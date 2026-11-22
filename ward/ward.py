@@ -25,11 +25,14 @@ class Ward:
     snapshot to a JSONL file.
     """
 
-    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None):
+    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None, cleaning_s=30.0):
         if not 1 <= beds <= 64:
             raise ValueError("beds must be 1..64")
         if rate_hz <= 0:
             raise ValueError("rate_hz must be > 0")
+        if cleaning_s <= 0:
+            raise ValueError("cleaning_s must be > 0")
+        self.cleaning_s = float(cleaning_s)
         profiles = profiles or []
         for p in profiles:
             if p not in PROFILES:
@@ -84,7 +87,14 @@ class Ward:
             for i, m in enumerate(self.monitors):
                 if not m.admitted:
                     admitted_at = self.timeline.admission_time(i)
-                    if admitted_at is not None and admitted_at <= self.elapsed:
+                    # A bed still being cleaned is not re-admitted, even
+                    # if its timeline admission time has passed; it comes
+                    # back once turnover finishes.
+                    if (
+                        admitted_at is not None
+                        and admitted_at <= self.elapsed
+                        and m.state(self.elapsed) == "available"
+                    ):
                         m.admitted = True
         readings = []
         online = []
@@ -94,6 +104,7 @@ class Ward:
                 entry = {"bed": m.bed_id, "online": False, "t": self.elapsed}
                 if not m.admitted:
                     entry["admitted"] = False
+                    entry["state"] = m.state(self.elapsed)
                 readings.append(entry)
             else:
                 r["online"] = True
@@ -104,7 +115,7 @@ class Ward:
         for m in self.monitors:
             for alarm in m.raised_this_tick:
                 self.staffing.alarm_raised(m.bed_id, alarm, self.elapsed, occupied)
-        snap = {"t": self.elapsed, "beds": readings, "staffing": self.staffing.summary(self.elapsed, occupied)}
+        snap = {"t": self.elapsed, "beds": readings, "staffing": self.staffing.summary(self.elapsed, occupied), "turnover": self.turnover_summary()}
         with self._lock:
             self.latest = snap
         if self.recorder is not None:
@@ -124,6 +135,39 @@ class Ward:
             "beds": beds,
             "total_raised": sum(b["total_raised"] for b in beds),
             "rate_per_min": round(sum(b["rate_per_min"] for b in beds), 3),
+        }
+
+    def discharge(self, bed_id):
+        """Discharge the patient in ``bed_id``.
+
+        The bed goes into cleaning for ``cleaning_s`` seconds and
+        cannot take a new admission until turnover finishes.
+        """
+        self._monitor(bed_id).discharge(self.elapsed, self.cleaning_s)
+
+    def admit(self, bed_id, profile=None, acuity=None):
+        """Admit a new patient to an available bed.
+
+        Raises ValueError if the bed is occupied or still cleaning.
+        """
+        self._monitor(bed_id).admit(self.elapsed, profile=profile, acuity=acuity)
+
+    def _monitor(self, bed_id):
+        if not 0 <= bed_id < self.beds:
+            raise ValueError("no bed %r, ward has %d beds" % (bed_id, self.beds))
+        return self.monitors[bed_id]
+
+    def turnover_summary(self):
+        """Per-bed turnover state and ward totals."""
+        beds = [m.turnover_summary(self.elapsed) for m in self.monitors]
+        return {
+            "t": self.elapsed,
+            "beds": beds,
+            "occupied": sum(1 for b in beds if b["state"] == "occupied"),
+            "cleaning": sum(1 for b in beds if b["state"] == "cleaning"),
+            "available": sum(1 for b in beds if b["state"] == "available"),
+            "total_turnovers": sum(b["turnovers"] for b in beds),
+            "total_cleaning_s": round(sum(b["total_cleaning_s"] for b in beds), 3),
         }
 
     def staffing_summary(self):

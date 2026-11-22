@@ -44,6 +44,9 @@ python3 -m ward.cli --replay run.jsonl
 # Staffing demo: full day roster, one nurse on nights from 19:00
 python3 -m ward.cli scenarios/staffing.json --seed 42
 
+# Bed turnover: beds 1 and 2 discharge, clean for 10s, then refill
+python3 -m ward.cli scenarios/turnover.json --seed 42
+
 # Reproducible run
 python3 -m ward.cli scenarios/example.json --seed 42
 ```
@@ -61,6 +64,9 @@ python3 -m ward.cli scenarios/example.json --seed 42
 - `GET /staffing` — the current shift, roster on duty, nurse-to-patient
   ratio, alarm acknowledgement and vitals-check metrics as JSON
   (503 while partitioned)
+- `GET /turnover` — per-bed turnover state (`occupied`, `cleaning`,
+  `available`), turnovers and total cleaning time per bed, plus ward
+  totals, as JSON (503 while partitioned)
 
 A reading looks like:
 
@@ -166,6 +172,9 @@ Chaos types:
 - `alarm_storm` — vitals on the target beds are dragged out of their
   normal bands, so every bed raises alarms.
 - `partition` — the ward is cut off from the server; endpoints return 503.
+- `discharge` — the target beds' patients are discharged at `at`
+  (instant, so `duration` is ignored and may be omitted); see
+  Bed turnover below.
 
 `bed` targets one bed, `beds` targets several, neither targets all beds
 (`partition` is always ward-wide). Times are elapsed seconds from start.
@@ -230,6 +239,46 @@ may not target more beds than the ward has. Beds keep the profiles
 from the scenario's `patients` list (or the default mix) when they are
 admitted. See `scenarios/ramp-up.json` for a runnable example.
 
+## Bed turnover
+
+When a patient is discharged, the bed is not free at once: it goes
+through cleaning first. A bed has three states — `occupied` while a
+patient is admitted, `cleaning` after a discharge until turnover
+finishes, `available` once it can take a new admission. The cleaning
+duration is `cleaning_s` seconds, set on the ward (30 by default) or
+in the scenario:
+
+```json
+{
+  "beds": 4,
+  "cleaning_s": 10,
+  "timeline": [{"at": 0, "beds": 4, "ramp_s": 0}],
+  "chaos": [
+    {"type": "discharge", "bed": 1, "at": 5},
+    {"type": "discharge", "bed": 2, "at": 8}
+  ]
+}
+```
+
+A discharged bed stops emitting readings and cannot be re-admitted
+until its cleaning time has elapsed — an admission attempt while
+cleaning raises an error. A scenario timeline does not pull a bed out
+of cleaning either: it refills the bed on the first tick after
+turnover finishes, so a discharge followed by a refill tests exactly
+the gap a real ward has. A new admission starts with fresh vitals, so
+the previous patient's readings and alarms do not carry over, and a
+discharge clears the patient's active alarms.
+
+Every snapshot carries a `"turnover"` object with the per-bed state,
+when a cleaning bed becomes available, how many turnovers each bed
+has had, and the total cleaning time per bed, plus ward totals
+(`occupied`, `cleaning`, `available`, `total_turnovers`,
+`total_cleaning_s`). The same summary is served by `GET /turnover`.
+Offline beds in a snapshot also carry their state (`"cleaning"` or
+`"available"`). See `scenarios/turnover.json` for a runnable example:
+bed 1 discharges at 5 s and is refilled at 15 s, bed 2 discharges at
+8 s and is refilled at 18 s.
+
 ## Recording a run
 
 `--record FILE` writes every tick to a JSONL file: a header line with
@@ -253,7 +302,7 @@ endpoints returned 503 while it lasted, the ticks did not stop.
 make test
 ```
 
-72 tests: vitals stay inside plausible ranges, dropout actually stops a
+85 tests: vitals stay inside plausible ranges, dropout actually stops a
 monitor's stream, an alarm storm produces alarms, stale readings freeze,
 a partition blocks the snapshot endpoint, the HTTP endpoints serve valid
 JSON, the stream serves JSON lines, scenario files validate, alarm
@@ -282,7 +331,15 @@ alarm storm proving one nurse for twelve beds triples mean time-to-ack
 (90.0 s vs 30.0 s) and delays vitals checks (24 delayed vs 0),
 staffing in snapshots and ward summaries, the `/staffing` endpoint
 (503 while partitioned), and the `staffing.json` scenario loading with
-per-shift rosters.
+per-shift rosters. Turnover tests cover discharge moving a bed to
+cleaning and stopping its readings, a discharged bed refusing
+re-admission until turnover finishes and then taking a new patient
+with fresh vitals, per-bed turnover counts and total cleaning time,
+discharge/admit rejection on the wrong state, a timeline not pulling
+a bed out of cleaning and refilling it after, the `discharge` chaos
+event firing exactly once, the `/turnover` endpoint (503 while
+partitioned), and the `turnover.json` scenario discharging two beds
+and refilling both after cleaning.
 
 ## Roadmap
 
@@ -290,4 +347,5 @@ per-shift rosters.
   alarm rates) — done in v0.6.0
 - Staffing/shift model (nurse-to-patient ratios affecting alarm
   response times) — done in v0.7.0
-- Bed turnover (discharges and new admissions refilling beds)
+- Bed turnover (discharges and new admissions refilling beds) — done
+  in v0.8.0

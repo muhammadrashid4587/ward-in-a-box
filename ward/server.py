@@ -55,6 +55,11 @@ def make_handler(ward):
                     self._send_json(503, {"error": "partitioned"})
                     return
                 self._send_json(200, ward.alarm_summary())
+            elif self.path == "/turnover":
+                if ward.partitioned:
+                    self._send_json(503, {"error": "partitioned"})
+                    return
+                self._send_json(200, ward.turnover_summary())
             elif self.path == "/staffing":
                 if ward.partitioned:
                     self._send_json(503, {"error": "partitioned"})

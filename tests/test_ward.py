@@ -949,5 +949,179 @@ class TestStaffing(unittest.TestCase):
             os.unlink(path)
 
 
+class TestTurnover(unittest.TestCase):
+    def _ward(self, beds=2, cleaning_s=10.0, **kw):
+        ward = Ward(beds=beds, cleaning_s=cleaning_s, seed=42, **kw)
+        ward.tick()
+        return ward
+
+    def test_discharge_moves_bed_to_cleaning_and_stops_readings(self):
+        ward = self._ward()
+        ward.discharge(0)
+        snap = ward.tick()
+        bed = snap["beds"][0]
+        self.assertFalse(bed["online"])
+        self.assertFalse(bed["admitted"])
+        self.assertEqual(bed["state"], "cleaning")
+        self.assertTrue(snap["beds"][1]["online"])
+        summary = snap["turnover"]
+        self.assertEqual(summary["occupied"], 1)
+        self.assertEqual(summary["cleaning"], 1)
+        self.assertEqual(summary["available"], 0)
+        self.assertEqual(summary["beds"][0]["state"], "cleaning")
+        self.assertEqual(summary["beds"][0]["cleaning_until"], 11.0)
+        self.assertEqual(summary["total_turnovers"], 1)
+
+    def test_discharged_bed_is_not_immediately_readmittable(self):
+        ward = self._ward()
+        ward.discharge(0)
+        with self.assertRaises(ValueError):
+            ward.admit(0)
+        # Still cleaning after 5 of the 10 turnover seconds.
+        for _ in range(5):
+            ward.tick()
+        with self.assertRaises(ValueError):
+            ward.admit(0)
+
+    def test_bed_becomes_available_after_turnover(self):
+        ward = self._ward()
+        ward.discharge(0)
+        for _ in range(10):
+            ward.tick()
+        # Discharged at t=1, cleaning_s 10: available at t=11.
+        snap = ward.tick()
+        self.assertEqual(snap["beds"][0]["state"], "available")
+        ward.admit(0, profile="febrile")
+        snap = ward.tick()
+        reading = snap["beds"][0]
+        self.assertTrue(reading["online"])
+        self.assertEqual(reading["profile"], "febrile")
+        self.assertEqual(reading["seq"], 1)
+
+    def test_new_admission_gets_fresh_vitals(self):
+        ward = self._ward()
+        first = ward.tick()["beds"][0]
+        ward.discharge(0)
+        for _ in range(11):
+            ward.tick()
+        ward.admit(0, profile="stable")
+        reading = ward.tick()["beds"][0]
+        self.assertEqual(reading["seq"], 1)
+        self.assertNotEqual(reading["heart_rate"], first["heart_rate"])
+
+    def test_turnover_summary_tracks_counts_and_cleaning_time(self):
+        ward = self._ward()
+        ward.discharge(0)
+        for _ in range(11):
+            ward.tick()
+        ward.admit(0)
+        ward.tick()
+        ward.discharge(0)
+        summary = ward.turnover_summary()
+        self.assertEqual(summary["beds"][0]["turnovers"], 2)
+        self.assertEqual(summary["beds"][0]["total_cleaning_s"], 20.0)
+        self.assertEqual(summary["total_turnovers"], 2)
+        self.assertEqual(summary["total_cleaning_s"], 20.0)
+
+    def test_discharge_of_unoccupied_bed_raises(self):
+        ward = self._ward()
+        ward.discharge(0)
+        with self.assertRaises(ValueError):
+            ward.discharge(0)
+        with self.assertRaises(ValueError):
+            ward.discharge(99)
+
+    def test_admit_of_occupied_bed_raises(self):
+        ward = self._ward()
+        with self.assertRaises(ValueError):
+            ward.admit(0)
+
+    def test_timeline_does_not_readmit_a_cleaning_bed(self):
+        timeline = Timeline([TimelinePhase(0, 2, ramp_s=0)])
+        ward = self._ward(timeline=timeline)
+        ward.discharge(0)
+        for _ in range(5):
+            ward.tick()
+        # Timeline admission time (t=0) has passed, but the bed is
+        # still cleaning, so it stays offline.
+        snap = ward.tick()
+        self.assertFalse(snap["beds"][0]["online"])
+        self.assertEqual(snap["beds"][0]["state"], "cleaning")
+        for _ in range(5):
+            ward.tick()
+        # Turnover done at t=11: the timeline refills the bed.
+        snap = ward.tick()
+        self.assertTrue(snap["beds"][0]["online"])
+
+    def test_discharge_chaos_event_fires_once(self):
+        ward = self._ward(
+            chaos=[ChaosEvent("discharge", 5, bed=0)],
+        )
+        for _ in range(3):
+            ward.tick()
+        self.assertEqual(ward.turnover_summary()["total_turnovers"], 0)
+        ward.tick()  # t=5: discharge fires
+        self.assertEqual(ward.turnover_summary()["total_turnovers"], 1)
+        for _ in range(20):
+            ward.tick()
+        self.assertEqual(ward.turnover_summary()["total_turnovers"], 1)
+
+    def test_discharge_event_without_duration_is_valid(self):
+        ev = ChaosEvent("discharge", 5, bed=0)
+        self.assertEqual(ev.duration, 0)
+        with self.assertRaises(ValueError):
+            ChaosEvent("dropout", 5, bed=0)
+        with self.assertRaises(ValueError):
+            ChaosEvent("dropout", 5, 0, bed=0)
+
+    def test_scenario_turnover(self):
+        cfg = load_scenario(os.path.join(HERE, "..", "scenarios", "turnover.json"))
+        self.assertEqual(cfg["cleaning_s"], 10.0)
+        ward = build_ward(cfg, seed=42)
+        for _ in range(5):
+            ward.tick()
+        snap = ward.tick()  # t=6: bed 1 discharged at t=5, cleaning
+        self.assertEqual(snap["beds"][1]["state"], "cleaning")
+        self.assertTrue(snap["beds"][2]["online"])
+        for _ in range(9):
+            ward.tick()
+        snap = ward.tick()  # t=16: bed 1 cleaned (t=15) and refilled
+        self.assertTrue(snap["beds"][1]["online"])
+        self.assertEqual(snap["beds"][2]["state"], "cleaning")
+        ward.tick()
+        snap = ward.tick()  # t=18: bed 2 cleaned and refilled too
+        self.assertTrue(snap["beds"][1]["online"])
+        self.assertTrue(snap["beds"][2]["online"])
+
+    def test_scenario_rejects_bad_cleaning_s(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"beds": 1, "cleaning_s": 0}, f)
+            path = f.name
+        try:
+            with self.assertRaises(ValueError):
+                load_scenario(path)
+        finally:
+            os.unlink(path)
+
+    def test_turnover_endpoint_serves_json_and_is_503_while_partitioned(self):
+        ward = Ward(beds=2, cleaning_s=10.0, seed=1)
+        ward.tick()
+        ward.discharge(0)
+        server, port = serve_in_thread(ward)
+        try:
+            status, body = get(port, "/turnover")
+            self.assertEqual(status, 200)
+            data = json.loads(body)
+            self.assertEqual(data["occupied"], 1)
+            self.assertEqual(data["cleaning"], 1)
+            self.assertEqual(data["beds"][0]["state"], "cleaning")
+            ward.partitioned = True
+            status, _ = get(port, "/turnover")
+            self.assertEqual(status, 503)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
 if __name__ == "__main__":
     unittest.main()

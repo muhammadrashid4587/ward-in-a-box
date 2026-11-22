@@ -43,13 +43,15 @@ def load_scenario(path):
                 ChaosEvent(
                     ev["type"],
                     ev["at"],
-                    ev["duration"],
+                    ev.get("duration"),
                     bed=ev.get("bed"),
                     beds=ev.get("beds"),
                 )
             )
         except KeyError as e:
             raise ValueError("chaos event %d: missing %s" % (i, e))
+        except ValueError as e:
+            raise ValueError("chaos event %d: %s" % (i, e))
     timeline = None
     if "timeline" in data:
         phases = []
@@ -71,6 +73,9 @@ def load_scenario(path):
             staffing = Staffing(**data["staffing"])
         except (TypeError, ValueError) as e:
             raise ValueError("staffing: %s" % e)
+    cleaning_s = data.get("cleaning_s", 30.0)
+    if not isinstance(cleaning_s, (int, float)) or cleaning_s <= 0:
+        raise ValueError("cleaning_s must be > 0")
     return {
         "beds": beds,
         "rate_hz": rate,
@@ -79,6 +84,7 @@ def load_scenario(path):
         "chaos": chaos,
         "timeline": timeline,
         "staffing": staffing,
+        "cleaning_s": float(cleaning_s),
         "host": data.get("host", "127.0.0.1"),
         "port": data.get("port", 8080),
     }
@@ -94,6 +100,7 @@ def build_ward(cfg, seed=None, recorder=None):
         seed=seed,
         timeline=cfg.get("timeline"),
         staffing=cfg.get("staffing"),
+        cleaning_s=cfg.get("cleaning_s", 30.0),
         recorder=recorder,
     )
 

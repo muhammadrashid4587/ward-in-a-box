@@ -1,0 +1,42 @@
+{
+  "beds": 4,
+  "chaos": [
+    {
+      "at": 5,
+      "bed": 1,
+      "type": "discharge"
+    },
+    {
+      "at": 8,
+      "bed": 2,
+      "type": "discharge"
+    }
+  ],
+  "cleaning_s": 10,
+  "patients": [
+    {
+      "bed": 0,
+      "profile": "stable"
+    },
+    {
+      "bed": 1,
+      "profile": "tachycardic"
+    },
+    {
+      "bed": 2,
+      "profile": "hypoxic"
+    },
+    {
+      "bed": 3,
+      "profile": "febrile"
+    }
+  ],
+  "rate_hz": 1.0,
+  "timeline": [
+    {
+      "at": 0,
+      "beds": 4,
+      "ramp_s": 0
+    }
+  ]
+}

@@ -46,12 +46,87 @@ class Monitor:
         self.alarm_history = deque(maxlen=MAX_ALARM_HISTORY)
         self.total_raised = 0
         self._active_alarms = set()
+        # Bed turnover: after a discharge the bed is cleaning until
+        # ``cleaning_until`` (elapsed seconds), then available again.
+        # ``turnovers`` counts discharges; ``total_cleaning_s`` is the
+        # total time this bed has spent being cleaned.
+        self.cleaning_until = None
+        self.turnovers = 0
+        self.total_cleaning_s = 0.0
         # Alarms raised by the most recent tick; the ward reads this to
         # hand them to the staffing model for acknowledgement.
         self.raised_this_tick = []
 
+    def state(self, now):
+        """Bed state at elapsed time ``now``.
+
+        ``"occupied"`` while a patient is admitted, ``"cleaning"`` after
+        a discharge until the turnover period ends, ``"available"``
+        once the bed can take a new admission.
+        """
+        if self.admitted:
+            return "occupied"
+        if self.cleaning_until is not None and now < self.cleaning_until:
+            return "cleaning"
+        return "available"
+
+    def discharge(self, now, cleaning_s):
+        """Discharge the patient: the bed goes into cleaning.
+
+        ``cleaning_s`` is how long turnover takes; the bed is not
+        re-admittable until it has elapsed. Raises ValueError if the
+        bed is not occupied. The discharged patient's alarms clear.
+        """
+        if cleaning_s <= 0:
+            raise ValueError("cleaning_s must be > 0")
+        if not self.admitted:
+            raise ValueError("bed %d is not occupied" % self.bed_id)
+        self._record_alarm_transitions([], now)
+        self.admitted = False
+        self.cleaning_until = round(now + cleaning_s, 3)
+        self.turnovers += 1
+        self.total_cleaning_s = round(self.total_cleaning_s + cleaning_s, 3)
+
+    def admit(self, now, profile=None, acuity=None):
+        """Admit a new patient to an available bed.
+
+        Raises ValueError if the bed is occupied or still cleaning.
+        A new admission starts with fresh vitals, so the previous
+        patient's readings and alarms do not carry over.
+        """
+        state = self.state(now)
+        if state == "occupied":
+            raise ValueError("bed %d is already occupied" % self.bed_id)
+        if state == "cleaning":
+            raise ValueError(
+                "bed %d is cleaning until t=%s" % (self.bed_id, self.cleaning_until)
+            )
+        if profile is not None:
+            self.profile = profile
+        if acuity is not None:
+            self.acuity = validate_acuity(acuity)
+        self.signs = initial_signs(self.profile, self.rng, self.acuity)
+        self.seq = 0
+        self.last_reading = None
+        self.cleaning_until = None
+        self.admitted = True
+
+    def turnover_summary(self, now):
+        """Per-bed turnover state and totals as plain JSON data."""
+        return {
+            "bed": self.bed_id,
+            "state": self.state(now),
+            "cleaning_until": self.cleaning_until
+            if self.state(now) == "cleaning"
+            else None,
+            "turnovers": self.turnovers,
+            "total_cleaning_s": self.total_cleaning_s,
+        }
+
     def tick(self, now, dt=1.0):
         self.raised_this_tick = []
+        if self.cleaning_until is not None and now >= self.cleaning_until:
+            self.cleaning_until = None
         if not self.admitted:
             return None
         if self.offline_until is not None:
