@@ -37,6 +37,11 @@ def make_handler(ward):
                 if snap is None:
                     snap = ward.tick()
                 self._send_json(200, snap)
+            elif self.path == "/alarms":
+                if ward.partitioned:
+                    self._send_json(503, {"error": "partitioned"})
+                    return
+                self._send_json(200, ward.alarm_summary())
             elif self.path == "/stream":
                 if ward.partitioned:
                     self._send_json(503, {"error": "partitioned"})

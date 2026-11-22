@@ -71,6 +71,16 @@ class Ward:
         with self._lock:
             return self.latest
 
+    def alarm_summary(self, window_s=60.0):
+        """Per-bed alarm history and rate metrics for the whole ward."""
+        beds = [m.alarm_summary(self.elapsed, window_s) for m in self.monitors]
+        return {
+            "t": self.elapsed,
+            "beds": beds,
+            "total_raised": sum(b["total_raised"] for b in beds),
+            "rate_per_min": round(sum(b["rate_per_min"] for b in beds), 3),
+        }
+
     def start(self):
         if self._thread is not None:
             return

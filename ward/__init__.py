@@ -1,6 +1,6 @@
 """ward-in-a-box: a simulated hospital ward as a load/chaos generator."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from .chaos import ChaosEngine, ChaosEvent
 from .monitor import Monitor

@@ -4,6 +4,7 @@ import http.client
 import io
 import json
 import os
+import random
 import sys
 import threading
 import unittest
@@ -14,6 +15,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from ward.chaos import ChaosEvent
 from ward.cli import load_scenario, main
+from ward.monitor import Monitor
 from ward.server import make_handler
 from ward.vitals import PROFILES
 from ward.ward import Ward
@@ -152,6 +154,129 @@ class TestHttp(unittest.TestCase):
     def test_unknown_path_is_404(self):
         status, _ = get(self.port, "/nope")
         self.assertEqual(status, 404)
+
+
+class TestAlarmHistory(unittest.TestCase):
+    # Pin the signs to known in-band values so the storm drags are exact.
+    # Each tick of an active storm moves a vital 35% toward its alarm
+    # target, so a vital starting at the top of its profile range trips
+    # its alarm on a known tick, and ending the storm clamps the signs
+    # back into band (via step()) so the alarm clears on the next tick.
+    SIGNS = {
+        "heart_rate": 88.0,
+        "spo2": 99.0,
+        "systolic": 117.0,
+        "diastolic": 75.0,
+        "temperature": 36.8,
+        "resp_rate": 15.0,
+    }
+
+    def test_history_records_raise_and_clear(self):
+        m = Monitor(0, "stable", rng=random.Random(1))
+        m.signs.update(self.SIGNS)
+        m.alarm_until = 10.0
+        reading = m.tick(1.0)
+        self.assertEqual(reading["alarms"], [])
+        self.assertEqual(len(m.alarm_history), 0)
+        # t=2: heart rate 88 -> 121.2, the only vital out of band.
+        reading = m.tick(2.0)
+        self.assertEqual(reading["alarms"], ["tachycardia"])
+        self.assertEqual(len(m.alarm_history), 1)
+        event = m.alarm_history[0]
+        self.assertEqual(event["alarm"], "tachycardia")
+        self.assertEqual(event["raised_t"], 2.0)
+        self.assertIsNone(event["cleared_t"])
+        self.assertEqual(m.total_raised, 1)
+
+        # Storm over: the next step clamps the signs back into band,
+        # so the same event is closed and no new event is raised.
+        m.alarm_until = None
+        reading = m.tick(3.0)
+        self.assertEqual(reading["alarms"], [])
+        self.assertEqual(m.alarm_history[0]["cleared_t"], 3.0)
+        self.assertEqual(m.total_raised, 1)
+
+        # A second, different alarm raises its own event.
+        m.alarm_until = 10.0
+        m.signs["spo2"] = 90.0
+        reading = m.tick(4.0)
+        self.assertEqual(reading["alarms"], ["low_spo2"])
+        self.assertEqual(m.total_raised, 2)
+        self.assertEqual(m.alarm_history[1]["alarm"], "low_spo2")
+        self.assertEqual(m.alarm_history[1]["raised_t"], 4.0)
+
+    def test_alarm_rate_counts_trailing_window(self):
+        m = Monitor(0, "stable", rng=random.Random(2))
+        m.signs.update(self.SIGNS)
+        m.signs["heart_rate"] = 130.0  # out of band already; storm keeps it there
+        m.alarm_until = 100.0
+        m.tick(1.0)  # tachycardia raised at t=1
+        m.alarm_until = None
+        m.tick(2.0)  # cleared
+        m.signs["spo2"] = 88.0
+        m.alarm_until = 100.0
+        m.tick(10.0)  # low_spo2 raised at t=10
+        m.alarm_until = None
+        m.tick(11.0)  # cleared
+        m.signs["temperature"] = 39.0
+        m.alarm_until = 100.0
+        m.tick(70.0)  # fever raised at t=70
+        self.assertEqual(m.alarm_rate(70.0), 2.0)  # raises at t=10, t=70
+        self.assertEqual(m.alarm_rate(70.0, window_s=120.0), 1.5)  # all three
+        self.assertEqual(m.alarm_rate(5.0), 1.0)  # only the t=1 raise
+        with self.assertRaises(ValueError):
+            m.alarm_rate(70.0, window_s=0)
+
+
+class TestWardAlarms(unittest.TestCase):
+    def test_ward_alarm_summary_after_storm(self):
+        ward = Ward(
+            beds=6,
+            chaos=[ChaosEvent("alarm_storm", at=1, duration=10, beds=[0, 1, 2])],
+            seed=2,
+        )
+        for _ in range(7):
+            ward.tick()
+        summary = ward.alarm_summary()
+        self.assertEqual(summary["t"], ward.elapsed)
+        self.assertEqual(len(summary["beds"]), 6)
+        self.assertGreaterEqual(summary["total_raised"], 3)
+        self.assertGreater(summary["rate_per_min"], 0)
+        for bed in summary["beds"]:
+            self.assertIn("history", bed)
+            self.assertIn("active", bed)
+            self.assertIn("rate_per_min", bed)
+            self.assertEqual(bed["total_raised"], len(bed["history"]))
+        storm = summary["beds"][0]
+        self.assertGreater(storm["total_raised"], 0)
+        self.assertTrue(storm["active"])
+
+
+class TestAlarmsHttp(unittest.TestCase):
+    def test_alarms_endpoint_serves_json(self):
+        ward = Ward(beds=4, rate_hz=20.0, seed=5)
+        server, port = serve_in_thread(ward)
+        try:
+            status, body = get(port, "/alarms")
+            self.assertEqual(status, 200)
+            data = json.loads(body)
+            self.assertEqual(len(data["beds"]), 4)
+            self.assertIn("total_raised", data)
+            self.assertIn("rate_per_min", data)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_alarms_endpoint_is_503_while_partitioned(self):
+        ward = Ward(beds=2, chaos=[ChaosEvent("partition", at=1, duration=5)], seed=4)
+        ward.tick()  # t=1: partitioned
+        server, port = serve_in_thread(ward)
+        try:
+            status, _ = get(port, "/alarms")
+            self.assertEqual(status, 503)
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 class TestScenario(unittest.TestCase):

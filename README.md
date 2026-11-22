@@ -42,6 +42,8 @@ python3 -m ward.cli scenarios/example.json --seed 42
 - `GET /health` — `{"status": "ok", "beds": 12}`
 - `GET /snapshot` — the latest reading for every bed as JSON
 - `GET /stream` — the ward ticking live, one JSON object per line
+- `GET /alarms` — per-bed alarm history and rate metrics as JSON
+  (503 while partitioned)
 
 A reading looks like:
 
@@ -54,6 +56,24 @@ A reading looks like:
 
 Offline beds appear as `{"bed": 2, "online": false, "t": 30.0}`.
 While a partition is active, `/snapshot` and `/stream` return 503.
+
+## Alarm history and rates
+
+Every time a bed's vitals cross out of (or back into) a normal band, the
+monitor records an alarm event:
+
+```json
+{"alarm": "tachycardia", "raised_t": 31.0, "cleared_t": 47.0}
+```
+
+`GET /alarms` returns, per bed, the alarms currently active, the full
+history (capped at the last 1000 events per bed; the total count keeps
+counting past the cap), the total number of alarms raised, and the alarm
+rate — alarms raised per minute over a trailing 60-second window. The
+ward totals are the sums across beds. A stale reading repeats the
+previous alarms, so it records nothing; while a monitor is offline its
+alarms are neither raised nor cleared, and transitions are recorded
+against the last reading it emitted when it comes back.
 
 ## Scenario format
 
@@ -94,14 +114,16 @@ Chaos types:
 make test
 ```
 
-13 tests: vitals stay inside plausible ranges, dropout actually stops a
+18 tests: vitals stay inside plausible ranges, dropout actually stops a
 monitor's stream, an alarm storm produces alarms, stale readings freeze,
 a partition blocks the snapshot endpoint, the HTTP endpoints serve valid
-JSON, the stream serves JSON lines, and scenario files validate.
+JSON, the stream serves JSON lines, scenario files validate, alarm
+history records raises and clears, alarm rate counts a trailing window,
+the ward summary aggregates per-bed alarms, and `/alarms` serves JSON
+(503 while partitioned).
 
 ## Roadmap
 
-- Per-bed alarm history and alarm rate metrics
 - Scenario timelines with ramp-up (admissions over time)
 - WebSocket endpoint alongside the JSON-lines stream
 - Recording a run to a file for replay
