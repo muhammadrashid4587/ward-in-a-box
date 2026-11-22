@@ -7,7 +7,7 @@ import time
 from .chaos import ChaosEngine
 from .monitor import Monitor
 from .timeline import Timeline
-from .vitals import PROFILES
+from .vitals import PROFILES, validate_acuity
 
 # Default patient mix when a scenario does not name profiles.
 DEFAULT_PROFILES = ["stable", "stable", "stable", "tachycardic", "hypoxic", "febrile"]
@@ -24,7 +24,7 @@ class Ward:
     snapshot to a JSONL file.
     """
 
-    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None):
+    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None):
         if not 1 <= beds <= 64:
             raise ValueError("beds must be 1..64")
         if rate_hz <= 0:
@@ -33,6 +33,9 @@ class Ward:
         for p in profiles:
             if p not in PROFILES:
                 raise ValueError("unknown profile: %r" % p)
+        acuities = acuities or []
+        for a in acuities:
+            validate_acuity(a)
         self.beds = beds
         self.rate_hz = rate_hz
         self.rng = random.Random(seed)
@@ -46,7 +49,8 @@ class Ward:
         self.monitors = []
         for i in range(beds):
             profile = profiles[i] if i < len(profiles) else DEFAULT_PROFILES[i % len(DEFAULT_PROFILES)]
-            monitor = Monitor(i, profile, rng=self.rng)
+            acuity = acuities[i] if i < len(acuities) else 3
+            monitor = Monitor(i, profile, rng=self.rng, acuity=acuity)
             # With a timeline, beds start unadmitted and come online as
             # the timeline admits them; without one, all beds start open.
             if timeline is not None:

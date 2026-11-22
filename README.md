@@ -58,7 +58,7 @@ python3 -m ward.cli scenarios/example.json --seed 42
 A reading looks like:
 
 ```json
-{"bed": 2, "seq": 31, "t": 30.0, "profile": "tachycardic",
+{"bed": 2, "seq": 31, "t": 30.0, "profile": "tachycardic", "acuity": 2,
  "heart_rate": 108.4, "spo2": 96.2, "systolic": 128.0,
  "diastolic": 82.0, "temperature": 36.9, "resp_rate": 17.5,
  "alarms": [], "stale": false, "online": true}
@@ -127,6 +127,30 @@ against the last reading it emitted when it comes back.
 Patient profiles: `stable`, `tachycardic`, `hypoxic`, `febrile`.
 Beds without a named profile cycle through a default mix.
 
+## Patient acuity
+
+Each patient also has an acuity, 1 (critical) to 4 (low/stable), on a
+triage-like scale, set per patient in the scenario:
+
+```json
+{"bed": 0, "profile": "tachycardic", "acuity": 1}
+```
+
+Acuity changes how a patient's vitals behave. A critical patient
+swings twice as hard per tick and wanders 35% further from the
+profile midpoint, so they cross alarm bands more often; a low-acuity
+patient is steadier and stays closer to the middle. Level 3 is the
+neutral default and reproduces exactly the old profile behaviour, so
+scenarios that do not set acuity are unchanged. Acuity 2 sits in
+between (1.5x volatility, 15% wider). The widened ranges are clamped
+inside a plausible envelope, so no acuity level can push a vital
+somewhere a real monitor would never show. The reading and the
+`/alarms` summary both carry the bed's acuity, so a client can tell a
+quiet stable patient from a quiet critical one. See
+`scenarios/acuity.json` for a ward with one patient at each level: over
+a seeded 600-tick run the acuity-1 hypoxic patient raised 61 alarms
+against 16 for the acuity-4 one.
+
 Chaos types:
 
 - `dropout` — a monitor goes offline for `duration` seconds; its bed
@@ -189,7 +213,7 @@ endpoints returned 503 while it lasted, the ticks did not stop.
 make test
 ```
 
-49 tests: vitals stay inside plausible ranges, dropout actually stops a
+59 tests: vitals stay inside plausible ranges, dropout actually stops a
 monitor's stream, an alarm storm produces alarms, stale readings freeze,
 a partition blocks the snapshot endpoint, the HTTP endpoints serve valid
 JSON, the stream serves JSON lines, scenario files validate, alarm
@@ -205,9 +229,16 @@ alarms, ping/pong, the close handshake, fragmented client messages, a
 400 without upgrade headers, and a 503 while partitioned. Recording
 tests cover the header and tick lines, the summary's tick, duration,
 reading, offline, and alarm counts, an empty recording, tick replay,
-and the `--record`, `--summary`, and `--replay` CLI flags.
+and the `--record`, `--summary`, and `--replay` CLI flags. Acuity tests
+cover range widening and narrowing by level, the plausible envelope,
+rejection of bad acuity values, the default of 3, readings and alarm
+summaries carrying acuity, a critical patient swinging and alarming
+more than a low-acuity one, ward-level acuities, and the `acuity.json`
+scenario loading with per-bed acuities.
 
 ## Roadmap
 
-- Recording a run to a file for replay — done in v0.5.0 (`--record`,
-  `--summary`, `--replay`)
+- Patient acuity model (acuity 1-4 driving vitals volatility and
+  alarm rates) — done in v0.6.0
+- Staffing/shift model (nurse-to-patient ratios affecting alarm
+  response times)

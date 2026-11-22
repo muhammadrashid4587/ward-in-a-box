@@ -19,12 +19,12 @@ from http.server import ThreadingHTTPServer
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from ward.chaos import ChaosEvent
-from ward.cli import load_scenario, main
+from ward.cli import build_ward, load_scenario, main
 from ward.monitor import Monitor
 from ward.recorder import Recorder, iter_ticks, summarize
 from ward.server import make_handler
 from ward.timeline import Timeline, TimelinePhase
-from ward.vitals import PROFILES
+from ward.vitals import PROFILES, effective_ranges, validate_acuity
 from ward.ward import Ward
 from ward.websocket import accept_key, encode_frame, read_frame
 
@@ -726,6 +726,92 @@ class TestRecording(unittest.TestCase):
         self.assertEqual(len(lines), 2)
         self.assertEqual(lines[0]["t"], snaps[0]["t"])
         self.assertNotIn("type", lines[0])
+
+
+class TestAcuity(unittest.TestCase):
+    def test_effective_ranges_widen_with_acuity(self):
+        lo1, hi1 = effective_ranges("stable", 1)["heart_rate"]
+        lo3, hi3 = effective_ranges("stable", 3)["heart_rate"]
+        lo4, hi4 = effective_ranges("stable", 4)["heart_rate"]
+        self.assertEqual((lo3, hi3), PROFILES["stable"]["heart_rate"])
+        self.assertLess(lo1, lo3)
+        self.assertGreater(hi1, hi3)
+        self.assertGreater(lo4, lo3)
+        self.assertLess(hi4, hi3)
+
+    def test_effective_ranges_stay_inside_plausible_envelope(self):
+        for acuity in (1, 2, 3, 4):
+            for profile in PROFILES:
+                ranges = effective_ranges(profile, acuity)
+                self.assertGreaterEqual(ranges["spo2"][1], 88.0)
+                self.assertLessEqual(ranges["spo2"][1], 100.0)
+                self.assertGreaterEqual(ranges["heart_rate"][0], 30.0)
+
+    def test_validate_acuity_rejects_bad_values(self):
+        for bad in (0, 5, -1, "1", 2.5, None, True):
+            with self.assertRaises(ValueError):
+                validate_acuity(bad)
+
+    def test_monitor_defaults_to_acuity_3_and_reports_it(self):
+        m = Monitor(0, "stable", rng=random.Random(1))
+        self.assertEqual(m.acuity, 3)
+        reading = m.tick(1.0)
+        self.assertEqual(reading["acuity"], 3)
+        self.assertEqual(m.alarm_summary(1.0)["acuity"], 3)
+
+    def test_monitor_rejects_bad_acuity(self):
+        with self.assertRaises(ValueError):
+            Monitor(0, "stable", rng=random.Random(1), acuity=9)
+
+    def test_critical_patient_swings_more_than_low_acuity(self):
+        means = {}
+        for acuity in (1, 4):
+            m = Monitor(0, "stable", rng=random.Random(11), acuity=acuity)
+            prev = None
+            total = 0.0
+            n = 0
+            for t in range(1, 501):
+                r = m.tick(float(t))
+                if prev is not None:
+                    total += abs(r["heart_rate"] - prev)
+                    n += 1
+                prev = r["heart_rate"]
+            means[acuity] = total / n
+        self.assertGreater(means[1], means[4] * 2)
+
+    def test_critical_patient_raises_more_alarms(self):
+        raised = {}
+        for acuity in (1, 4):
+            m = Monitor(0, "hypoxic", rng=random.Random(7), acuity=acuity)
+            for t in range(1, 601):
+                m.tick(float(t))
+            raised[acuity] = m.total_raised
+        self.assertGreater(raised[1], raised[4] * 2)
+
+    def test_ward_acuities(self):
+        ward = Ward(beds=2, profiles=["stable", "stable"], acuities=[1, 4], seed=1)
+        self.assertEqual([m.acuity for m in ward.monitors], [1, 4])
+        snap = ward.tick()
+        self.assertEqual([r["acuity"] for r in snap["beds"]], [1, 4])
+
+    def test_scenario_acuity(self):
+        cfg = load_scenario(os.path.join(HERE, "..", "scenarios", "acuity.json"))
+        self.assertEqual(cfg["acuities"], [1, 2, 3, 4])
+        ward = build_ward(cfg, seed=42)
+        snap = ward.tick()
+        self.assertEqual(snap["beds"][0]["acuity"], 1)
+        self.assertEqual(snap["beds"][0]["profile"], "tachycardic")
+        self.assertEqual(snap["beds"][3]["acuity"], 4)
+
+    def test_scenario_rejects_bad_acuity(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"beds": 1, "patients": [{"profile": "stable", "acuity": 0}]}, f)
+            path = f.name
+        try:
+            with self.assertRaises(ValueError):
+                load_scenario(path)
+        finally:
+            os.unlink(path)
 
 
 if __name__ == "__main__":

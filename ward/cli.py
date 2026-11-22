@@ -8,7 +8,7 @@ from .chaos import ChaosEvent
 from .recorder import Recorder, iter_ticks, summarize
 from .server import serve
 from .timeline import Timeline, TimelinePhase
-from .vitals import PROFILES
+from .vitals import PROFILES, validate_acuity
 from .ward import Ward
 
 
@@ -21,11 +21,18 @@ def load_scenario(path):
     beds = data.get("beds", 12)
     rate = data.get("rate_hz", 1.0)
     profiles = []
+    acuities = []
     for i, p in enumerate(data.get("patients", [])):
         profile = p.get("profile", "stable") if isinstance(p, dict) else p
         if profile not in PROFILES:
             raise ValueError("patient %d: unknown profile: %r" % (i, profile))
         profiles.append(profile)
+        acuity = p.get("acuity", 3) if isinstance(p, dict) else 3
+        try:
+            validate_acuity(acuity)
+        except ValueError:
+            raise ValueError("patient %d: acuity must be an int in 1..4, got %r" % (i, acuity))
+        acuities.append(acuity)
     chaos = []
     for i, ev in enumerate(data.get("chaos", [])):
         if not isinstance(ev, dict):
@@ -59,6 +66,7 @@ def load_scenario(path):
         "beds": beds,
         "rate_hz": rate,
         "profiles": profiles,
+        "acuities": acuities,
         "chaos": chaos,
         "timeline": timeline,
         "host": data.get("host", "127.0.0.1"),
@@ -71,6 +79,7 @@ def build_ward(cfg, seed=None, recorder=None):
         beds=cfg["beds"],
         rate_hz=cfg["rate_hz"],
         profiles=cfg["profiles"],
+        acuities=cfg.get("acuities"),
         chaos=cfg["chaos"],
         seed=seed,
         timeline=cfg.get("timeline"),

@@ -3,7 +3,7 @@
 import random
 from collections import deque
 
-from .vitals import alarms_for, initial_signs, step
+from .vitals import alarms_for, initial_signs, step, validate_acuity
 
 # Where an alarm storm drags each vital. All of them trip an alarm.
 ALARM_TARGETS = {
@@ -29,11 +29,12 @@ class Monitor:
     seconds); the monitor clears each one when its time passes.
     """
 
-    def __init__(self, bed_id, profile="stable", rng=None):
+    def __init__(self, bed_id, profile="stable", rng=None, acuity=3):
         self.bed_id = bed_id
         self.profile = profile
+        self.acuity = validate_acuity(acuity)
         self.rng = rng if rng is not None else random.Random()
-        self.signs = initial_signs(profile, self.rng)
+        self.signs = initial_signs(profile, self.rng, self.acuity)
         self.seq = 0
         # False until the ward admits this bed (scenario timeline); an
         # unadmitted bed emits no readings at all.
@@ -71,7 +72,7 @@ class Monitor:
                 )
         else:
             self.alarm_until = None
-            self.signs = step(self.signs, self.profile, self.rng, dt)
+            self.signs = step(self.signs, self.profile, self.rng, dt, self.acuity)
 
         self.seq += 1
         reading = {
@@ -79,6 +80,7 @@ class Monitor:
             "seq": self.seq,
             "t": round(now, 3),
             "profile": self.profile,
+            "acuity": self.acuity,
             "stale": False,
             **self.signs,
         }
@@ -125,6 +127,7 @@ class Monitor:
         return {
             "bed": self.bed_id,
             "profile": self.profile,
+            "acuity": self.acuity,
             "active": sorted(self._active_alarms),
             "total_raised": self.total_raised,
             "rate_per_min": self.alarm_rate(now, window_s),

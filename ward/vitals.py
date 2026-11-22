@@ -60,20 +60,67 @@ SIGMA = {
 }
 
 
-def initial_signs(profile, rng):
-    """Draw a starting set of vitals inside the profile's range."""
+# Patient acuity, 1 (critical) to 4 (low/stable), on a triage-like scale.
+# Acuity drives two things: how volatile a patient's vitals are, and how
+# wide the range they wander in is. Level 3 is the neutral default: it
+# reproduces exactly the behaviour of the profiles on their own, so
+# existing scenarios are unchanged. A critical patient swings twice as
+# hard and wanders 35% further from the profile midpoint, so they cross
+# alarm bands more often; a low-acuity patient is steadier and stays
+# closer to the middle.
+ACUITY_SIGMA = {1: 2.0, 2: 1.5, 3: 1.0, 4: 0.6}
+ACUITY_WIDEN = {1: 0.35, 2: 0.15, 3: 0.0, 4: -0.15}
+
+# Hard plausible envelope: widened ranges are clamped inside these so
+# no acuity level can push a vital somewhere a real monitor would never
+# show. SpO2 cannot exceed 100.
+PLAUSIBLE = {
+    "heart_rate": (30.0, 200.0),
+    "spo2": (70.0, 100.0),
+    "systolic": (60.0, 220.0),
+    "diastolic": (30.0, 140.0),
+    "temperature": (34.0, 41.0),
+    "resp_rate": (6.0, 40.0),
+}
+
+
+def validate_acuity(acuity):
+    """Acuity must be an int in 1..4; anything else is a scenario bug."""
+    if not isinstance(acuity, int) or isinstance(acuity, bool) or acuity not in ACUITY_SIGMA:
+        raise ValueError("acuity must be an int in 1..4, got %r" % (acuity,))
+    return acuity
+
+
+def effective_ranges(profile, acuity=3):
+    """A profile's vital ranges widened (or narrowed) by acuity."""
+    validate_acuity(acuity)
     if profile not in PROFILES:
         raise ValueError("unknown profile: %r" % profile)
-    return {k: round(rng.uniform(*v), 2) for k, v in PROFILES[profile].items()}
+    widen = ACUITY_WIDEN[acuity]
+    out = {}
+    for key, (lo, hi) in PROFILES[profile].items():
+        mid = (lo + hi) / 2.0
+        half = (hi - lo) / 2.0 * (1.0 + widen)
+        plo, phi = PLAUSIBLE[key]
+        out[key] = (round(max(plo, mid - half), 2), round(min(phi, mid + half), 2))
+    return out
 
 
-def step(signs, profile, rng, dt=1.0):
+def initial_signs(profile, rng, acuity=3):
+    """Draw a starting set of vitals inside the profile's range."""
+    ranges = effective_ranges(profile, acuity)
+    return {k: round(rng.uniform(*v), 2) for k, v in ranges.items()}
+
+
+def step(signs, profile, rng, dt=1.0, acuity=3):
     """One random-walk step, mean-reverting to the profile midpoint."""
-    ranges = PROFILES[profile]
+    validate_acuity(acuity)
+    ranges = effective_ranges(profile, acuity)
+    sigma = ACUITY_SIGMA[acuity]
     out = {}
     for key, (lo, hi) in ranges.items():
         mid = (lo + hi) / 2.0
-        value = signs[key] + rng.gauss(0, SIGMA[key] * dt) + (mid - signs[key]) * 0.05
+        value = signs[key] + rng.gauss(0, SIGMA[key] * sigma * dt) + (mid - signs[key]) * 0.05
         out[key] = round(max(lo, min(hi, value)), 2)
     return out
 

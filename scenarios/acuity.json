@@ -1,0 +1,1 @@
+{"beds":4,"host":"127.0.0.1","patients":[{"acuity":1,"bed":0,"profile":"tachycardic"},{"acuity":2,"bed":1,"profile":"hypoxic"},{"acuity":3,"bed":2,"profile":"stable"},{"acuity":4,"bed":3,"profile":"stable"}],"port":8080,"rate_hz":1.0}
