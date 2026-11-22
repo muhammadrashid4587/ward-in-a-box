@@ -1,8 +1,21 @@
 """HTTP endpoint streaming ward vitals as JSON lines (stdlib only)."""
 
 import json
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from .websocket import (
+    OP_BINARY,
+    OP_CLOSE,
+    OP_CONTINUATION,
+    OP_PING,
+    OP_PONG,
+    OP_TEXT,
+    accept_key,
+    encode_frame,
+    read_frame,
+)
 
 
 def make_handler(ward):
@@ -57,8 +70,89 @@ def make_handler(ward):
                         time.sleep(1.0 / ward.rate_hz)
                 except (BrokenPipeError, ConnectionResetError):
                     pass
+            elif self.path == "/ws":
+                if ward.partitioned:
+                    self._send_json(503, {"error": "partitioned"})
+                    return
+                key = self.headers.get("Sec-WebSocket-Key")
+                upgrade = (self.headers.get("Upgrade") or "").lower()
+                connection = (self.headers.get("Connection") or "").lower()
+                if not key or upgrade != "websocket" or "upgrade" not in connection:
+                    self._send_json(400, {"error": "expected a WebSocket upgrade"})
+                    return
+                self.send_response(101, "Switching Protocols")
+                self.send_header("Upgrade", "websocket")
+                self.send_header("Connection", "Upgrade")
+                self.send_header("Sec-WebSocket-Accept", accept_key(key))
+                self.end_headers()
+                self._ws_loop(ward)
+                self.close_connection = True
             else:
                 self._send_json(404, {"error": "not found"})
+
+        def _ws_loop(self, ward):
+            """Stream one ward tick per text frame until the client closes.
+
+            A reader thread handles client frames (ping/pong, close,
+            fragmented messages); this thread sends the ticks. Writes share
+            one lock so a pong and a tick frame can never interleave.
+            """
+            stop = threading.Event()
+            write_lock = threading.Lock()
+
+            def send(opcode, payload):
+                with write_lock:
+                    self.wfile.write(encode_frame(payload, opcode))
+                    self.wfile.flush()
+
+            def reader():
+                try:
+                    message = bytearray()
+                    while not stop.is_set():
+                        fin, opcode, payload = read_frame(self.rfile)
+                        if opcode is None:  # clean EOF
+                            break
+                        if opcode == OP_CLOSE:
+                            try:
+                                send(OP_CLOSE, payload)
+                            except OSError:
+                                pass
+                            break
+                        if opcode == OP_PING:
+                            send(OP_PONG, payload)
+                            continue
+                        if opcode == OP_PONG:
+                            continue
+                        if opcode in (OP_TEXT, OP_BINARY):
+                            message = bytearray(payload)
+                        elif opcode == OP_CONTINUATION:
+                            message += payload
+                        else:
+                            continue
+                        if fin:
+                            # Client messages are accepted and ignored for
+                            # now; the ward pushes ticks, it takes no input.
+                            message = bytearray()
+                except (OSError, ConnectionError):
+                    pass
+                finally:
+                    stop.set()
+
+            threading.Thread(target=reader, daemon=True).start()
+            try:
+                while not stop.is_set():
+                    snap = ward.tick()
+                    msg = {
+                        "t": snap["t"],
+                        "beds": snap["beds"],
+                        "alarms": ward.alarm_summary(),
+                    }
+                    send(OP_TEXT, json.dumps(msg))
+                    stop.wait(1.0 / ward.rate_hz)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            finally:
+                stop.set()
 
     return WardHandler
 

@@ -45,6 +45,8 @@ python3 -m ward.cli scenarios/example.json --seed 42
 - `GET /health` — `{"status": "ok", "beds": 12}`
 - `GET /snapshot` — the latest reading for every bed as JSON
 - `GET /stream` — the ward ticking live, one JSON object per line
+- `GET /ws` — WebSocket endpoint streaming one JSON message per tick
+  (beds plus alarm summary; see below)
 - `GET /alarms` — per-bed alarm history and rate metrics as JSON
   (503 while partitioned)
 
@@ -61,6 +63,25 @@ Offline beds appear as `{"bed": 2, "online": false, "t": 30.0}`.
 Beds not yet admitted by a scenario timeline appear the same way,
 with an extra `"admitted": false`. While a partition is active,
 `/snapshot` and `/stream` return 503.
+
+## WebSocket endpoint
+
+`GET /ws` with a standard WebSocket upgrade (`Upgrade: websocket`,
+`Sec-WebSocket-Key`) returns `101 Switching Protocols` and then
+streams one JSON text frame per tick at the ward rate:
+
+```json
+{"t": 30.0, "beds": [...], "alarms": {"t": 30.0, "beds": [...], "total_raised": 3, "rate_per_min": 1.2}}
+```
+
+Each frame carries the same snapshot as `/snapshot` plus the alarm
+summary from `/alarms`, so a client gets bed occupancy, vitals, and
+alarms in one message. Ping frames are answered with pong, close frames
+are echoed and the connection is then closed; text frames from the
+client are accepted and ignored — the ward pushes ticks, it takes no
+input. While a partition is active the upgrade is refused with 503,
+like the other live endpoints. Pure stdlib: the framing is a minimal
+hand-rolled RFC 6455 implementation in `ward/websocket.py`.
 
 ## Alarm history and rates
 
@@ -146,7 +167,7 @@ admitted. See `scenarios/ramp-up.json` for a runnable example.
 make test
 ```
 
-29 tests: vitals stay inside plausible ranges, dropout actually stops a
+40 tests: vitals stay inside plausible ranges, dropout actually stops a
 monitor's stream, an alarm storm produces alarms, stale readings freeze,
 a partition blocks the snapshot endpoint, the HTTP endpoints serve valid
 JSON, the stream serves JSON lines, scenario files validate, alarm
@@ -156,9 +177,11 @@ the ward summary aggregates per-bed alarms, and `/alarms` serves JSON
 phases, per-bed admission times, decreasing-target and bad-value
 rejection, beds coming online as the timeline admits them, a timeline
 target above the bed count, and the `ramp-up.json` scenario loading and
-filling the ward.
+filling the ward. WebSocket tests cover the RFC 6455 accept key and
+frame round-trip, the 101 handshake, tick frames carrying beds and
+alarms, ping/pong, the close handshake, fragmented client messages, a
+400 without upgrade headers, and a 503 while partitioned.
 
 ## Roadmap
 
-- WebSocket endpoint alongside the JSON-lines stream
 - Recording a run to a file for replay

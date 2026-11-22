@@ -1,10 +1,14 @@
 """Tests for ward-in-a-box."""
 
+import base64
+import hashlib
 import http.client
 import io
 import json
 import os
 import random
+import socket
+import struct
 import sys
 import threading
 import unittest
@@ -20,6 +24,7 @@ from ward.server import make_handler
 from ward.timeline import Timeline, TimelinePhase
 from ward.vitals import PROFILES
 from ward.ward import Ward
+from ward.websocket import accept_key, encode_frame, read_frame
 
 HERE = os.path.dirname(__file__)
 
@@ -407,6 +412,207 @@ class TestScenario(unittest.TestCase):
         self.assertEqual(rc, 0)
         snap = json.loads(buf.getvalue())
         self.assertEqual(len(snap["beds"]), 2)
+
+
+class TestWebSocketFraming(unittest.TestCase):
+    def test_accept_key_matches_rfc6455_example(self):
+        # The worked example from RFC 6455, section 1.3.
+        self.assertEqual(
+            accept_key("dGhlIHNhbXBsZSBub25jZQ=="),
+            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=",
+        )
+
+    def test_encode_read_frame_round_trip(self):
+        for payload in (b"hello", b"x" * 200, b"y" * 70000):
+            buf = io.BytesIO(encode_frame(payload))
+            fin, opcode, out = read_frame(buf)
+            self.assertTrue(fin)
+            self.assertEqual(opcode, 1)
+            self.assertEqual(out, payload)
+
+    def test_read_frame_unmasks_client_payload(self):
+        mask = b"\x37\xfa\x21\x3d"
+        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(b"Hello"))
+        frame = bytes([0x81, 0x80 | 5]) + mask + masked
+        fin, opcode, out = read_frame(io.BytesIO(frame))
+        self.assertTrue(fin)
+        self.assertEqual(opcode, 1)
+        self.assertEqual(out, b"Hello")
+
+    def test_read_frame_empty_on_clean_eof(self):
+        self.assertEqual(read_frame(io.BytesIO(b"")), (False, None, b""))
+
+
+class WsClient:
+    """Minimal WebSocket client for tests (masked frames, like a browser)."""
+
+    def __init__(self, port):
+        self.sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        self.buf = b""
+        self.key = base64.b64encode(os.urandom(16)).decode()
+        req = (
+            "GET /ws HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+            "Sec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n" % self.key
+        )
+        self.sock.sendall(req.encode())
+        head = self._read_until(b"\r\n\r\n")
+        lines = head.decode().split("\r\n")
+        self.status = int(lines[0].split()[1])
+        self.headers = {}
+        for line in lines[1:]:
+            if line:
+                k, v = line.split(": ", 1)
+                self.headers[k.lower()] = v
+
+    def _read_until(self, sep):
+        while sep not in self.buf:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("EOF waiting for %r" % sep)
+            self.buf += chunk
+        out, self.buf = self.buf.split(sep, 1)
+        return out + sep
+
+    def _read_exact(self, n):
+        while len(self.buf) < n:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("EOF while reading frame")
+            self.buf += chunk
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    def read_frame(self):
+        head = self._read_exact(2)
+        opcode = head[0] & 0x0F
+        length = head[1] & 0x7F
+        if length == 126:
+            length = struct.unpack(">H", self._read_exact(2))[0]
+        elif length == 127:
+            length = struct.unpack(">Q", self._read_exact(8))[0]
+        payload = self._read_exact(length) if length else b""
+        return opcode, payload
+
+    def read_until_opcode(self, opcode, limit=20):
+        for _ in range(limit):
+            got, payload = self.read_frame()
+            if got == opcode:
+                return payload
+        raise AssertionError("no frame with opcode %d in %d frames" % (opcode, limit))
+
+    def send_frame(self, payload, opcode=0x1, fin=True):
+        if isinstance(payload, str):
+            payload = payload.encode()
+        mask = os.urandom(4)
+        first = (0x80 if fin else 0x00) | opcode
+        n = len(payload)
+        if n < 126:
+            header = bytes([first, 0x80 | n])
+        elif n < 65536:
+            header = bytes([first, 0x80 | 126]) + struct.pack(">H", n)
+        else:
+            header = bytes([first, 0x80 | 127]) + struct.pack(">Q", n)
+        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        self.sock.sendall(header + mask + masked)
+
+    def close(self):
+        self.sock.close()
+
+
+class TestWebSocketEndpoint(unittest.TestCase):
+    def setUp(self):
+        self.ward = Ward(beds=4, rate_hz=20.0, seed=5)
+        self.server, self.port = serve_in_thread(self.ward)
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+    def test_handshake_returns_101_and_correct_accept(self):
+        ws = WsClient(self.port)
+        try:
+            self.assertEqual(ws.status, 101)
+            self.assertEqual(ws.headers.get("upgrade"), "websocket")
+            self.assertEqual(
+                ws.headers.get("sec-websocket-accept"), accept_key(ws.key)
+            )
+        finally:
+            ws.close()
+
+    def test_streams_tick_frames_with_beds_and_alarms(self):
+        ws = WsClient(self.port)
+        try:
+            first = json.loads(ws.read_until_opcode(1))
+            second = json.loads(ws.read_until_opcode(1))
+            for msg in (first, second):
+                self.assertEqual(len(msg["beds"]), 4)
+                self.assertTrue(all("heart_rate" in b for b in msg["beds"] if b["online"]))
+                self.assertIn("total_raised", msg["alarms"])
+                self.assertIn("rate_per_min", msg["alarms"])
+                self.assertEqual(len(msg["alarms"]["beds"]), 4)
+            self.assertGreater(second["t"], first["t"])
+        finally:
+            ws.close()
+
+    def test_ping_gets_pong(self):
+        ws = WsClient(self.port)
+        try:
+            ws.send_frame("hello", opcode=0x9)
+            self.assertEqual(ws.read_until_opcode(0xA), b"hello")
+        finally:
+            ws.close()
+
+    def test_close_handshake(self):
+        ws = WsClient(self.port)
+        ws.send_frame(b"", opcode=0x8)
+        # A tick frame may land before the close echo; skip past it.
+        ws.read_until_opcode(0x8)
+        # Server closes the socket after replying to close.
+        with self.assertRaises(ConnectionError):
+            ws.read_frame()
+        ws.close()
+
+    def test_fragmented_client_message_is_accepted(self):
+        ws = WsClient(self.port)
+        try:
+            ws.send_frame("hel", opcode=0x1, fin=False)
+            ws.send_frame("lo", opcode=0x0, fin=True)
+            # Stream keeps ticking after the fragmented message.
+            msg = json.loads(ws.read_until_opcode(1))
+            self.assertEqual(len(msg["beds"]), 4)
+        finally:
+            ws.close()
+
+    def test_ws_without_upgrade_headers_is_400(self):
+        status, body = get(self.port, "/ws")
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body)["error"], "expected a WebSocket upgrade")
+
+    def test_ws_is_503_while_partitioned(self):
+        ward = Ward(beds=2, chaos=[ChaosEvent("partition", at=1, duration=5)], seed=4)
+        ward.tick()  # t=1: partitioned
+        server, port = serve_in_thread(ward)
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+            try:
+                conn.request(
+                    "GET",
+                    "/ws",
+                    headers={
+                        "Upgrade": "websocket",
+                        "Connection": "Upgrade",
+                        "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ==",
+                        "Sec-WebSocket-Version": "13",
+                    },
+                )
+                resp = conn.getresponse()
+                self.assertEqual(resp.status, 503)
+            finally:
+                conn.close()
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 if __name__ == "__main__":
