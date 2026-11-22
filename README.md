@@ -36,6 +36,11 @@ python3 -m ward.cli --beds 6 --rate 2 --port 9000
 # Print one snapshot and exit
 python3 -m ward.cli --beds 4 --once
 
+# Record a run to a file, then summarise it (or replay its ticks)
+python3 -m ward.cli scenarios/example.json --seed 42 --record run.jsonl
+python3 -m ward.cli --summary run.jsonl
+python3 -m ward.cli --replay run.jsonl
+
 # Reproducible run
 python3 -m ward.cli scenarios/example.json --seed 42
 ```
@@ -161,13 +166,30 @@ may not target more beds than the ward has. Beds keep the profiles
 from the scenario's `patients` list (or the default mix) when they are
 admitted. See `scenarios/ramp-up.json` for a runnable example.
 
+## Recording a run
+
+`--record FILE` writes every tick to a JSONL file: a header line with
+the run's beds, rate, and seed, then one line per tick holding the
+snapshot exactly as the ward emitted it. Plain JSONL, so any tool can
+read a recording without this package.
+
+```sh
+python3 -m ward.cli --summary run.jsonl   # ticks, duration, readings/offline/stale per bed, alarms raised
+python3 -m ward.cli --replay run.jsonl    # the recorded ticks, one JSON object per line
+```
+
+The summary counts an alarm once, when it first appears in a bed's
+reading — the same raise/clear transitions the monitor records. A
+recording with a partition in it still records every tick; the
+endpoints returned 503 while it lasted, the ticks did not stop.
+
 ## Tests
 
 ```sh
 make test
 ```
 
-40 tests: vitals stay inside plausible ranges, dropout actually stops a
+49 tests: vitals stay inside plausible ranges, dropout actually stops a
 monitor's stream, an alarm storm produces alarms, stale readings freeze,
 a partition blocks the snapshot endpoint, the HTTP endpoints serve valid
 JSON, the stream serves JSON lines, scenario files validate, alarm
@@ -180,8 +202,12 @@ target above the bed count, and the `ramp-up.json` scenario loading and
 filling the ward. WebSocket tests cover the RFC 6455 accept key and
 frame round-trip, the 101 handshake, tick frames carrying beds and
 alarms, ping/pong, the close handshake, fragmented client messages, a
-400 without upgrade headers, and a 503 while partitioned.
+400 without upgrade headers, and a 503 while partitioned. Recording
+tests cover the header and tick lines, the summary's tick, duration,
+reading, offline, and alarm counts, an empty recording, tick replay,
+and the `--record`, `--summary`, and `--replay` CLI flags.
 
 ## Roadmap
 
-- Recording a run to a file for replay
+- Recording a run to a file for replay — done in v0.5.0 (`--record`,
+  `--summary`, `--replay`)

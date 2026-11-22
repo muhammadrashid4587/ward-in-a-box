@@ -10,6 +10,7 @@ import random
 import socket
 import struct
 import sys
+import tempfile
 import threading
 import unittest
 from contextlib import redirect_stdout
@@ -20,6 +21,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from ward.chaos import ChaosEvent
 from ward.cli import load_scenario, main
 from ward.monitor import Monitor
+from ward.recorder import Recorder, iter_ticks, summarize
 from ward.server import make_handler
 from ward.timeline import Timeline, TimelinePhase
 from ward.vitals import PROFILES
@@ -613,6 +615,117 @@ class TestWebSocketEndpoint(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+
+class TestRecording(unittest.TestCase):
+    def _recorded(self, ward, ticks, seed=1):
+        path = os.path.join(tempfile.mkdtemp(), "run.jsonl")
+        with Recorder(path, ward.beds, ward.rate_hz, seed=seed) as rec:
+            ward.recorder = rec
+            snaps = [ward.tick() for _ in range(ticks)]
+        return path, snaps
+
+    def test_recorder_writes_header_and_ticks(self):
+        ward = Ward(beds=2, seed=1)
+        path, snaps = self._recorded(ward, 3)
+        with open(path) as f:
+            lines = [json.loads(line) for line in f if line.strip()]
+        self.assertEqual(lines[0]["type"], "header")
+        self.assertEqual(lines[0]["beds"], 2)
+        self.assertEqual(lines[0]["rate_hz"], 1.0)
+        self.assertEqual(lines[0]["seed"], 1)
+        self.assertEqual(len(lines) - 1, 3)
+        for line, snap in zip(lines[1:], snaps):
+            self.assertEqual(line["type"], "tick")
+            self.assertEqual(line["t"], snap["t"])
+            self.assertEqual(len(line["beds"]), 2)
+
+    def test_recorder_counts_ticks(self):
+        ward = Ward(beds=2, seed=1)
+        path, _ = self._recorded(ward, 4)
+        with open(path) as f:
+            self.assertEqual(sum(1 for _ in f), 5)  # header + 4 ticks
+
+    def test_summary_counts_ticks_duration_and_readings(self):
+        ward = Ward(beds=2, seed=1)
+        path, _ = self._recorded(ward, 5)
+        s = summarize(path)
+        self.assertEqual(s["ticks"], 5)
+        self.assertEqual(s["first_t"], 1.0)
+        self.assertEqual(s["last_t"], 5.0)
+        self.assertEqual(s["duration_s"], 4.0)
+        self.assertEqual(s["readings_per_bed"], {0: 5, 1: 5})
+        self.assertEqual(s["offline_ticks_per_bed"], {})
+        self.assertEqual(s["alarms_raised"], 0)
+
+    def test_summary_counts_offline_ticks_and_alarms(self):
+        ward = Ward(
+            beds=2,
+            seed=7,
+            chaos=[
+                ChaosEvent("dropout", at=1, duration=3, bed=0),
+                ChaosEvent("alarm_storm", at=1, duration=5, beds=[1]),
+            ],
+        )
+        path, _ = self._recorded(ward, 5, seed=7)
+        s = summarize(path)
+        self.assertEqual(s["ticks"], 5)
+        self.assertEqual(s["offline_ticks_per_bed"], {0: 3})
+        self.assertEqual(s["readings_per_bed"], {0: 2, 1: 5})
+        self.assertGreaterEqual(s["alarms_raised"], 1)
+
+    def test_summary_of_empty_recording(self):
+        path = os.path.join(tempfile.mkdtemp(), "run.jsonl")
+        Recorder(path, 2, 1.0, seed=1).close()
+        s = summarize(path)
+        self.assertEqual(s["ticks"], 0)
+        self.assertIsNone(s["first_t"])
+        self.assertIsNone(s["duration_s"])
+        self.assertEqual(s["beds"], 2)
+
+    def test_iter_ticks_replays_snapshots(self):
+        ward = Ward(beds=2, seed=1)
+        path, snaps = self._recorded(ward, 3)
+        replayed = list(iter_ticks(path))
+        self.assertEqual(len(replayed), 3)
+        for replayed_snap, snap in zip(replayed, snaps):
+            self.assertEqual(replayed_snap["t"], snap["t"])
+            self.assertEqual(replayed_snap["beds"], snap["beds"])
+
+    def test_cli_record_once_writes_file(self):
+        path = os.path.join(tempfile.mkdtemp(), "run.jsonl")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = main(["--beds", "2", "--once", "--record", path])
+        self.assertEqual(rc, 0)
+        snap = json.loads(buf.getvalue())
+        self.assertEqual(len(snap["beds"]), 2)
+        s = summarize(path)
+        self.assertEqual(s["ticks"], 1)
+        self.assertEqual(s["beds"], 2)
+
+    def test_cli_summary_prints_json(self):
+        ward = Ward(beds=2, seed=1)
+        path, _ = self._recorded(ward, 3)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = main(["--summary", path])
+        self.assertEqual(rc, 0)
+        s = json.loads(buf.getvalue())
+        self.assertEqual(s["ticks"], 3)
+        self.assertEqual(s["readings_per_bed"], {"0": 3, "1": 3})
+
+    def test_cli_replay_prints_tick_lines(self):
+        ward = Ward(beds=2, seed=1)
+        path, snaps = self._recorded(ward, 2)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = main(["--replay", path])
+        self.assertEqual(rc, 0)
+        lines = [json.loads(line) for line in buf.getvalue().splitlines()]
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(lines[0]["t"], snaps[0]["t"])
+        self.assertNotIn("type", lines[0])
 
 
 if __name__ == "__main__":

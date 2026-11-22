@@ -19,10 +19,12 @@ class Ward:
     ``tick()`` advances every monitor one step and returns the snapshot:
     ``{"t": elapsed, "beds": [reading, ...]}``. Offline beds appear as
     ``{"bed": n, "online": false, "t": elapsed}``. ``start()`` runs the
-    same loop in a background thread at ``rate_hz``.
+    same loop in a background thread at ``rate_hz``. Pass a
+    ``recorder`` (a ``ward.recorder.Recorder``) to persist every tick
+    snapshot to a JSONL file.
     """
 
-    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None):
+    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None):
         if not 1 <= beds <= 64:
             raise ValueError("beds must be 1..64")
         if rate_hz <= 0:
@@ -59,6 +61,7 @@ class Ward:
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self.latest = None
+        self.recorder = recorder
 
     def tick(self, dt=None):
         dt = dt if dt is not None else 1.0 / self.rate_hz
@@ -84,6 +87,8 @@ class Ward:
         snap = {"t": self.elapsed, "beds": readings}
         with self._lock:
             self.latest = snap
+        if self.recorder is not None:
+            self.recorder.record(snap)
         return snap
 
     def snapshot(self):

@@ -5,6 +5,7 @@ import json
 import sys
 
 from .chaos import ChaosEvent
+from .recorder import Recorder, iter_ticks, summarize
 from .server import serve
 from .timeline import Timeline, TimelinePhase
 from .vitals import PROFILES
@@ -65,7 +66,7 @@ def load_scenario(path):
     }
 
 
-def build_ward(cfg, seed=None):
+def build_ward(cfg, seed=None, recorder=None):
     return Ward(
         beds=cfg["beds"],
         rate_hz=cfg["rate_hz"],
@@ -73,6 +74,7 @@ def build_ward(cfg, seed=None):
         chaos=cfg["chaos"],
         seed=seed,
         timeline=cfg.get("timeline"),
+        recorder=recorder,
     )
 
 
@@ -88,7 +90,21 @@ def main(argv=None):
     ap.add_argument("--port", type=int, default=None, help="override scenario port")
     ap.add_argument("--seed", type=int, default=None, help="RNG seed for reproducible runs")
     ap.add_argument("--once", action="store_true", help="print one snapshot as JSON and exit")
+    ap.add_argument("--record", metavar="FILE", default=None,
+                    help="record every tick to a JSONL file")
+    ap.add_argument("--summary", metavar="FILE", default=None,
+                    help="print a summary of a recorded run and exit")
+    ap.add_argument("--replay", metavar="FILE", default=None,
+                    help="print a recorded run's ticks as JSON lines and exit")
     args = ap.parse_args(argv)
+
+    if args.summary is not None:
+        print(json.dumps(summarize(args.summary)))
+        return 0
+    if args.replay is not None:
+        for snap in iter_ticks(args.replay):
+            print(json.dumps(snap))
+        return 0
 
     if args.scenario:
         cfg = load_scenario(args.scenario)
@@ -107,18 +123,25 @@ def main(argv=None):
             "port": args.port if args.port is not None else 8080,
         }
 
-    ward = build_ward(cfg, seed=args.seed)
-    if args.once:
-        print(json.dumps(ward.tick()))
-        return 0
+    recorder = None
+    if args.record is not None:
+        recorder = Recorder(args.record, cfg["beds"], cfg["rate_hz"], seed=args.seed)
+    ward = build_ward(cfg, seed=args.seed, recorder=recorder)
+    try:
+        if args.once:
+            print(json.dumps(ward.tick()))
+            return 0
 
-    ward.start()
-    print(
-        "ward-in-a-box: %d beds at %s Hz on http://%s:%d (Ctrl-C to stop)"
-        % (ward.beds, ward.rate_hz, cfg["host"], cfg["port"]),
-        file=sys.stderr,
-    )
-    serve(ward, cfg["host"], cfg["port"])
+        ward.start()
+        print(
+            "ward-in-a-box: %d beds at %s Hz on http://%s:%d (Ctrl-C to stop)"
+            % (ward.beds, ward.rate_hz, cfg["host"], cfg["port"]),
+            file=sys.stderr,
+        )
+        serve(ward, cfg["host"], cfg["port"])
+    finally:
+        if recorder is not None:
+            recorder.close()
     return 0
 
 
