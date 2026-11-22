@@ -1,0 +1,57 @@
+{
+  "beds": 12,
+  "chaos": [
+    {
+      "at": 30,
+      "bed": 2,
+      "duration": 10,
+      "type": "dropout"
+    },
+    {
+      "at": 45,
+      "bed": 5,
+      "duration": 15,
+      "type": "stale"
+    },
+    {
+      "at": 60,
+      "beds": [
+        0,
+        1,
+        2
+      ],
+      "duration": 20,
+      "type": "alarm_storm"
+    },
+    {
+      "at": 90,
+      "duration": 15,
+      "type": "partition"
+    }
+  ],
+  "host": "127.0.0.1",
+  "patients": [
+    {
+      "bed": 0,
+      "profile": "stable"
+    },
+    {
+      "bed": 1,
+      "profile": "stable"
+    },
+    {
+      "bed": 2,
+      "profile": "tachycardic"
+    },
+    {
+      "bed": 3,
+      "profile": "hypoxic"
+    },
+    {
+      "bed": 4,
+      "profile": "febrile"
+    }
+  ],
+  "port": 8080,
+  "rate_hz": 1.0
+}
