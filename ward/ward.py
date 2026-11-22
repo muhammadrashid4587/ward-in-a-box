@@ -6,6 +6,7 @@ import time
 
 from .chaos import ChaosEngine
 from .monitor import Monitor
+from .timeline import Timeline
 from .vitals import PROFILES
 
 # Default patient mix when a scenario does not name profiles.
@@ -21,7 +22,7 @@ class Ward:
     same loop in a background thread at ``rate_hz``.
     """
 
-    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None):
+    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None):
         if not 1 <= beds <= 64:
             raise ValueError("beds must be 1..64")
         if rate_hz <= 0:
@@ -35,10 +36,20 @@ class Ward:
         self.rng = random.Random(seed)
         self.partitioned = False
         self.elapsed = 0.0
+        self.timeline = timeline
+        if timeline is not None and timeline.max_beds > beds:
+            raise ValueError(
+                "timeline targets %d beds, ward has %d beds" % (timeline.max_beds, beds)
+            )
         self.monitors = []
         for i in range(beds):
             profile = profiles[i] if i < len(profiles) else DEFAULT_PROFILES[i % len(DEFAULT_PROFILES)]
-            self.monitors.append(Monitor(i, profile, rng=self.rng))
+            monitor = Monitor(i, profile, rng=self.rng)
+            # With a timeline, beds start unadmitted and come online as
+            # the timeline admits them; without one, all beds start open.
+            if timeline is not None:
+                monitor.admitted = False
+            self.monitors.append(monitor)
         self.chaos = ChaosEngine(chaos or [])
         for ev in self.chaos.events:
             for b in ev.targets(self):
@@ -53,11 +64,20 @@ class Ward:
         dt = dt if dt is not None else 1.0 / self.rate_hz
         self.elapsed = round(self.elapsed + dt, 3)
         self.chaos.apply(self, self.elapsed)
+        if self.timeline is not None:
+            for i, m in enumerate(self.monitors):
+                if not m.admitted:
+                    admitted_at = self.timeline.admission_time(i)
+                    if admitted_at is not None and admitted_at <= self.elapsed:
+                        m.admitted = True
         readings = []
         for m in self.monitors:
             r = m.tick(self.elapsed, dt)
             if r is None:
-                readings.append({"bed": m.bed_id, "online": False, "t": self.elapsed})
+                entry = {"bed": m.bed_id, "online": False, "t": self.elapsed}
+                if not m.admitted:
+                    entry["admitted"] = False
+                readings.append(entry)
             else:
                 r["online"] = True
                 readings.append(r)

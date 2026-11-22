@@ -27,6 +27,9 @@ more.
 # Run the example scenario (12 beds, chaos starts at 30s)
 python3 -m ward.cli scenarios/example.json
 
+# Admissions ramp-up: 4 beds over 10s, then 8 by 50s, then all 12 by 70s
+python3 -m ward.cli scenarios/ramp-up.json
+
 # Ad-hoc ward: 6 beds at 2 Hz on port 9000
 python3 -m ward.cli --beds 6 --rate 2 --port 9000
 
@@ -55,7 +58,9 @@ A reading looks like:
 ```
 
 Offline beds appear as `{"bed": 2, "online": false, "t": 30.0}`.
-While a partition is active, `/snapshot` and `/stream` return 503.
+Beds not yet admitted by a scenario timeline appear the same way,
+with an extra `"admitted": false`. While a partition is active,
+`/snapshot` and `/stream` return 503.
 
 ## Alarm history and rates
 
@@ -108,22 +113,52 @@ Chaos types:
 `bed` targets one bed, `beds` targets several, neither targets all beds
 (`partition` is always ward-wide). Times are elapsed seconds from start.
 
+## Scenario timelines (admissions with ramp-up)
+
+A scenario can add a `timeline` of admission phases. The ward starts
+empty and beds come online as the timeline admits them — useful for
+testing how health software handles a ward filling up, rather than a
+ward that is full from the first second.
+
+```json
+{
+  "beds": 12,
+  "timeline": [
+    {"at": 0, "beds": 4, "ramp_s": 10},
+    {"at": 30, "beds": 8, "ramp_s": 20},
+    {"at": 60, "beds": 12, "ramp_s": 10}
+  ]
+}
+```
+
+Each phase names a target number of occupied beds and a time to reach
+it: starting at `at`, beds are admitted one by one over `ramp_s`
+seconds until `beds` beds are occupied (`ramp_s` 0 admits them all at
+once, at `at`). Between phases the occupancy stays at the last target.
+Targets only go up — this is admissions, not discharges — and a phase
+may not target more beds than the ward has. Beds keep the profiles
+from the scenario's `patients` list (or the default mix) when they are
+admitted. See `scenarios/ramp-up.json` for a runnable example.
+
 ## Tests
 
 ```sh
 make test
 ```
 
-18 tests: vitals stay inside plausible ranges, dropout actually stops a
+29 tests: vitals stay inside plausible ranges, dropout actually stops a
 monitor's stream, an alarm storm produces alarms, stale readings freeze,
 a partition blocks the snapshot endpoint, the HTTP endpoints serve valid
 JSON, the stream serves JSON lines, scenario files validate, alarm
 history records raises and clears, alarm rate counts a trailing window,
 the ward summary aggregates per-bed alarms, and `/alarms` serves JSON
-(503 while partitioned).
+(503 while partitioned). Timeline tests cover linear ramp-up, instant
+phases, per-bed admission times, decreasing-target and bad-value
+rejection, beds coming online as the timeline admits them, a timeline
+target above the bed count, and the `ramp-up.json` scenario loading and
+filling the ward.
 
 ## Roadmap
 
-- Scenario timelines with ramp-up (admissions over time)
 - WebSocket endpoint alongside the JSON-lines stream
 - Recording a run to a file for replay

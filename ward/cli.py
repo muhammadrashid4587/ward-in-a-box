@@ -6,6 +6,7 @@ import sys
 
 from .chaos import ChaosEvent
 from .server import serve
+from .timeline import Timeline, TimelinePhase
 from .vitals import PROFILES
 from .ward import Ward
 
@@ -40,11 +41,25 @@ def load_scenario(path):
             )
         except KeyError as e:
             raise ValueError("chaos event %d: missing %s" % (i, e))
+    timeline = None
+    if "timeline" in data:
+        phases = []
+        for i, ph in enumerate(data.get("timeline") or []):
+            if not isinstance(ph, dict):
+                raise ValueError("timeline phase %d: must be an object" % i)
+            try:
+                phases.append(
+                    TimelinePhase(ph["at"], ph["beds"], ramp_s=ph.get("ramp_s", 0))
+                )
+            except KeyError as e:
+                raise ValueError("timeline phase %d: missing %s" % (i, e))
+        timeline = Timeline(phases)
     return {
         "beds": beds,
         "rate_hz": rate,
         "profiles": profiles,
         "chaos": chaos,
+        "timeline": timeline,
         "host": data.get("host", "127.0.0.1"),
         "port": data.get("port", 8080),
     }
@@ -57,6 +72,7 @@ def build_ward(cfg, seed=None):
         profiles=cfg["profiles"],
         chaos=cfg["chaos"],
         seed=seed,
+        timeline=cfg.get("timeline"),
     )
 
 
@@ -86,6 +102,7 @@ def main(argv=None):
             "rate_hz": args.rate_hz,
             "profiles": [],
             "chaos": [],
+            "timeline": None,
             "host": args.host or "127.0.0.1",
             "port": args.port if args.port is not None else 8080,
         }

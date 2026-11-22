@@ -17,6 +17,7 @@ from ward.chaos import ChaosEvent
 from ward.cli import load_scenario, main
 from ward.monitor import Monitor
 from ward.server import make_handler
+from ward.timeline import Timeline, TimelinePhase
 from ward.vitals import PROFILES
 from ward.ward import Ward
 
@@ -277,6 +278,107 @@ class TestAlarmsHttp(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+
+class TestTimeline(unittest.TestCase):
+    def test_occupied_at_ramps_linearly(self):
+        tl = Timeline([
+            TimelinePhase(at=0, beds=4, ramp_s=10),
+            TimelinePhase(at=30, beds=8, ramp_s=20),
+        ])
+        self.assertEqual(tl.occupied_at(0), 0)
+        self.assertEqual(tl.occupied_at(5), 2)
+        self.assertEqual(tl.occupied_at(10), 4)
+        self.assertEqual(tl.occupied_at(20), 4)
+        self.assertEqual(tl.occupied_at(40), 6)
+        self.assertEqual(tl.occupied_at(50), 8)
+        self.assertEqual(tl.occupied_at(999), 8)
+
+    def test_instant_phase_admits_at_once(self):
+        tl = Timeline([TimelinePhase(at=5, beds=3, ramp_s=0)])
+        self.assertEqual(tl.occupied_at(4.9), 0)
+        self.assertEqual(tl.occupied_at(5), 3)
+
+    def test_admission_time_spreads_beds_over_ramp(self):
+        tl = Timeline([TimelinePhase(at=0, beds=4, ramp_s=10)])
+        self.assertEqual(tl.admission_time(0), 2.5)
+        self.assertEqual(tl.admission_time(1), 5.0)
+        self.assertEqual(tl.admission_time(2), 7.5)
+        self.assertEqual(tl.admission_time(3), 10.0)
+        self.assertIsNone(tl.admission_time(4))
+
+    def test_admission_time_across_phases(self):
+        tl = Timeline([
+            TimelinePhase(at=0, beds=2, ramp_s=2),
+            TimelinePhase(at=5, beds=4, ramp_s=0),
+        ])
+        self.assertEqual(tl.admission_time(0), 1.0)
+        self.assertEqual(tl.admission_time(1), 2.0)
+        self.assertEqual(tl.admission_time(2), 5.0)
+        self.assertEqual(tl.admission_time(3), 5.0)
+
+    def test_decreasing_targets_rejected(self):
+        with self.assertRaises(ValueError):
+            Timeline([TimelinePhase(0, 4), TimelinePhase(10, 2)])
+
+    def test_bad_phase_values_rejected(self):
+        with self.assertRaises(ValueError):
+            TimelinePhase(at=-1, beds=2)
+        with self.assertRaises(ValueError):
+            TimelinePhase(at=0, beds=-1)
+        with self.assertRaises(ValueError):
+            TimelinePhase(at=0, beds=2, ramp_s=-1)
+
+    def test_phases_sort_by_start_time(self):
+        tl = Timeline([TimelinePhase(30, 8, 20), TimelinePhase(0, 4, 10)])
+        self.assertEqual(tl.occupied_at(5), 2)
+        self.assertEqual(tl.max_beds, 8)
+
+
+class TestTimelineWard(unittest.TestCase):
+    def test_beds_come_online_as_timeline_admits_them(self):
+        ward = Ward(
+            beds=4,
+            timeline=Timeline([
+                TimelinePhase(at=0, beds=2, ramp_s=2),
+                TimelinePhase(at=5, beds=4, ramp_s=0),
+            ]),
+            seed=11,
+        )
+        snap = ward.tick()  # t=1: bed 0 admitted at t=1
+        self.assertTrue(snap["beds"][0]["online"])
+        self.assertFalse(snap["beds"][1]["online"])
+        self.assertFalse(snap["beds"][1]["admitted"])
+        snap = ward.tick()  # t=2: bed 1 admitted at t=2
+        self.assertTrue(snap["beds"][1]["online"])
+        self.assertFalse(snap["beds"][2]["online"])
+        for _ in range(3):  # t=5: instant phase admits beds 2 and 3
+            snap = ward.tick()
+        self.assertTrue(all(b["online"] for b in snap["beds"]))
+
+    def test_timeline_target_above_bed_count_rejected(self):
+        with self.assertRaises(ValueError):
+            Ward(beds=2, timeline=Timeline([TimelinePhase(0, 3)]))
+
+    def test_ramp_up_scenario_loads_and_fills(self):
+        cfg = load_scenario(os.path.join(HERE, "..", "scenarios", "ramp-up.json"))
+        self.assertEqual(cfg["beds"], 12)
+        self.assertEqual(len(cfg["timeline"].phases), 3)
+        ward = Ward(beds=cfg["beds"], rate_hz=cfg["rate_hz"], profiles=cfg["profiles"], chaos=cfg["chaos"], timeline=cfg["timeline"], seed=12)
+        snap = ward.tick()  # t=1: no bed admitted yet (first at t=2.5)
+        self.assertFalse(any(b["online"] for b in snap["beds"]))
+        for _ in range(69):  # t=70: last ramp ends at t=70
+            snap = ward.tick()
+        self.assertTrue(all(b["online"] for b in snap["beds"]))
+
+    def test_cli_once_with_ramp_up_scenario(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = main([os.path.join(HERE, "..", "scenarios", "ramp-up.json"), "--once"])
+        self.assertEqual(rc, 0)
+        snap = json.loads(buf.getvalue())
+        self.assertEqual(len(snap["beds"]), 12)
+        self.assertFalse(any(b["online"] for b in snap["beds"]))
 
 
 class TestScenario(unittest.TestCase):

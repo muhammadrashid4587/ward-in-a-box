@@ -35,6 +35,9 @@ class Monitor:
         self.rng = rng if rng is not None else random.Random()
         self.signs = initial_signs(profile, self.rng)
         self.seq = 0
+        # False until the ward admits this bed (scenario timeline); an
+        # unadmitted bed emits no readings at all.
+        self.admitted = True
         self.offline_until = None
         self.stale_until = None
         self.alarm_until = None
@@ -44,6 +47,8 @@ class Monitor:
         self._active_alarms = set()
 
     def tick(self, now, dt=1.0):
+        if not self.admitted:
+            return None
         if self.offline_until is not None:
             if now < self.offline_until:
                 return None
