@@ -41,6 +41,9 @@ python3 -m ward.cli scenarios/example.json --seed 42 --record run.jsonl
 python3 -m ward.cli --summary run.jsonl
 python3 -m ward.cli --replay run.jsonl
 
+# Staffing demo: full day roster, one nurse on nights from 19:00
+python3 -m ward.cli scenarios/staffing.json --seed 42
+
 # Reproducible run
 python3 -m ward.cli scenarios/example.json --seed 42
 ```
@@ -48,11 +51,15 @@ python3 -m ward.cli scenarios/example.json --seed 42
 ## Endpoints
 
 - `GET /health` — `{"status": "ok", "beds": 12}`
-- `GET /snapshot` — the latest reading for every bed as JSON
+- `GET /snapshot` — the latest reading for every bed as JSON,
+  plus a `"staffing"` object (see below)
 - `GET /stream` — the ward ticking live, one JSON object per line
 - `GET /ws` — WebSocket endpoint streaming one JSON message per tick
-  (beds plus alarm summary; see below)
+  (beds plus alarm and staffing summaries; see below)
 - `GET /alarms` — per-bed alarm history and rate metrics as JSON
+  (503 while partitioned)
+- `GET /staffing` — the current shift, roster on duty, nurse-to-patient
+  ratio, alarm acknowledgement and vitals-check metrics as JSON
   (503 while partitioned)
 
 A reading looks like:
@@ -76,12 +83,12 @@ with an extra `"admitted": false`. While a partition is active,
 streams one JSON text frame per tick at the ward rate:
 
 ```json
-{"t": 30.0, "beds": [...], "alarms": {"t": 30.0, "beds": [...], "total_raised": 3, "rate_per_min": 1.2}}
+{"t": 30.0, "beds": [...], "alarms": {"t": 30.0, "beds": [...], "total_raised": 3, "rate_per_min": 1.2}, "staffing": {"t": 30.0, "shift": "day", "on_shift": {"nurse": 3, "doctor": 1, "tech": 1}, "patients_per_nurse": 4.0, "adequate": true, "alarms": {"raised": 3, "acked": 3, "pending": 0, "mean_time_to_ack_s": 30.0}, "checks": {"performed": 12, "delayed": 0}}}
 ```
 
 Each frame carries the same snapshot as `/snapshot` plus the alarm
-summary from `/alarms`, so a client gets bed occupancy, vitals, and
-alarms in one message. Ping frames are answered with pong, close frames
+summary from `/alarms` and the staffing summary from `/staffing`, so a
+client gets bed occupancy, vitals, alarms, and staffing in one message. Ping frames are answered with pong, close frames
 are echoed and the connection is then closed; text frames from the
 client are accepted and ignored — the ward pushes ticks, it takes no
 input. While a partition is active the upgrade is refused with 503,
@@ -163,6 +170,39 @@ Chaos types:
 `bed` targets one bed, `beds` targets several, neither targets all beds
 (`partition` is always ward-wide). Times are elapsed seconds from start.
 
+## Staffing and shifts
+
+The ward runs on two shifts — day 07:00–19:00, night 19:00–07:00 —
+each with its own roster of nurses, doctors, and techs, set in the
+scenario:
+
+```json
+{"staffing": {
+  "start_hour": 18,
+  "day": {"nurse": 3, "doctor": 1, "tech": 1},
+  "night": {"nurse": 1, "doctor": 1, "tech": 0}
+}}
+```
+
+The ward clock starts at `start_hour` (08:00 by default, an hour into
+the day shift). What matters for care is the nurse-to-patient ratio:
+one nurse keeps up with up to four occupied beds. Past that, alarms
+take longer to acknowledge and routine vitals checks slip later, in
+proportion to the overload. The first fifteen minutes after a shift
+change are a handover, when response is half as fast again even with
+a full roster. The model is deterministic: with an adequate roster an
+alarm is acknowledged 30 seconds after it is raised and a vitals
+check is due every 60 seconds; a ward with one nurse for twelve beds
+acknowledges in 90 seconds and its checks run every 180 seconds, so
+they count as delayed. `GET /staffing` (and every snapshot and
+WebSocket frame) reports the shift, the roster on duty, the ratio,
+whether it is adequate, the current load factor, alarms raised/acked/
+pending with mean time-to-ack, and checks performed/delayed. See
+`scenarios/staffing.json` for a ward that is fine on days and thin on
+nights: over a seeded 400-tick alarm storm the full roster
+acknowledged in 30.0 s on average with 0 delayed checks, against
+90.0 s and 24 delayed checks with one nurse.
+
 ## Scenario timelines (admissions with ramp-up)
 
 A scenario can add a `timeline` of admission phases. The ward starts
@@ -213,7 +253,7 @@ endpoints returned 503 while it lasted, the ticks did not stop.
 make test
 ```
 
-59 tests: vitals stay inside plausible ranges, dropout actually stops a
+72 tests: vitals stay inside plausible ranges, dropout actually stops a
 monitor's stream, an alarm storm produces alarms, stale readings freeze,
 a partition blocks the snapshot endpoint, the HTTP endpoints serve valid
 JSON, the stream serves JSON lines, scenario files validate, alarm
@@ -234,11 +274,20 @@ cover range widening and narrowing by level, the plausible envelope,
 rejection of bad acuity values, the default of 3, readings and alarm
 summaries carrying acuity, a critical patient swinging and alarming
 more than a low-acuity one, ward-level acuities, and the `acuity.json`
-scenario loading with per-bed acuities.
+scenario loading with per-bed acuities. Staffing tests cover day/night
+shift boundaries, roster counts per shift, the fifteen-minute handover
+window, the load factor at 1:4, 1:6, and 1:12 ratios and during
+handover, zero nurses on shift, rejection of bad rosters, a seeded
+alarm storm proving one nurse for twelve beds triples mean time-to-ack
+(90.0 s vs 30.0 s) and delays vitals checks (24 delayed vs 0),
+staffing in snapshots and ward summaries, the `/staffing` endpoint
+(503 while partitioned), and the `staffing.json` scenario loading with
+per-shift rosters.
 
 ## Roadmap
 
 - Patient acuity model (acuity 1-4 driving vitals volatility and
   alarm rates) — done in v0.6.0
 - Staffing/shift model (nurse-to-patient ratios affecting alarm
-  response times)
+  response times) — done in v0.7.0
+- Bed turnover (discharges and new admissions refilling beds)

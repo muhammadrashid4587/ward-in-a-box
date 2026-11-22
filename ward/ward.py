@@ -6,6 +6,7 @@ import time
 
 from .chaos import ChaosEngine
 from .monitor import Monitor
+from .staffing import Staffing
 from .timeline import Timeline
 from .vitals import PROFILES, validate_acuity
 
@@ -17,14 +18,14 @@ class Ward:
     """A simulated ward.
 
     ``tick()`` advances every monitor one step and returns the snapshot:
-    ``{"t": elapsed, "beds": [reading, ...]}``. Offline beds appear as
-    ``{"bed": n, "online": false, "t": elapsed}``. ``start()`` runs the
+    ``{"t": elapsed, "beds": [reading, ...], "staffing": {...}}``. Offline
+    beds appear as ``{"bed": n, "online": false, "t": elapsed}``. ``start()`` runs the
     same loop in a background thread at ``rate_hz``. Pass a
     ``recorder`` (a ``ward.recorder.Recorder``) to persist every tick
     snapshot to a JSONL file.
     """
 
-    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None):
+    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None):
         if not 1 <= beds <= 64:
             raise ValueError("beds must be 1..64")
         if rate_hz <= 0:
@@ -36,6 +37,14 @@ class Ward:
         acuities = acuities or []
         for a in acuities:
             validate_acuity(a)
+        if staffing is None:
+            self.staffing = Staffing()
+        elif isinstance(staffing, Staffing):
+            self.staffing = staffing
+        elif isinstance(staffing, dict):
+            self.staffing = Staffing(**staffing)
+        else:
+            raise ValueError("staffing must be a Staffing or a dict, got %r" % (staffing,))
         self.beds = beds
         self.rate_hz = rate_hz
         self.rng = random.Random(seed)
@@ -78,6 +87,7 @@ class Ward:
                     if admitted_at is not None and admitted_at <= self.elapsed:
                         m.admitted = True
         readings = []
+        online = []
         for m in self.monitors:
             r = m.tick(self.elapsed, dt)
             if r is None:
@@ -88,7 +98,13 @@ class Ward:
             else:
                 r["online"] = True
                 readings.append(r)
-        snap = {"t": self.elapsed, "beds": readings}
+                online.append(m.bed_id)
+        occupied = sum(1 for m in self.monitors if m.admitted)
+        self.staffing.tick(self.elapsed, occupied, online)
+        for m in self.monitors:
+            for alarm in m.raised_this_tick:
+                self.staffing.alarm_raised(m.bed_id, alarm, self.elapsed, occupied)
+        snap = {"t": self.elapsed, "beds": readings, "staffing": self.staffing.summary(self.elapsed, occupied)}
         with self._lock:
             self.latest = snap
         if self.recorder is not None:
@@ -109,6 +125,11 @@ class Ward:
             "total_raised": sum(b["total_raised"] for b in beds),
             "rate_per_min": round(sum(b["rate_per_min"] for b in beds), 3),
         }
+
+    def staffing_summary(self):
+        """Current staffing state and care metrics."""
+        occupied = sum(1 for m in self.monitors if m.admitted)
+        return self.staffing.summary(self.elapsed, occupied)
 
     def start(self):
         if self._thread is not None:

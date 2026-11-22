@@ -46,8 +46,12 @@ class Monitor:
         self.alarm_history = deque(maxlen=MAX_ALARM_HISTORY)
         self.total_raised = 0
         self._active_alarms = set()
+        # Alarms raised by the most recent tick; the ward reads this to
+        # hand them to the staffing model for acknowledgement.
+        self.raised_this_tick = []
 
     def tick(self, now, dt=1.0):
+        self.raised_this_tick = []
         if not self.admitted:
             return None
         if self.offline_until is not None:
@@ -100,7 +104,9 @@ class Monitor:
         """
         now = round(now, 3)
         current = set(alarms)
-        for name in sorted(current - self._active_alarms):
+        raised = sorted(current - self._active_alarms)
+        self.raised_this_tick = raised
+        for name in raised:
             self.alarm_history.append(
                 {"alarm": name, "raised_t": now, "cleared_t": None}
             )

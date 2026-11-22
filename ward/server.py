@@ -55,6 +55,11 @@ def make_handler(ward):
                     self._send_json(503, {"error": "partitioned"})
                     return
                 self._send_json(200, ward.alarm_summary())
+            elif self.path == "/staffing":
+                if ward.partitioned:
+                    self._send_json(503, {"error": "partitioned"})
+                    return
+                self._send_json(200, ward.staffing_summary())
             elif self.path == "/stream":
                 if ward.partitioned:
                     self._send_json(503, {"error": "partitioned"})
@@ -146,6 +151,7 @@ def make_handler(ward):
                         "t": snap["t"],
                         "beds": snap["beds"],
                         "alarms": ward.alarm_summary(),
+                        "staffing": ward.staffing_summary(),
                     }
                     send(OP_TEXT, json.dumps(msg))
                     stop.wait(1.0 / ward.rate_hz)

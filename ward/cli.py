@@ -7,6 +7,7 @@ import sys
 from .chaos import ChaosEvent
 from .recorder import Recorder, iter_ticks, summarize
 from .server import serve
+from .staffing import Staffing
 from .timeline import Timeline, TimelinePhase
 from .vitals import PROFILES, validate_acuity
 from .ward import Ward
@@ -62,6 +63,14 @@ def load_scenario(path):
             except KeyError as e:
                 raise ValueError("timeline phase %d: missing %s" % (i, e))
         timeline = Timeline(phases)
+    staffing = None
+    if "staffing" in data:
+        if not isinstance(data["staffing"], dict):
+            raise ValueError("staffing must be an object")
+        try:
+            staffing = Staffing(**data["staffing"])
+        except (TypeError, ValueError) as e:
+            raise ValueError("staffing: %s" % e)
     return {
         "beds": beds,
         "rate_hz": rate,
@@ -69,6 +78,7 @@ def load_scenario(path):
         "acuities": acuities,
         "chaos": chaos,
         "timeline": timeline,
+        "staffing": staffing,
         "host": data.get("host", "127.0.0.1"),
         "port": data.get("port", 8080),
     }
@@ -83,6 +93,7 @@ def build_ward(cfg, seed=None, recorder=None):
         chaos=cfg["chaos"],
         seed=seed,
         timeline=cfg.get("timeline"),
+        staffing=cfg.get("staffing"),
         recorder=recorder,
     )
 
@@ -128,6 +139,7 @@ def main(argv=None):
             "profiles": [],
             "chaos": [],
             "timeline": None,
+            "staffing": None,
             "host": args.host or "127.0.0.1",
             "port": args.port if args.port is not None else 8080,
         }

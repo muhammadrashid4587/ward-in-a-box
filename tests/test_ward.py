@@ -23,6 +23,7 @@ from ward.cli import build_ward, load_scenario, main
 from ward.monitor import Monitor
 from ward.recorder import Recorder, iter_ticks, summarize
 from ward.server import make_handler
+from ward.staffing import Staffing
 from ward.timeline import Timeline, TimelinePhase
 from ward.vitals import PROFILES, effective_ranges, validate_acuity
 from ward.ward import Ward
@@ -806,6 +807,140 @@ class TestAcuity(unittest.TestCase):
     def test_scenario_rejects_bad_acuity(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             json.dump({"beds": 1, "patients": [{"profile": "stable", "acuity": 0}]}, f)
+            path = f.name
+        try:
+            with self.assertRaises(ValueError):
+                load_scenario(path)
+        finally:
+            os.unlink(path)
+
+
+class TestStaffing(unittest.TestCase):
+    def test_shift_is_day_midday_and_night_after_19(self):
+        s = Staffing(start_hour=8)
+        self.assertEqual(s.shift_at(0), "day")        # 08:00
+        self.assertEqual(s.shift_at(36000), "day")    # 18:00
+        self.assertEqual(s.shift_at(39600), "night")  # 19:00
+        self.assertEqual(s.shift_at(79200), "night")  # 06:00 next day
+        self.assertEqual(s.shift_at(82800), "day")    # 07:00 next day
+        self.assertEqual(s.shift_at(86400), "day")    # 08:00 next day
+
+    def test_on_shift_counts_follow_the_roster(self):
+        s = Staffing(
+            day={"nurse": 3, "doctor": 1, "tech": 1},
+            night={"nurse": 1, "doctor": 1, "tech": 0},
+            start_hour=8,
+        )
+        self.assertEqual(s.on_shift(0)["nurse"], 3)
+        self.assertEqual(s.on_shift(39600)["nurse"], 1)
+        self.assertEqual(s.on_shift(39600)["tech"], 0)
+
+    def test_handover_is_the_first_fifteen_minutes_of_a_shift(self):
+        s = Staffing(start_hour=7)
+        self.assertTrue(s.in_handover(0))       # shift just started
+        self.assertTrue(s.in_handover(899))
+        self.assertFalse(s.in_handover(900))
+        self.assertTrue(s.in_handover(43200))   # 19:00, night shift starts
+        self.assertFalse(s.in_handover(44100))
+
+    def test_load_factor_is_one_when_adequate_and_grows_with_overload(self):
+        s = Staffing(day={"nurse": 3}, night={"nurse": 3}, start_hour=8)
+        self.assertEqual(s.load_factor(12, 0), 1.0)   # 4 per nurse
+        self.assertEqual(s.load_factor(6, 0), 1.0)    # 2 per nurse
+        s = Staffing(day={"nurse": 2}, night={"nurse": 2}, start_hour=8)
+        self.assertEqual(s.load_factor(12, 0), 1.5)   # 6 per nurse
+        s = Staffing(day={"nurse": 1}, night={"nurse": 1}, start_hour=8)
+        self.assertEqual(s.load_factor(12, 0), 3.0)   # 12 per nurse
+
+    def test_load_factor_rises_during_handover(self):
+        s = Staffing(day={"nurse": 3}, night={"nurse": 3}, start_hour=7)
+        self.assertEqual(s.load_factor(12, 0), 1.5)
+        self.assertEqual(s.load_factor(12, 900), 1.0)
+
+    def test_no_nurse_on_shift_is_not_adequate(self):
+        s = Staffing(day={"nurse": 0}, night={"nurse": 0}, start_hour=8)
+        self.assertIsNone(s.patients_per_nurse(12, 0))
+        self.assertEqual(s.load_factor(12, 0), 4.0)
+        self.assertFalse(s.summary(0, 12)["adequate"])
+
+    def test_staffing_rejects_bad_roster(self):
+        with self.assertRaises(ValueError):
+            Staffing(day={"nurse": -1})
+        with self.assertRaises(ValueError):
+            Staffing(day={"surgeon": 1})
+        with self.assertRaises(ValueError):
+            Staffing(day={"nurse": 1.5})
+        with self.assertRaises(ValueError):
+            Staffing(start_hour=24)
+
+    def _storm_ward(self, nurses, ticks=400):
+        staffing = {
+            "day": {"nurse": nurses, "doctor": 1, "tech": 1},
+            "night": {"nurse": nurses, "doctor": 1, "tech": 0},
+            "start_hour": 8,
+        }
+        chaos = [ChaosEvent("alarm_storm", 0, 600, beds=list(range(12)))]
+        ward = Ward(beds=12, rate_hz=1.0, chaos=chaos, seed=42, staffing=staffing)
+        for _ in range(ticks):
+            ward.tick()
+        return ward
+
+    def test_understaffing_measurably_worsens_time_to_ack(self):
+        full = self._storm_ward(3).staffing_summary()
+        thin = self._storm_ward(1).staffing_summary()
+        # Same seeded vitals, so both wards raised the same alarms.
+        self.assertEqual(full["alarms"]["raised"], thin["alarms"]["raised"])
+        self.assertGreater(thin["alarms"]["raised"], 0)
+        self.assertEqual(full["alarms"]["acked"], full["alarms"]["raised"])
+        self.assertEqual(thin["alarms"]["acked"], thin["alarms"]["raised"])
+        self.assertEqual(full["alarms"]["mean_time_to_ack_s"], 30.0)
+        self.assertEqual(thin["alarms"]["mean_time_to_ack_s"], 90.0)
+        self.assertFalse(full["adequate"] is False)
+        self.assertFalse(thin["adequate"])
+
+    def test_understaffing_delays_vitals_checks(self):
+        full = self._storm_ward(3).staffing_summary()
+        thin = self._storm_ward(1).staffing_summary()
+        self.assertEqual(full["checks"]["delayed"], 0)
+        self.assertGreater(thin["checks"]["delayed"], 0)
+        self.assertLess(thin["checks"]["performed"], full["checks"]["performed"])
+
+    def test_snapshot_and_ward_summary_carry_staffing(self):
+        ward = self._storm_ward(3, ticks=10)
+        snap = ward.tick()
+        self.assertIn("staffing", snap)
+        self.assertEqual(snap["staffing"]["shift"], "day")
+        self.assertEqual(snap["staffing"]["occupied_beds"], 12)
+        summary = ward.staffing_summary()
+        self.assertEqual(summary["alarms"]["raised"], snap["staffing"]["alarms"]["raised"])
+
+    def test_staffing_endpoint_serves_json_and_is_503_while_partitioned(self):
+        ward = Ward(beds=2, seed=1)
+        ward.tick()
+        server, port = serve_in_thread(ward)
+        try:
+            status, body = get(port, "/staffing")
+            self.assertEqual(status, 200)
+            data = json.loads(body)
+            self.assertEqual(data["occupied_beds"], 2)
+            self.assertIn("mean_time_to_ack_s", data["alarms"])
+            ward.partitioned = True
+            status, _ = get(port, "/staffing")
+            self.assertEqual(status, 503)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_scenario_staffing(self):
+        cfg = load_scenario(os.path.join(HERE, "..", "scenarios", "staffing.json"))
+        self.assertEqual(cfg["staffing"].roster["night"]["nurse"], 1)
+        ward = build_ward(cfg, seed=42)
+        snap = ward.tick()
+        self.assertEqual(snap["staffing"]["on_shift"]["nurse"], 3)
+
+    def test_scenario_rejects_bad_staffing(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"beds": 1, "staffing": {"day": {"nurse": -2}}}, f)
             path = f.name
         try:
             with self.assertRaises(ValueError):
