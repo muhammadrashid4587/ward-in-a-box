@@ -149,6 +149,11 @@ python3 -m ward.cli scenarios/example.json --seed 42
 - `GET /news2` — per-patient NEWS2 early-warning scores and
   deterioration episodes (see below), as JSON (503 while
   partitioned)
+- `GET /news2/history` — per-patient NEWS2 score history: every
+  score this stay, one entry per reading, with the peak score and
+  risk and the latest score (see below); `?bed=N` returns one bed
+  (404 for a bed the ward does not have, 400 for a bed that is not
+  an integer), as JSON (503 while partitioned)
 
 A reading looks like:
 
@@ -989,6 +994,35 @@ closes there, and the confused stable bed recovers to Alert at
 3 s — 7 changes and 5 episodes raised in total, 1 patient not
 Alert at the end.
 
+## NEWS2 score history
+
+`GET /news2` says where each patient is now; `GET /news2/history`
+says how they got there. Every fresh reading appends one entry to
+its bed's history — the time, the score, the risk, the red-score
+flag, the SpO2 scale, the per-parameter components, and the
+consciousness level at that tick — so a client can plot a
+patient's score over the run, or find when they crossed from low
+to medium, without replaying a recording. The history is per stay:
+a new admission clears it, and after a discharge the departed
+patient's history stays, marked unadmitted, until the next
+admission. It is capped at 1000 entries per bed, oldest first out;
+the run summary still counts every tick scored. A stale tick
+repeats the previous reading, so it records nothing — one entry
+per reading, never a duplicate.
+
+Each bed's entry carries the history list, the number of points,
+the peak score and the risk at that score, and the latest entry as
+`"current"`. `GET /news2/history?bed=2` returns one bed; the
+whole-ward form returns every bed. The run summary carries the
+same shape in aggregate per bed: ticks scored, peak score and
+risk, ticks at each risk level, and the first and last scored
+times. See `scenarios/news2-history.json` for a runnable example:
+over a seeded 40-tick run the stable bed stays low (peak 1), the
+hypoxic bed sits medium and drifts to high at the end (peak 7),
+and the febrile bed peaks at 11 under the alarm storm and is low
+again by the end — 10 high ticks, 17 low, the arc visible in the
+history rather than just the final score.
+
 ## Recording a run
 
 `--record FILE` writes every tick to a JSONL file: a header line with
@@ -1324,3 +1358,11 @@ WebSocket frames.
   frame, a `GET /news2` endpoint, and the run summary; off by
   default, deterministic and never changing the vitals or alarms)
   — done in v0.26.0
+- NEWS2 score history (every score this stay recorded per bed —
+  time, score, risk, red-score flag, SpO2 scale, components, and
+  consciousness — one entry per fresh reading, stale ticks
+  recording nothing, capped at 1000 entries per bed and cleared on
+  a new admission, in a `GET /news2/history` endpoint for the ward
+  or one bed with `?bed=N`, and per-bed history totals — ticks
+  scored, peak score and risk, ticks at each risk level — in the
+  run summary) — done in v0.27.0

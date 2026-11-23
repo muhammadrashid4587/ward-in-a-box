@@ -84,7 +84,9 @@ def summarize(path):
     how many occupied beds are flagged ready and how many are not —
     and early-warning totals from the last tick: how many beds are
     at high, medium, and low NEWS2 risk, how many deterioration
-    episodes are open, and how many have raised.
+    episodes are open, and how many have raised — and NEWS2 history
+    totals per bed: ticks scored, peak score and risk, and ticks at
+    each risk level.
     Returns ``None`` fields for a recording with no ticks.
     """
     header = None
@@ -95,6 +97,7 @@ def summarize(path):
     stale = {}
     alarms_raised = 0
     active = {}
+    news2_hist = {}
     last_triage = None
     last_discharge = None
     last_readiness = None
@@ -123,6 +126,35 @@ def summarize(path):
                 last_readiness = obj["discharge_readiness"]
             if isinstance(obj.get("early_warning"), dict):
                 last_early_warning = obj["early_warning"]
+                # NEWS2 history totals per bed, from the score on
+                # each tick's reading: ticks scored, peak score and
+                # the risk at that score, and ticks at each risk
+                # level, with the first and last scored times — so
+                # a run's escalation shape is visible without
+                # replaying every tick.
+                for b in obj["early_warning"].get("beds", []):
+                    n2 = b.get("news2")
+                    if n2 is None:
+                        continue
+                    entry = news2_hist.setdefault(
+                        b["bed"],
+                        {
+                            "ticks": 0,
+                            "peak_score": 0,
+                            "peak_risk": "low",
+                            "ticks_low": 0,
+                            "ticks_medium": 0,
+                            "ticks_high": 0,
+                            "first_t": t,
+                            "last_t": t,
+                        },
+                    )
+                    entry["ticks"] += 1
+                    entry["last_t"] = t
+                    if n2["score"] > entry["peak_score"]:
+                        entry["peak_score"] = n2["score"]
+                        entry["peak_risk"] = n2["risk"]
+                    entry["ticks_" + n2["risk"]] += 1
             for bed in obj["beds"]:
                 b = bed["bed"]
                 if not bed.get("online", True):
@@ -248,4 +280,8 @@ def summarize(path):
             if last_early_warning is not None
             else None
         ),
+        # NEWS2 history totals per bed: ticks scored, peak score
+        # and the risk at that score, ticks at each risk level, and
+        # the first and last scored times.
+        "news2_history": news2_hist,
     }

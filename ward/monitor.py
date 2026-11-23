@@ -26,6 +26,10 @@ ALARM_TARGETS = {
 # history list, but total_raised still counts every alarm ever raised.
 MAX_ALARM_HISTORY = 1000
 
+# Maximum NEWS2 score entries kept per bed. Older scores drop off
+# the history list; the run summary still counts every tick scored.
+MAX_NEWS2_HISTORY = 1000
+
 
 class Monitor:
     """A bedside monitor for one bed.
@@ -65,6 +69,13 @@ class Monitor:
         self.alarm_until = None
         self.last_reading = None
         self.alarm_history = deque(maxlen=MAX_ALARM_HISTORY)
+        # Every NEWS2 score this stay, in tick order, as
+        # {"t": seconds, "score": int, "risk": str, "red_score": bool,
+        # "spo2_scale": 1|2, "components": {parameter: points, ...},
+        # "consciousness": level}. One entry per fresh reading — a
+        # stale tick repeats the previous score, so it records
+        # nothing — capped at MAX_NEWS2_HISTORY, oldest first out.
+        self.news2_history = deque(maxlen=MAX_NEWS2_HISTORY)
         self.total_raised = 0
         self._active_alarms = set()
         # Bed turnover: after a discharge the bed is cleaning until
@@ -214,6 +225,9 @@ class Monitor:
         self.consciousness_history = []
         self._deteriorating_s = 0.0
         self._recovering_s = 0.0
+        # A new patient starts with no NEWS2 history either: the
+        # previous patient's scores do not carry over.
+        self.news2_history.clear()
         self.signs = initial_signs(self.profile, self.rng, self.acuity)
         self.seq = 0
         self.last_reading = None
@@ -304,6 +318,22 @@ class Monitor:
             self.signs, self.on_oxygen, self.consciousness
         )
         self._track_escalation(reading["news2"], now)
+        # This tick's score joins the bed's history, so a client can
+        # see how the patient got here, not just where they are now.
+        # Stale ticks never reach this point: they return the
+        # previous reading above, so a repeated score is not
+        # recorded twice.
+        self.news2_history.append(
+            {
+                "t": round(now, 3),
+                "score": reading["news2"]["score"],
+                "risk": reading["news2"]["risk"],
+                "red_score": reading["news2"]["red_score"],
+                "spo2_scale": reading["news2"]["spo2_scale"],
+                "components": dict(reading["news2"]["components"]),
+                "consciousness": self.consciousness,
+            }
+        )
         self._record_alarm_transitions(reading["alarms"], now)
         self.last_reading = reading
         return reading
@@ -463,6 +493,32 @@ class Monitor:
             "escalated": self._escalation is not None,
             "escalations_raised": self.escalations_raised,
             "episodes": episodes,
+        }
+
+    def news2_history_detail(self, now):
+        """Per-patient NEWS2 score history as plain JSON data.
+
+        ``history`` is every score this stay, one entry per fresh
+        reading in tick order (stale repeats are not recorded);
+        ``current`` is the latest entry, or None before the first
+        reading; ``peak_score`` / ``peak_risk`` are the worst score
+        reached and the risk at that score. After a discharge the
+        departed patient's history stays until the next admission
+        clears it, with ``admitted`` false.
+        """
+        history = [dict(e) for e in self.news2_history]
+        peak = max(history, key=lambda e: e["score"], default=None)
+        return {
+            "bed": self.bed_id,
+            "admitted": self.admitted,
+            "profile": self.profile,
+            "on_oxygen": self.on_oxygen,
+            "consciousness": self.consciousness,
+            "history": history,
+            "points": len(history),
+            "peak_score": peak["score"] if peak is not None else None,
+            "peak_risk": peak["risk"] if peak is not None else None,
+            "current": dict(history[-1]) if history else None,
         }
 
     def stable_s(self, now):

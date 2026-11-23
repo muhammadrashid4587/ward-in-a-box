@@ -4516,5 +4516,169 @@ class TestConsciousnessDynamics(unittest.TestCase):
             server.server_close()
 
 
+class TestNEWS2History(unittest.TestCase):
+    def test_monitor_records_one_entry_per_fresh_tick(self):
+        ward = Ward(beds=2, profiles=["stable", "hypoxic"], seed=42)
+        snaps = [ward.tick() for _ in range(5)]
+        for i, m in enumerate(ward.monitors):
+            self.assertEqual(len(m.news2_history), 5)
+            for entry, snap in zip(m.news2_history, snaps):
+                self.assertEqual(entry["t"], snap["t"])
+                self.assertEqual(
+                    entry["score"], snap["beds"][i]["news2"]["score"]
+                )
+                self.assertEqual(
+                    entry["risk"], snap["beds"][i]["news2"]["risk"]
+                )
+                self.assertEqual(
+                    entry["components"],
+                    snap["beds"][i]["news2"]["components"],
+                )
+                self.assertEqual(entry["consciousness"], "alert")
+            detail = m.news2_history_detail(ward.elapsed)
+            self.assertEqual(detail["points"], 5)
+            self.assertEqual(detail["current"], dict(m.news2_history[-1]))
+            self.assertEqual(
+                detail["peak_score"],
+                max(e["score"] for e in m.news2_history),
+            )
+
+    def test_stale_tick_does_not_duplicate(self):
+        m = Monitor(0, "stable", rng=random.Random(1))
+        m.tick(1.0)
+        self.assertEqual(len(m.news2_history), 1)
+        m.stale_until = 10.0
+        stale = m.tick(2.0)
+        self.assertTrue(stale["stale"])
+        self.assertEqual(len(m.news2_history), 1)
+        self.assertEqual(m.news2_history[0]["t"], 1.0)
+
+    def test_history_capped_at_1000(self):
+        m = Monitor(0, "stable", rng=random.Random(1))
+        for i in range(1, 1006):
+            m.tick(float(i))
+        self.assertEqual(len(m.news2_history), 1000)
+        self.assertEqual(m.news2_history[0]["t"], 6.0)
+        self.assertEqual(m.news2_history[-1]["t"], 1005.0)
+
+    def test_new_admission_clears_history(self):
+        ward = Ward(beds=1, profiles=["stable"], cleaning_s=1.0, seed=1)
+        for _ in range(3):
+            ward.tick()
+        self.assertEqual(len(ward.monitors[0].news2_history), 3)
+        ward.discharge(0)
+        ward.tick()  # cleaning finishes at t=4
+        ward.admit(0, profile="stable")
+        self.assertEqual(len(ward.monitors[0].news2_history), 0)
+        ward.tick()
+        self.assertEqual(len(ward.monitors[0].news2_history), 1)
+
+    def test_ward_history_summary_single_and_all_beds(self):
+        ward = Ward(beds=2, profiles=["stable", "hypoxic"], seed=42)
+        for _ in range(3):
+            ward.tick()
+        all_beds = ward.news2_history_summary()
+        self.assertEqual(all_beds["t"], 3.0)
+        self.assertEqual(len(all_beds["beds"]), 2)
+        self.assertEqual(all_beds["beds"][0]["points"], 3)
+        one = ward.news2_history_summary(1)
+        self.assertEqual(one["bed"], 1)
+        self.assertEqual(one["points"], 3)
+        self.assertEqual(one["peak_risk"], "medium")
+        self.assertEqual(
+            one["current"]["score"],
+            ward.monitors[1].last_reading["news2"]["score"],
+        )
+        with self.assertRaises(ValueError):
+            ward.news2_history_summary(99)
+
+    def test_history_endpoint(self):
+        ward = Ward(beds=2, profiles=["stable", "hypoxic"], seed=42)
+        for _ in range(3):
+            ward.tick()
+        server, port = serve_in_thread(ward)
+        try:
+            status, body = get(port, "/news2/history")
+            self.assertEqual(status, 200)
+            data = json.loads(body)
+            self.assertEqual(len(data["beds"]), 2)
+            self.assertEqual(data["beds"][0]["points"], 3)
+            status, body = get(port, "/news2/history?bed=1")
+            self.assertEqual(status, 200)
+            data = json.loads(body)
+            self.assertEqual(data["bed"], 1)
+            self.assertEqual(data["points"], 3)
+            self.assertEqual(data["peak_risk"], "medium")
+            status, _ = get(port, "/news2/history?bed=99")
+            self.assertEqual(status, 404)
+            status, _ = get(port, "/news2/history?bed=x")
+            self.assertEqual(status, 400)
+            ward.partitioned = True
+            status, _ = get(port, "/news2/history")
+            self.assertEqual(status, 503)
+            status, _ = get(port, "/news2/history?bed=0")
+            self.assertEqual(status, 503)
+            ward.partitioned = False
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_scenario_news2_history(self):
+        cfg = load_scenario(
+            os.path.join(HERE, "..", "scenarios", "news2-history.json")
+        )
+        ward = build_ward(cfg, seed=42)
+        for _ in range(40):
+            ward.tick()
+        history = ward.news2_history_summary()
+        bed0, bed1, bed2 = history["beds"]
+        # Stable bed: low throughout, never above 1.
+        self.assertEqual(bed0["points"], 40)
+        self.assertEqual(bed0["peak_score"], 1)
+        self.assertEqual(bed0["peak_risk"], "low")
+        # Hypoxic bed: medium on a red SpO2 score, drifting high.
+        self.assertEqual(bed1["points"], 40)
+        self.assertEqual(bed1["peak_score"], 7)
+        self.assertEqual(bed1["peak_risk"], "high")
+        # Febrile bed: medium before the storm, 11 under it, low
+        # again by the end — the history shows the whole arc.
+        self.assertEqual(bed2["points"], 40)
+        self.assertEqual(bed2["history"][0]["score"], 5)
+        self.assertEqual(bed2["history"][0]["risk"], "medium")
+        self.assertEqual(bed2["peak_score"], 11)
+        self.assertEqual(bed2["peak_risk"], "high")
+        self.assertEqual(bed2["history"][-1]["risk"], "low")
+
+    def test_recorder_summary_carries_news2_history(self):
+        cfg = load_scenario(
+            os.path.join(HERE, "..", "scenarios", "news2-history.json")
+        )
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".jsonl", delete=False
+        ) as f:
+            path = f.name
+        try:
+            with Recorder(path, cfg["beds"], cfg["rate_hz"], seed=42) as rec:
+                ward = build_ward(cfg, seed=42, recorder=rec)
+                for _ in range(40):
+                    ward.tick()
+            summary = summarize(path)
+            hist = summary["news2_history"]
+            self.assertEqual(hist[0]["ticks"], 40)
+            self.assertEqual(hist[0]["peak_score"], 1)
+            self.assertEqual(hist[0]["ticks_low"], 40)
+            self.assertEqual(hist[1]["peak_score"], 7)
+            self.assertEqual(hist[1]["peak_risk"], "high")
+            self.assertEqual(hist[1]["ticks_high"], 6)
+            self.assertEqual(hist[2]["peak_score"], 11)
+            self.assertEqual(hist[2]["peak_risk"], "high")
+            self.assertEqual(hist[2]["ticks_high"], 10)
+            self.assertEqual(hist[2]["ticks_low"], 17)
+            self.assertEqual(hist[2]["first_t"], 1.0)
+            self.assertEqual(hist[2]["last_t"], 40.0)
+        finally:
+            os.unlink(path)
+
+
 if __name__ == "__main__":
     unittest.main()

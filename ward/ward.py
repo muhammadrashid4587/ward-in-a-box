@@ -406,6 +406,25 @@ class Ward:
             ),
         }
 
+    def news2_history_summary(self, bed_id=None):
+        """NEWS2 score history, for one bed or the whole ward.
+
+        ``bed_id`` picks one bed (``ValueError`` when the ward has
+        no such bed); None returns every bed. Each bed's entry is
+        its score history with peak score and risk and the latest
+        score, as returned by
+        :meth:`Monitor.news2_history_detail`.
+        """
+        if bed_id is None:
+            return {
+                "t": self.elapsed,
+                "beds": [
+                    m.news2_history_detail(self.elapsed)
+                    for m in self.monitors
+                ],
+            }
+        return self._monitor(bed_id).news2_history_detail(self.elapsed)
+
     def discharge_summary(self):
         """Planned discharges, cleaning capacity, and queued beds."""
         summary = self.discharge_planner.summary(self.elapsed)

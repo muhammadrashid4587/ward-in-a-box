@@ -4,6 +4,7 @@ import json
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
 from .websocket import (
     OP_BINARY,
@@ -34,7 +35,12 @@ def make_handler(ward):
             self.wfile.write(body)
 
         def do_GET(self):
-            if self.path == "/health":
+            # The path is matched without its query string, so
+            # /news2/history?bed=3 routes like /news2/history.
+            parsed = urlparse(self.path)
+            path = parsed.path
+            query = parse_qs(parsed.query)
+            if path == "/health":
                 self._send_json(
                     200,
                     {
@@ -42,7 +48,7 @@ def make_handler(ward):
                         "beds": ward.beds,
                     },
                 )
-            elif self.path == "/snapshot":
+            elif path == "/snapshot":
                 if ward.partitioned:
                     self._send_json(503, {"error": "partitioned"})
                     return
@@ -50,52 +56,71 @@ def make_handler(ward):
                 if snap is None:
                     snap = ward.tick()
                 self._send_json(200, snap)
-            elif self.path == "/alarms":
+            elif path == "/alarms":
                 if ward.partitioned:
                     self._send_json(503, {"error": "partitioned"})
                     return
                 self._send_json(200, ward.alarm_summary())
-            elif self.path == "/turnover":
+            elif path == "/turnover":
                 if ward.partitioned:
                     self._send_json(503, {"error": "partitioned"})
                     return
                 self._send_json(200, ward.turnover_summary())
-            elif self.path == "/staffing":
+            elif path == "/staffing":
                 if ward.partitioned:
                     self._send_json(503, {"error": "partitioned"})
                     return
                 self._send_json(200, ward.staffing_summary())
-            elif self.path == "/meds":
+            elif path == "/meds":
                 if ward.partitioned:
                     self._send_json(503, {"error": "partitioned"})
                     return
                 self._send_json(200, ward.meds_summary())
-            elif self.path == "/triage":
+            elif path == "/triage":
                 if ward.partitioned:
                     self._send_json(503, {"error": "partitioned"})
                     return
                 self._send_json(200, ward.triage_summary())
-            elif self.path == "/arrivals":
+            elif path == "/arrivals":
                 if ward.partitioned:
                     self._send_json(503, {"error": "partitioned"})
                     return
                 self._send_json(200, ward.arrivals_summary())
-            elif self.path == "/discharge":
+            elif path == "/discharge":
                 if ward.partitioned:
                     self._send_json(503, {"error": "partitioned"})
                     return
                 self._send_json(200, ward.discharge_summary())
-            elif self.path == "/discharge-readiness":
+            elif path == "/discharge-readiness":
                 if ward.partitioned:
                     self._send_json(503, {"error": "partitioned"})
                     return
                 self._send_json(200, ward.readiness_summary())
-            elif self.path == "/news2":
+            elif path == "/news2":
                 if ward.partitioned:
                     self._send_json(503, {"error": "partitioned"})
                     return
                 self._send_json(200, ward.early_warning_summary())
-            elif self.path == "/stream":
+            elif path == "/news2/history":
+                if ward.partitioned:
+                    self._send_json(503, {"error": "partitioned"})
+                    return
+                raw = query.get("bed", [None])[0]
+                if raw is None:
+                    self._send_json(200, ward.news2_history_summary())
+                    return
+                try:
+                    bed_id = int(raw)
+                except ValueError:
+                    self._send_json(400, {"error": "bed must be an integer"})
+                    return
+                try:
+                    self._send_json(
+                        200, ward.news2_history_summary(bed_id)
+                    )
+                except ValueError:
+                    self._send_json(404, {"error": "no bed %s" % raw})
+            elif path == "/stream":
                 if ward.partitioned:
                     self._send_json(503, {"error": "partitioned"})
                     return
@@ -110,7 +135,7 @@ def make_handler(ward):
                         time.sleep(1.0 / ward.rate_hz)
                 except (BrokenPipeError, ConnectionResetError):
                     pass
-            elif self.path == "/ws":
+            elif path == "/ws":
                 if ward.partitioned:
                     self._send_json(503, {"error": "partitioned"})
                     return
