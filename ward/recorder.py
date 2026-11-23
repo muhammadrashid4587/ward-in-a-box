@@ -84,7 +84,8 @@ def summarize(path):
     how many occupied beds are flagged ready and how many are not —
     and early-warning totals from the last tick: how many beds are
     at high, medium, and low NEWS2 risk, how many deterioration
-    episodes are open, and how many have raised — and NEWS2 history
+    episodes are open, and how many have raised, and how many
+    NEWS2 trend alerts are open and have raised — and NEWS2 history
     totals per bed: ticks scored, peak score and risk, and ticks at
     each risk level.
     Returns ``None`` fields for a recording with no ticks.
@@ -272,6 +273,12 @@ def summarize(path):
                 "escalations_raised": last_early_warning[
                     "escalations_raised"
                 ],
+                "trend_alerts": last_early_warning.get(
+                    "trend_alerts", 0
+                ),
+                "trend_alerts_raised": last_early_warning.get(
+                    "trend_alerts_raised", 0
+                ),
                 "not_alert": last_early_warning.get("not_alert", 0),
                 "consciousness_changes": last_early_warning.get(
                     "consciousness_changes", 0

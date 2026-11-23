@@ -7,7 +7,11 @@ import time
 from .chaos import ChaosEngine
 from .discharge import DischargePlanner
 from .monitor import Monitor
-from .news2 import validate_consciousness, validate_consciousness_dynamics
+from .news2 import (
+    validate_consciousness,
+    validate_consciousness_dynamics,
+    validate_news2_trend,
+)
 from .readiness import DischargeReadiness
 from .staffing import Staffing
 from .timeline import Timeline
@@ -29,7 +33,7 @@ class Ward:
     snapshot to a JSONL file.
     """
 
-    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None, cleaning_s=30.0, meds=None, triage=None, discharge_planning=None, cleaning_capacity=None, discharge_readiness=None, oxygen=None, consciousness=None, consciousness_dynamics=None):
+    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None, cleaning_s=30.0, meds=None, triage=None, discharge_planning=None, cleaning_capacity=None, discharge_readiness=None, oxygen=None, consciousness=None, consciousness_dynamics=None, news2_trend=None):
         if not 1 <= beds <= 64:
             raise ValueError("beds must be 1..64")
         if rate_hz <= 0:
@@ -57,6 +61,7 @@ class Ward:
                 "discharge_readiness must be a DischargeReadiness or a dict, got %r"
                 % (discharge_readiness,)
             )
+        self.news2_trend = validate_news2_trend(news2_trend)
         if discharge_planning is None:
             self.discharge_planner = DischargePlanner()
         elif isinstance(discharge_planning, DischargePlanner):
@@ -138,7 +143,7 @@ class Ward:
                 and i < len(consciousness_dynamics)
                 else None
             )
-            monitor = Monitor(i, profile, rng=self.rng, acuity=acuity, meds=bed_meds, on_oxygen=on_oxygen, consciousness=bed_consciousness, consciousness_dynamics=bed_dynamics)
+            monitor = Monitor(i, profile, rng=self.rng, acuity=acuity, meds=bed_meds, on_oxygen=on_oxygen, consciousness=bed_consciousness, consciousness_dynamics=bed_dynamics, news2_trend=self.news2_trend)
             # With a timeline, beds start unadmitted and come online as
             # the timeline admits them; without one, all beds start open.
             if timeline is not None:
@@ -403,6 +408,12 @@ class Ward:
             "escalated": sum(1 for b in beds if b["escalated"]),
             "escalations_raised": sum(
                 b["escalations_raised"] for b in beds
+            ),
+            "trend_alerts": sum(
+                1 for b in beds if b["trend_alert_active"]
+            ),
+            "trend_alerts_raised": sum(
+                b["trend_alerts_raised"] for b in beds
             ),
         }
 

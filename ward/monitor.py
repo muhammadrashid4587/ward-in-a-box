@@ -7,8 +7,10 @@ from .meds import MedSchedule
 from .news2 import (
     ACVPU_LEVELS,
     score_signs,
+    trend_for,
     validate_consciousness,
     validate_consciousness_dynamics,
+    validate_news2_trend,
 )
 from .vitals import alarms_for, initial_signs, step, validate_acuity
 
@@ -40,7 +42,7 @@ class Monitor:
     seconds); the monitor clears each one when its time passes.
     """
 
-    def __init__(self, bed_id, profile="stable", rng=None, acuity=3, meds=None, on_oxygen=False, consciousness="alert", consciousness_dynamics=None):
+    def __init__(self, bed_id, profile="stable", rng=None, acuity=3, meds=None, on_oxygen=False, consciousness="alert", consciousness_dynamics=None, news2_trend=None):
         self.bed_id = bed_id
         self.profile = profile
         self.acuity = validate_acuity(acuity)
@@ -49,6 +51,7 @@ class Monitor:
         self.consciousness_dynamics = validate_consciousness_dynamics(
             consciousness_dynamics
         )
+        self.news2_trend = validate_news2_trend(news2_trend)
         # Every consciousness change this stay, as
         # {"from": level, "to": level, "t": seconds}; empty while
         # dynamics are off or the level has never moved.
@@ -111,6 +114,15 @@ class Monitor:
         self._escalation = None
         self.escalation_history = []
         self.escalations_raised = 0
+        # NEWS2 trend alerts: a trend alert is open while the
+        # patient's score is rising by the configured rules — a
+        # jump of ``delta`` within ``window_s`` seconds, or a
+        # sustained upward creep over the last ``trend_ticks``
+        # ticks. ``trend_alert_history`` keeps every closed alert;
+        # the open one lives in ``_trend_alert`` until it closes.
+        self._trend_alert = None
+        self.trend_alert_history = []
+        self.trend_alerts_raised = 0
 
     @staticmethod
     def _validate_on_oxygen(on_oxygen):
@@ -185,6 +197,7 @@ class Monitor:
         self.awaiting_cleaning = False
         self._record_alarm_transitions([], now)
         self._close_escalation(now)
+        self._close_trend_alert(now)
         self.meds.reset()
         self.admitted = False
         self.cleaning_until = round(now + cleaning_s, 3)
@@ -334,6 +347,9 @@ class Monitor:
                 "consciousness": self.consciousness,
             }
         )
+        # A rising score raises a trend alert — the score's own
+        # rate of change, not a new vital-sign alarm.
+        self._track_trend(now)
         self._record_alarm_transitions(reading["alarms"], now)
         self.last_reading = reading
         return reading
@@ -459,6 +475,57 @@ class Monitor:
             self.escalation_history.append(self._escalation)
             self._escalation = None
 
+    def _track_trend(self, now):
+        """Open, update, or close the NEWS2 trend alert.
+
+        A trend alert is open while the score is rising by the
+        configured rules (see :func:`ward.news2.trend_for`). It
+        records when it raised, the score the rise started from
+        and when, the worst score it reached, and the biggest rise
+        — so a client can see a patient who climbed fast and came
+        back, not just where they are now. It closes when the
+        score stops rising: the window slides forward and the
+        rise out of it shrinks, or the recent ticks stop climbing.
+        Like the score itself, it never touches the vital-sign
+        alarm list.
+        """
+        now = round(now, 3)
+        trend = trend_for(self.news2_history, **self.news2_trend)
+        if trend["rising"]:
+            if self._trend_alert is None:
+                self._trend_alert = {
+                    "raised_t": now,
+                    "cleared_t": None,
+                    "start_t": trend["start_t"],
+                    "start_score": trend["start_score"],
+                    "peak_score": trend["current_score"],
+                    "peak_delta": trend["delta"],
+                    "rule": trend["rule"],
+                }
+                self.trend_alerts_raised += 1
+            else:
+                if trend["current_score"] > self._trend_alert["peak_score"]:
+                    self._trend_alert["peak_score"] = trend["current_score"]
+                if trend["delta"] > self._trend_alert["peak_delta"]:
+                    self._trend_alert["peak_delta"] = trend["delta"]
+            return
+        self._close_trend_alert(now)
+
+    def _close_trend_alert(self, now):
+        """Close the open trend alert, if any."""
+        if self._trend_alert is not None:
+            self._trend_alert["cleared_t"] = round(now, 3)
+            self.trend_alert_history.append(self._trend_alert)
+            self._trend_alert = None
+
+    def trend_alerts(self):
+        """Every trend alert this stay: closed ones, then the open
+        one if there is one."""
+        alerts = [dict(e) for e in self.trend_alert_history]
+        if self._trend_alert is not None:
+            alerts.append(dict(self._trend_alert))
+        return alerts
+
     def news2_detail(self, now):
         """Per-patient early-warning state as plain JSON data.
 
@@ -466,7 +533,10 @@ class Monitor:
         the bed has no patient or no reading yet); ``escalated`` is
         True while a deterioration episode is open; ``episodes``
         lists the closed ones with raised/cleared times and peak
-        score and risk.
+        score and risk. ``trend`` is the current rate of change of
+        the score (see :func:`ward.news2.trend_for`), and
+        ``trend_alerts`` lists every trend alert this stay with
+        raised/cleared times and peak score and rise.
         """
         reading = self.last_reading
         offline = (
@@ -493,6 +563,10 @@ class Monitor:
             "escalated": self._escalation is not None,
             "escalations_raised": self.escalations_raised,
             "episodes": episodes,
+            "trend": trend_for(self.news2_history, **self.news2_trend),
+            "trend_alert_active": self._trend_alert is not None,
+            "trend_alerts_raised": self.trend_alerts_raised,
+            "trend_alerts": self.trend_alerts(),
         }
 
     def news2_history_detail(self, now):
@@ -504,7 +578,9 @@ class Monitor:
         reading; ``peak_score`` / ``peak_risk`` are the worst score
         reached and the risk at that score. After a discharge the
         departed patient's history stays until the next admission
-        clears it, with ``admitted`` false.
+        clears it, with ``admitted`` false. ``trend`` is the
+        current rate of change of the score and ``trend_alerts``
+        lists every trend alert this stay.
         """
         history = [dict(e) for e in self.news2_history]
         peak = max(history, key=lambda e: e["score"], default=None)
@@ -519,6 +595,10 @@ class Monitor:
             "peak_score": peak["score"] if peak is not None else None,
             "peak_risk": peak["risk"] if peak is not None else None,
             "current": dict(history[-1]) if history else None,
+            "trend": trend_for(self.news2_history, **self.news2_trend),
+            "trend_alert_active": self._trend_alert is not None,
+            "trend_alerts_raised": self.trend_alerts_raised,
+            "trend_alerts": self.trend_alerts(),
         }
 
     def stable_s(self, now):

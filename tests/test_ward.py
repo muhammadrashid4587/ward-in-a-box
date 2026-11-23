@@ -32,8 +32,10 @@ from ward.news2 import (
     score_consciousness,
     score_signs,
     score_spo2,
+    trend_for,
     validate_consciousness,
     validate_consciousness_dynamics,
+    validate_news2_trend,
 )
 from ward.vitals import PROFILES, effective_ranges, validate_acuity
 from ward.ward import Ward
@@ -4676,6 +4678,299 @@ class TestNEWS2History(unittest.TestCase):
             self.assertEqual(hist[2]["ticks_low"], 17)
             self.assertEqual(hist[2]["first_t"], 1.0)
             self.assertEqual(hist[2]["last_t"], 40.0)
+        finally:
+            os.unlink(path)
+
+
+class TestNEWS2Trend(unittest.TestCase):
+    def _entries(self, scores, t0=1.0):
+        return [
+            {"t": t0 + i, "score": s} for i, s in enumerate(scores)
+        ]
+
+    def test_trend_for_jump_rule(self):
+        # A rise of 2 inside the window is a jump, measured from
+        # the earliest entry in the window.
+        trend = trend_for(self._entries([3, 3, 5]), window_s=60.0, delta=2)
+        self.assertTrue(trend["rising"])
+        self.assertEqual(trend["rule"], "jump")
+        self.assertEqual(trend["start_t"], 1.0)
+        self.assertEqual(trend["start_score"], 3)
+        self.assertEqual(trend["current_score"], 5)
+        self.assertEqual(trend["delta"], 2)
+        self.assertEqual(trend["window_s"], 60.0)
+        # A rise of 1 is not a jump.
+        trend = trend_for(self._entries([3, 3, 4]), window_s=60.0, delta=2)
+        self.assertFalse(trend["rising"])
+        self.assertIsNone(trend["rule"])
+        self.assertEqual(trend["delta"], 1)
+
+    def test_trend_for_creep_rule(self):
+        # A slow climb — a point every couple of ticks, never
+        # jumping — is a creep, when the window is too short for
+        # the jump rule to see it.
+        trend = trend_for(
+            self._entries([3, 3, 4, 4, 5]),
+            window_s=2.0,
+            delta=5,
+            trend_ticks=5,
+            min_rise=2,
+        )
+        self.assertTrue(trend["rising"])
+        self.assertEqual(trend["rule"], "creep")
+        self.assertEqual(trend["start_t"], 1.0)
+        self.assertEqual(trend["start_score"], 3)
+        self.assertEqual(trend["delta"], 2)
+        # A one-point wobble does not count as a trend.
+        trend = trend_for(
+            self._entries([0, 1, 0, 1, 0]),
+            window_s=2.0,
+            delta=5,
+            trend_ticks=5,
+            min_rise=2,
+        )
+        self.assertFalse(trend["rising"])
+        # More falls than rises is not a creep either.
+        trend = trend_for(
+            self._entries([5, 4, 5, 4, 3]),
+            window_s=2.0,
+            delta=5,
+            trend_ticks=5,
+            min_rise=2,
+        )
+        self.assertFalse(trend["rising"])
+
+    def test_trend_for_flat_falling_and_empty(self):
+        flat = trend_for(self._entries([4, 4, 4, 4]))
+        self.assertFalse(flat["rising"])
+        self.assertEqual(flat["delta"], 0)
+        falling = trend_for(self._entries([5, 4, 3]))
+        self.assertFalse(falling["rising"])
+        self.assertEqual(falling["delta"], -2)
+        empty = trend_for([])
+        self.assertFalse(empty["rising"])
+        self.assertIsNone(empty["rule"])
+        self.assertIsNone(empty["start_t"])
+        self.assertIsNone(empty["start_score"])
+        self.assertIsNone(empty["current_score"])
+
+    def test_validate_news2_trend(self):
+        defaults = validate_news2_trend(None)
+        self.assertEqual(defaults["window_s"], 60.0)
+        self.assertEqual(defaults["delta"], 2)
+        self.assertEqual(defaults["trend_ticks"], 10)
+        self.assertEqual(defaults["min_rise"], 2)
+        custom = validate_news2_trend({"window_s": 10, "delta": 3})
+        self.assertEqual(custom["window_s"], 10.0)
+        self.assertEqual(custom["delta"], 3)
+        self.assertEqual(custom["trend_ticks"], 10)
+        with self.assertRaises(ValueError):
+            validate_news2_trend({"window_s": 0})
+        with self.assertRaises(ValueError):
+            validate_news2_trend({"window_s": "fast"})
+        with self.assertRaises(ValueError):
+            validate_news2_trend({"delta": 0})
+        with self.assertRaises(ValueError):
+            validate_news2_trend({"delta": 1.5})
+        with self.assertRaises(ValueError):
+            validate_news2_trend({"trend_ticks": 1})
+        with self.assertRaises(ValueError):
+            validate_news2_trend({"min_rise": 0})
+        with self.assertRaises(ValueError):
+            validate_news2_trend({"window": 10})
+        with self.assertRaises(ValueError):
+            validate_news2_trend("fast")
+
+    def test_monitor_opens_and_closes_trend_alert(self):
+        # Febrile bed under an alarm storm: the score jumps 7 to
+        # 11, so a trend alert opens on the jump rule, and it
+        # closes when the storm ends and the score falls back.
+        ward = Ward(
+            beds=1,
+            profiles=["febrile"],
+            chaos=[ChaosEvent("alarm_storm", at=1, duration=10, bed=0)],
+            seed=3,
+        )
+        ward.tick()
+        m = ward.monitors[0]
+        self.assertIsNone(m._trend_alert)
+        ward.tick()
+        self.assertIsNotNone(m._trend_alert)
+        alert = m._trend_alert
+        self.assertEqual(alert["raised_t"], 2.0)
+        self.assertEqual(alert["start_score"], 7)
+        self.assertEqual(alert["rule"], "jump")
+        for _ in range(8):
+            ward.tick()
+        self.assertEqual(m._trend_alert["peak_score"], 11)
+        self.assertEqual(m._trend_alert["peak_delta"], 4)
+        self.assertEqual(m.trend_alerts_raised, 1)
+        # The storm ends at t=11; the score falls and the alert
+        # closes in the same tick.
+        ward.tick()
+        self.assertIsNone(m._trend_alert)
+        self.assertEqual(len(m.trend_alert_history), 1)
+        closed = m.trend_alert_history[0]
+        self.assertEqual(closed["cleared_t"], 11.0)
+        self.assertEqual(closed["peak_score"], 11)
+
+    def test_discharge_closes_open_trend_alert(self):
+        ward = Ward(
+            beds=1,
+            profiles=["hypoxic"],
+            seed=3,
+            news2_trend={"window_s": 10.0, "delta": 2},
+        )
+        for _ in range(40):
+            ward.tick()
+        m = ward.monitors[0]
+        self.assertIsNotNone(m._trend_alert)
+        raised = m.trend_alerts_raised
+        ward.discharge(0)
+        self.assertIsNone(m._trend_alert)
+        self.assertEqual(m.trend_alerts_raised, raised)
+        self.assertEqual(
+            m.trend_alert_history[-1]["cleared_t"], 40.0
+        )
+
+    def test_trend_in_history_detail_and_early_warning(self):
+        ward = Ward(
+            beds=2,
+            profiles=["stable", "febrile"],
+            chaos=[ChaosEvent("alarm_storm", at=1, duration=10, bed=1)],
+            seed=3,
+            news2_trend={"window_s": 10.0, "delta": 2},
+        )
+        for _ in range(5):
+            ward.tick()
+        detail = ward.monitors[1].news2_history_detail(ward.elapsed)
+        self.assertTrue(detail["trend"]["rising"])
+        self.assertEqual(detail["trend"]["rule"], "jump")
+        self.assertTrue(detail["trend_alert_active"])
+        self.assertEqual(detail["trend_alerts_raised"], 1)
+        self.assertEqual(len(detail["trend_alerts"]), 1)
+        # The stable bed is not rising.
+        stable = ward.monitors[0].news2_history_detail(ward.elapsed)
+        self.assertFalse(stable["trend"]["rising"])
+        self.assertEqual(stable["trend_alerts_raised"], 0)
+        # The early-warning summary carries the ward totals, and
+        # the snapshot carries them too.
+        ew = ward.early_warning_summary()
+        self.assertEqual(ew["trend_alerts"], 1)
+        self.assertEqual(ew["trend_alerts_raised"], 1)
+        self.assertEqual(
+            ward.snapshot()["early_warning"]["trend_alerts"], 1
+        )
+        news2 = ward.monitors[1].news2_detail(ward.elapsed)
+        self.assertTrue(news2["trend"]["rising"])
+        self.assertTrue(news2["trend_alert_active"])
+
+    def test_trend_does_not_touch_the_alarm_list(self):
+        # Like the score itself, a trend alert is not a vital-sign
+        # alarm: the alarm list is only what alarms_for raises.
+        known = {
+            "tachycardia", "bradycardia", "low_spo2", "hypertension",
+            "hypotension", "fever", "hypothermia", "tachypnea",
+            "missed_dose",
+        }
+        ward = Ward(
+            beds=1,
+            profiles=["febrile"],
+            chaos=[ChaosEvent("alarm_storm", at=1, duration=10, bed=0)],
+            seed=3,
+        )
+        for _ in range(40):
+            snap = ward.tick()
+            self.assertTrue(set(snap["beds"][0]["alarms"]) <= known)
+        self.assertEqual(ward.monitors[0].trend_alerts_raised, 1)
+
+    def test_history_endpoint_carries_trend(self):
+        ward = Ward(
+            beds=2,
+            profiles=["stable", "febrile"],
+            chaos=[ChaosEvent("alarm_storm", at=1, duration=10, bed=1)],
+            seed=3,
+            news2_trend={"window_s": 10.0, "delta": 2},
+        )
+        for _ in range(5):
+            ward.tick()
+        server, port = serve_in_thread(ward)
+        try:
+            status, body = get(port, "/news2/history?bed=1")
+            self.assertEqual(status, 200)
+            data = json.loads(body)
+            self.assertTrue(data["trend"]["rising"])
+            self.assertEqual(data["trend"]["rule"], "jump")
+            self.assertEqual(data["trend_alerts_raised"], 1)
+            self.assertEqual(data["trend_alerts"][0]["peak_score"], 11)
+            # The whole-ward form carries the trend per bed too.
+            status, body = get(port, "/news2/history")
+            self.assertEqual(status, 200)
+            data = json.loads(body)
+            self.assertFalse(data["beds"][0]["trend"]["rising"])
+            self.assertTrue(data["beds"][1]["trend"]["rising"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_scenario_news2_trend(self):
+        cfg = load_scenario(
+            os.path.join(HERE, "..", "scenarios", "news2-trend.json")
+        )
+        self.assertEqual(cfg["news2_trend"]["window_s"], 10.0)
+        self.assertEqual(cfg["news2_trend"]["delta"], 2)
+        ward = build_ward(cfg, seed=42)
+        for _ in range(40):
+            snap = ward.tick()
+        history = ward.news2_history_summary()
+        bed0, bed1, bed2 = history["beds"]
+        # Stable bed: never rises two points, no alert.
+        self.assertEqual(bed0["trend_alerts_raised"], 0)
+        self.assertFalse(bed0["trend_alert_active"])
+        # Hypoxic bed: drifts up twice — a creep alert at 12-18,
+        # then a jump alert from 35 that is still open at the end.
+        self.assertEqual(bed1["trend_alerts_raised"], 2)
+        self.assertTrue(bed1["trend_alert_active"])
+        self.assertEqual(bed1["trend"]["rule"], "jump")
+        self.assertEqual(bed1["trend"]["delta"], 2)
+        first = bed1["trend_alerts"][0]
+        self.assertEqual(first["raised_t"], 12.0)
+        self.assertEqual(first["cleared_t"], 18.0)
+        self.assertEqual(first["rule"], "creep")
+        # Febrile bed: one jump alert under the storm, 5 to 11,
+        # clearing at 15 when the storm ends.
+        self.assertEqual(bed2["trend_alerts_raised"], 1)
+        self.assertFalse(bed2["trend_alert_active"])
+        alert = bed2["trend_alerts"][0]
+        self.assertEqual(alert["raised_t"], 5.0)
+        self.assertEqual(alert["cleared_t"], 15.0)
+        self.assertEqual(alert["start_t"], 1.0)
+        self.assertEqual(alert["start_score"], 5)
+        self.assertEqual(alert["peak_score"], 11)
+        self.assertEqual(alert["peak_delta"], 6)
+        self.assertEqual(alert["rule"], "jump")
+        # Ward totals: one alert still open, three raised.
+        self.assertEqual(snap["early_warning"]["trend_alerts"], 1)
+        self.assertEqual(snap["early_warning"]["trend_alerts_raised"], 3)
+
+    def test_recorder_summary_carries_trend_alerts(self):
+        cfg = load_scenario(
+            os.path.join(HERE, "..", "scenarios", "news2-trend.json")
+        )
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".jsonl", delete=False
+        ) as f:
+            path = f.name
+        try:
+            with Recorder(path, cfg["beds"], cfg["rate_hz"], seed=42) as rec:
+                ward = build_ward(cfg, seed=42, recorder=rec)
+                for _ in range(40):
+                    ward.tick()
+            summary = summarize(path)
+            ew = summary["early_warning"]
+            self.assertEqual(ew["trend_alerts"], 1)
+            self.assertEqual(ew["trend_alerts_raised"], 3)
+            self.assertEqual(ew["escalations_raised"], 2)
         finally:
             os.unlink(path)
 

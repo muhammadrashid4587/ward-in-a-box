@@ -107,6 +107,11 @@ python3 -m ward.cli scenarios/oxygen.json --seed 42
 # is high — all three stay escalated, consciousness never changes
 python3 -m ward.cli scenarios/news2-acvpu.json --seed 42
 
+# NEWS2 trend alerts: a febrile bed jumps 5 to 11 under an alarm
+# storm, a hypoxic bed drifts up twice, and the stable bed stays
+# quiet — 3 trend alerts raised, 1 still open at the end
+python3 -m ward.cli scenarios/news2-trend.json --seed 42
+
 # Reproducible run
 python3 -m ward.cli scenarios/example.json --seed 42
 ```
@@ -151,7 +156,8 @@ python3 -m ward.cli scenarios/example.json --seed 42
   partitioned)
 - `GET /news2/history` — per-patient NEWS2 score history: every
   score this stay, one entry per reading, with the peak score and
-  risk and the latest score (see below); `?bed=N` returns one bed
+  risk, the latest score, and the current trend and trend alerts
+  (see below); `?bed=N` returns one bed
   (404 for a bed the ward does not have, 400 for a bed that is not
   an integer), as JSON (503 while partitioned)
 
@@ -1023,6 +1029,53 @@ and the febrile bed peaks at 11 under the alarm storm and is low
 again by the end — 10 high ticks, 17 low, the arc visible in the
 history rather than just the final score.
 
+## NEWS2 trend alerts
+
+A score says how sick a patient looks; the trend says how fast
+they are getting there. Every bed's history is watched for a
+rising score, and a rise raises a trend alert — an episode, like
+a deterioration episode, with raised and cleared times — in the
+early-warning summary (`GET /news2`), in the history endpoint
+(`GET /news2/history`), in every snapshot and WebSocket frame,
+and in the run summary (`--summary`), which reports how many
+trend alerts are open and how many have raised. Two rules, either
+of which raises one:
+
+- **jump** — the score rose by at least `delta` (2 by default)
+  from the earliest entry inside the trailing `window_s`
+  seconds (60 by default): a patient who deteriorates fast.
+- **creep** — over the last `trend_ticks` entries (10 by default)
+  the score rose on more ticks than it fell and the net rise is
+  at least `min_rise` (2 by default): a patient who drifts up
+  slowly, a point a tick, without ever jumping. A one-point
+  wobble does not count as a trend.
+
+Each bed's history entry carries the current trend — whether the
+score is rising, which rule fired, the score the rise started
+from and when (`"start_score"`, `"start_t"`), the current score,
+and the rise (`"delta"`) — and each alert records when it raised
+and cleared, the score it started from, the worst score it
+reached, the biggest rise, and the rule. An alert closes when the
+score stops rising: the window slides forward and the rise out of
+it shrinks, or the recent ticks stop climbing — or when the
+patient is discharged. Like the score itself, a trend alert never
+touches the vital-sign alarm list: a hypoxic patient's alarms are
+exactly the ones their vitals raise. The thresholds are set per
+ward in the scenario:
+
+```json
+{"news2_trend": {"window_s": 10, "delta": 2}}
+```
+
+See `scenarios/news2-trend.json` for a runnable example: over a
+seeded 40-tick run with a 10-second window the stable bed never
+rises two points and raises nothing, the hypoxic bed drifts up
+twice — a creep alert at 12-18 s and a jump alert from 35 s that
+is still open at the end — and the febrile bed raises one jump
+alert under the alarm storm, from 5 at 1 s to 11, a rise of 6,
+clearing at 15 s when the storm ends — 3 trend alerts raised in
+total, 1 still open.
+
 ## Recording a run
 
 `--record FILE` writes every tick to a JSONL file: a header line with
@@ -1046,7 +1099,7 @@ endpoints returned 503 while it lasted, the ticks did not stop.
 make test
 ```
 
-228 tests: vitals stay inside plausible ranges, dropout actually stops a
+256 tests: vitals stay inside plausible ranges, dropout actually stops a
 monitor's stream, an alarm storm produces alarms, stale readings freeze,
 a partition blocks the snapshot endpoint, the HTTP endpoints serve valid
 JSON, the stream serves JSON lines, scenario files validate, alarm
@@ -1252,7 +1305,19 @@ dynamics config still applies, and the
 recording 7 consciousness changes over a seeded run (the hypoxic
 bed sliding to Unresponsive, two patients recovering to Alert),
 with the changes carried by the `GET /news2` endpoint and
-WebSocket frames.
+WebSocket frames. NEWS2-trend tests cover the jump and creep
+rules on synthetic histories (including a one-point wobble not
+counting as a trend, and flat, falling, and empty histories),
+validation of the trend config and of bad scenario values, a
+trend alert opening on a jump under an alarm storm and closing
+when the storm ends, a discharge closing an open trend alert,
+the trend and its alerts carried by the history detail, the
+early-warning summary, snapshots, and the `GET /news2/history`
+endpoint, the trend never adding an alarm to the alarm list,
+and the `news2-trend.json` scenario raising 3 trend alerts over
+a seeded run (a jump alert on the febrile bed peaking at 11 with
+a rise of 6, a creep and a jump alert on the hypoxic bed), with
+the run summary carrying the trend totals.
 
 ## Roadmap
 
@@ -1366,3 +1431,13 @@ WebSocket frames.
   or one bed with `?bed=N`, and per-bed history totals — ticks
   scored, peak score and risk, ticks at each risk level — in the
   run summary) — done in v0.27.0
+- NEWS2 trend / rate-of-change alerts (a rising score raises a
+  trend alert, an episode with raised/cleared times and peak score
+  and rise — by the jump rule, a rise of `delta` within the
+  trailing `window_s` seconds, or the creep rule, a net rise of
+  `min_rise` over the last `trend_ticks` ticks with more rises than
+  falls, configurable per ward with `news2_trend` in the scenario
+  — with the current trend and the alerts in the early-warning
+  summary, `GET /news2/history`, every snapshot, WebSocket frame,
+  and the run summary; the trend never touches the vital-sign
+  alarm list) — done in v0.28.0

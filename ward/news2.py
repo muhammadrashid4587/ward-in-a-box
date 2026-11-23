@@ -200,6 +200,160 @@ def validate_consciousness_dynamics(value):
     return out
 
 
+# NEWS2 trend / rate-of-change alerts: how a rising score is
+# recognised. Two rules, either of which raises a trend alert:
+# ``jump`` — the score rose by at least ``delta`` from the earliest
+# entry inside the trailing ``window_s`` seconds — and ``creep`` —
+# over the last ``trend_ticks`` entries the score rose on more ticks
+# than it fell and the net rise is at least ``min_rise``. The jump
+# rule catches a patient who deteriorates fast; the creep rule
+# catches one who drifts up slowly, a point a tick, without ever
+# jumping. Defaults: a rise of 2 within 60 seconds, or a net rise
+# of 2 over the last 10 ticks with more rises than falls — a
+# one-point wobble does not count as a trend.
+DEFAULT_NEWS2_TREND = {
+    "window_s": 60.0,
+    "delta": 2,
+    "trend_ticks": 10,
+    "min_rise": 2,
+}
+
+
+def validate_news2_trend(value):
+    """Normalize a NEWS2 trend config.
+
+    None means the defaults; a dict may set ``window_s`` (seconds
+    of trailing history the jump rule looks at, a number above 0),
+    ``delta`` (score rise within that window that raises an alert,
+    an int of at least 1), ``trend_ticks`` (how many recent ticks
+    the creep rule looks at, an int of at least 2), and
+    ``min_rise`` (net rise over those ticks that counts as a
+    sustained upward slope, an int of at least 1). Returns the
+    normalized dict.
+    """
+    if value is None:
+        return dict(DEFAULT_NEWS2_TREND)
+    if not isinstance(value, dict):
+        raise ValueError(
+            "news2_trend must be a dict, got %r" % (value,)
+        )
+    unknown = sorted(set(value) - set(DEFAULT_NEWS2_TREND))
+    if unknown:
+        raise ValueError(
+            "news2_trend has unknown keys: %s" % ", ".join(unknown)
+        )
+    out = dict(DEFAULT_NEWS2_TREND)
+    for key, threshold in value.items():
+        if key == "window_s":
+            if (
+                isinstance(threshold, bool)
+                or not isinstance(threshold, (int, float))
+                or threshold <= 0
+            ):
+                raise ValueError(
+                    "news2_trend window_s must be a number > 0, got %r"
+                    % (threshold,)
+                )
+            out[key] = float(threshold)
+        elif key == "trend_ticks":
+            if (
+                isinstance(threshold, bool)
+                or not isinstance(threshold, int)
+                or threshold < 2
+            ):
+                raise ValueError(
+                    "news2_trend trend_ticks must be an int >= 2, got %r"
+                    % (threshold,)
+                )
+            out[key] = threshold
+        else:
+            if (
+                isinstance(threshold, bool)
+                or not isinstance(threshold, int)
+                or threshold < 1
+            ):
+                raise ValueError(
+                    "news2_trend %s must be an int >= 1, got %r"
+                    % (key, threshold)
+                )
+            out[key] = threshold
+    return out
+
+
+def trend_for(history, window_s=60.0, delta=2, trend_ticks=10, min_rise=2):
+    """The trend of a NEWS2 score history.
+
+    ``history`` is the bed's score entries in tick order, each with
+    ``"t"`` and ``"score"``. Returns ``{"rising": bool,
+    "rule": "jump"|"creep"|None, "start_t": seconds|None,
+    "start_score": int|None, "current_score": int|None,
+    "delta": int, "window_s": float}``. ``start_score`` is the score
+    the rise is measured from — the earliest entry inside the
+    trailing window for the jump rule, the first of the last
+    ``trend_ticks`` entries for the creep rule — ``current_score``
+    is the latest score, and ``delta`` is the rise between them.
+    With no history, nothing is rising and the scores are None.
+    """
+    if not history:
+        return {
+            "rising": False,
+            "rule": None,
+            "start_t": None,
+            "start_score": None,
+            "current_score": None,
+            "delta": 0,
+            "window_s": float(window_s),
+        }
+    entries = list(history)
+    current = entries[-1]
+    now = current["t"]
+    window = [e for e in entries if e["t"] >= now - window_s]
+    start = window[0]
+    jump_delta = current["score"] - start["score"]
+    if jump_delta >= delta:
+        return {
+            "rising": True,
+            "rule": "jump",
+            "start_t": start["t"],
+            "start_score": start["score"],
+            "current_score": current["score"],
+            "delta": jump_delta,
+            "window_s": float(window_s),
+        }
+    recent = entries[-trend_ticks:]
+    if len(recent) >= 2:
+        net = recent[-1]["score"] - recent[0]["score"]
+        rises = sum(
+            1
+            for a, b in zip(recent, recent[1:])
+            if b["score"] > a["score"]
+        )
+        falls = sum(
+            1
+            for a, b in zip(recent, recent[1:])
+            if b["score"] < a["score"]
+        )
+        if net >= min_rise and rises > falls:
+            return {
+                "rising": True,
+                "rule": "creep",
+                "start_t": recent[0]["t"],
+                "start_score": recent[0]["score"],
+                "current_score": current["score"],
+                "delta": net,
+                "window_s": float(window_s),
+            }
+    return {
+        "rising": False,
+        "rule": None,
+        "start_t": start["t"],
+        "start_score": start["score"],
+        "current_score": current["score"],
+        "delta": jump_delta,
+        "window_s": float(window_s),
+    }
+
+
 def score_consciousness(level):
     """NEWS2 points for consciousness: Alert 0, anything else 3."""
     validate_consciousness(level)

@@ -6,7 +6,11 @@ import sys
 
 from .chaos import ChaosEvent
 from .discharge import DischargePlanner
-from .news2 import validate_consciousness, validate_consciousness_dynamics
+from .news2 import (
+    validate_consciousness,
+    validate_consciousness_dynamics,
+    validate_news2_trend,
+)
 from .readiness import DischargeReadiness
 from .recorder import Recorder, iter_ticks, summarize
 from .server import serve
@@ -154,6 +158,14 @@ def load_scenario(path):
             )
         except (TypeError, ValueError) as e:
             raise ValueError("discharge_readiness: %s" % e)
+    news2_trend = None
+    if "news2_trend" in data:
+        if not isinstance(data["news2_trend"], dict):
+            raise ValueError("news2_trend must be an object")
+        try:
+            news2_trend = validate_news2_trend(data["news2_trend"])
+        except ValueError as e:
+            raise ValueError("news2_trend: %s" % e)
     return {
         "beds": beds,
         "rate_hz": rate,
@@ -170,6 +182,7 @@ def load_scenario(path):
         "cleaning_capacity": cleaning_capacity,
         "discharge_planning": discharge_planning,
         "discharge_readiness": discharge_readiness,
+        "news2_trend": news2_trend,
         "triage": triage,
         "host": data.get("host", "127.0.0.1"),
         "port": data.get("port", 8080),
@@ -194,6 +207,7 @@ def build_ward(cfg, seed=None, recorder=None):
         cleaning_capacity=cfg.get("cleaning_capacity"),
         discharge_planning=cfg.get("discharge_planning"),
         discharge_readiness=cfg.get("discharge_readiness"),
+        news2_trend=cfg.get("news2_trend"),
         triage=cfg.get("triage"),
         recorder=recorder,
     )
