@@ -12,6 +12,7 @@ Arrivals can be scheduled in a scenario (``{"at": t, "acuity": n,
 "profile": ...}``) or added live with :meth:`TriageQueue.arrive`.
 """
 
+from .arrivals import ArrivalModel
 from .vitals import PROFILES, validate_acuity
 
 # Default intake queue capacity when a scenario does not set one.
@@ -27,11 +28,29 @@ DEFAULT_WAIT_THRESHOLDS = {1: 300.0, 2: 900.0, 3: 1800.0, 4: 3600.0}
 class TriageQueue:
     """The ED intake queue for one ward."""
 
-    def __init__(self, capacity=DEFAULT_CAPACITY, arrivals=None, wait_thresholds=None):
+    def __init__(self, capacity=DEFAULT_CAPACITY, arrivals=None, wait_thresholds=None, poisson=None, rng=None, seed=None):
         if not isinstance(capacity, int) or capacity < 1:
             raise ValueError("triage capacity must be an int >= 1, got %r" % (capacity,))
         self.capacity = capacity
         self.wait_thresholds = self._validate_thresholds(wait_thresholds)
+        # Optional walk-in arrival model (a Poisson process): a dict
+        # configures one, an ArrivalModel is used as-is. ``rng`` is
+        # the random source for the model — the ward passes its own
+        # seeded RNG so a seeded run reproduces the same arrivals.
+        self.poisson = None
+        if poisson is not None:
+            if isinstance(poisson, ArrivalModel):
+                self.poisson = poisson
+            elif isinstance(poisson, dict):
+                self.poisson = ArrivalModel(rng=rng, seed=seed, **poisson)
+            else:
+                raise ValueError(
+                    "poisson must be an ArrivalModel or a dict, got %r"
+                    % (poisson,)
+                )
+        # The arrival rate at the ward clock hour of the last tick
+        # (None before the first tick with a model).
+        self._current_rate = None
         # Waiting patients, in arrival order: {"arrival_t", "acuity",
         # "profile", "wait_alarm_t"} — "wait_alarm_t" is the time the
         # wait-time alarm was raised, or None while under threshold.
@@ -147,6 +166,23 @@ class TriageQueue:
             self._next_scheduled += 1
             self.arrive(arrival["at"], arrival["acuity"], arrival["profile"])
 
+    def process_poisson_arrivals(self, now, dt, hour):
+        """Generate this tick's walk-in arrivals and queue them.
+
+        ``dt`` is the tick length in seconds, ``hour`` the ward clock
+        hour (0-23) the arrival rate is read at. Each generated
+        arrival joins the queue like any other — or is diverted when
+        the queue is full. Returns the generated arrivals. With no
+        Poisson model configured this is a no-op.
+        """
+        if self.poisson is None:
+            return []
+        self._current_rate = self.poisson.rate_at(hour)
+        arrivals = self.poisson.generate(now, dt, hour)
+        for arrival in arrivals:
+            self.arrive(arrival["arrival_t"], arrival["acuity"], arrival["profile"])
+        return arrivals
+
     def check_wait_alarms(self, now):
         """Raise a wait-time alarm for any patient past their threshold.
 
@@ -259,6 +295,16 @@ class TriageQueue:
                 1 for p in self.waiting if p["wait_alarm_t"] is not None
             ),
             "wait_alarm_history": [dict(e) for e in self.wait_alarm_history],
+            "arrival_rate_per_hour": self._current_rate,
+            "arrivals_generated": (
+                self.poisson.generated if self.poisson is not None else 0
+            ),
+            "arrival_hourly_rates": (
+                list(self.poisson.hourly_rates)
+                if self.poisson is not None
+                and self.poisson.hourly_rates is not None
+                else None
+            ),
             "mean_wait_s": round(sum(waits) / len(waits), 3) if waits else 0.0,
             "max_wait_s": round(max(waits), 3) if waits else 0.0,
             "longest_wait_s": round(

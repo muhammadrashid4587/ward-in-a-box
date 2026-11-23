@@ -61,6 +61,10 @@ python3 -m ward.cli scenarios/triage.json --seed 42
 # patient waiting 20 s both raise alarms while the ward stays full
 python3 -m ward.cli scenarios/wait-alarm.json --seed 42
 
+# Walk-in arrivals: quiet overnight, busy at midday, beds freeing
+# up after discharge and cleaning
+python3 -m ward.cli scenarios/arrivals.json --seed 42
+
 # Reproducible run
 python3 -m ward.cli scenarios/example.json --seed 42
 ```
@@ -431,6 +435,41 @@ full alarm history with raised and cleared times. See
 25-tick run the critical patient raises an alarm at 5 s and the
 low-acuity patient at 22 s while the ward stays full.
 
+## Walk-in / Poisson arrivals
+
+Scheduled arrivals are not how an ED works: walk-ins show up at
+random, at a rate that rises and falls through the day. A scenario
+can add a `poisson` arrival model to its `triage` block instead of
+(or alongside) scheduled arrivals:
+
+```json
+{"triage": {
+  "capacity": 5,
+  "poisson": {
+    "hourly_rates": [30, 30, 30, 30, 30, 30, 60, 90, 180, 180, 180,
+                     180, 150, 150, 150, 150, 150, 120, 120, 90, 90,
+                     90, 60, 60]
+  }
+}}
+```
+
+Each tick draws a Poisson count with mean `rate * dt` — the rate
+read at the ward clock hour, so the ward is quiet overnight and
+busy at midday — and each arrival draws an acuity and a profile
+from configurable weights (defaults: mostly acuity 3-4, half
+stable). A flat rate works too: `"poisson": {"rate_per_hour": 120}`.
+The draws come from the ward's seeded RNG, so `--seed 42` reproduces
+exactly the same arrivals. Walk-ins join the same triage queue as
+scheduled arrivals: they wait for a bed freed by discharge and
+cleaning, or are diverted when the queue is full. The triage
+summary carries the current arrival rate
+(`arrival_rate_per_hour`), the hourly rate table, and how many
+walk-ins have been generated (`arrivals_generated`); the run
+summary (`--summary`) reports the same intake totals from the last
+tick. See `scenarios/arrivals.json` for a runnable example: over a
+seeded 60-tick run at 180/hr, 3 walk-ins arrive, 2 take the beds
+freed by the discharges at 5 s and 8 s, and 1 is still waiting.
+
 ## Recording a run
 
 `--record FILE` writes every tick to a JSONL file: a header line with
@@ -454,7 +493,7 @@ endpoints returned 503 while it lasted, the ticks did not stop.
 make test
 ```
 
-120 tests: vitals stay inside plausible ranges, dropout actually stops a
+130 tests: vitals stay inside plausible ranges, dropout actually stops a
 monitor's stream, an alarm storm produces alarms, stale readings freeze,
 a partition blocks the snapshot endpoint, the HTTP endpoints serve valid
 JSON, the stream serves JSON lines, scenario files validate, alarm
@@ -520,7 +559,15 @@ on admission with its cleared time recorded, per-acuity default
 thresholds (a critical patient alarms at 300 s while a low-acuity
 one does not), validation of custom thresholds, and the
 `wait-alarm.json` scenario raising alarms at 5 s and 22 s over a
-seeded run.
+seeded run. Poisson arrival tests cover a flat rate landing near its
+expected count over 600 ticks, hourly rates varying by hour of day
+and wrapping past midnight, validation of rates and weights,
+generated arrivals having valid acuities and profiles, seeded runs
+reproducing exactly, walk-ins feeding the queue and taking a freed
+bed with fresh vitals, the triage summary carrying the current
+arrival rate, the `arrivals.json` scenario generating 3 walk-ins and
+admitting 2 over a seeded 60-tick run, the run summary carrying
+arrival totals, and rejection of a bad Poisson config.
 
 ## Roadmap
 
@@ -545,3 +592,7 @@ seeded run.
   raised when a waiting patient passes their threshold and cleared
   on admission, with alarm history and active/raised counts in the
   triage summary and `GET /triage`) — done in v0.12.0
+- Walk-in / Poisson arrivals (arrivals driven by a Poisson process
+  with a flat or hour-of-day rate, seeded so runs are reproducible,
+  feeding the triage queue and bed allocation, with the arrival rate
+  in the triage and run summaries) — done in v0.13.0

@@ -73,7 +73,9 @@ def summarize(path):
     Counts ticks and the run's time span, per-bed readings, offline
     and stale ticks, and alarms raised (an alarm counts once when it
     first appears in a bed's reading, matching the monitor's
-    raise/clear transitions). Returns ``None`` fields for a recording
+    raise/clear transitions), plus intake totals from the last tick —
+    patients admitted and diverted, walk-ins generated, and the
+    arrival rate at that hour. Returns ``None`` fields for a recording
     with no ticks.
     """
     header = None
@@ -84,6 +86,7 @@ def summarize(path):
     stale = {}
     alarms_raised = 0
     active = {}
+    last_triage = None
     with open(path) as f:
         for line in f:
             line = line.strip()
@@ -100,6 +103,8 @@ def summarize(path):
             if first_t is None:
                 first_t = t
             last_t = t
+            if isinstance(obj.get("triage"), dict):
+                last_triage = obj["triage"]
             for bed in obj["beds"]:
                 b = bed["bed"]
                 if not bed.get("online", True):
@@ -125,4 +130,19 @@ def summarize(path):
         "offline_ticks_per_bed": offline,
         "stale_ticks_per_bed": stale,
         "alarms_raised": alarms_raised,
+        # Intake totals from the last tick: how many patients the
+        # queue admitted and diverted, how many walk-ins the Poisson
+        # process generated, and the arrival rate at that hour.
+        "triage": (
+            {
+                "admitted": last_triage["admitted"],
+                "diverted": last_triage["diverted"],
+                "arrivals_generated": last_triage.get("arrivals_generated", 0),
+                "arrival_rate_per_hour": last_triage.get(
+                    "arrival_rate_per_hour"
+                ),
+            }
+            if last_triage is not None
+            else None
+        ),
     }

@@ -25,6 +25,7 @@ from ward.recorder import Recorder, iter_ticks, summarize
 from ward.server import make_handler
 from ward.staffing import Staffing
 from ward.timeline import Timeline, TimelinePhase
+from ward.triage import TriageQueue
 from ward.vitals import PROFILES, effective_ranges, validate_acuity
 from ward.ward import Ward
 from ward.websocket import accept_key, encode_frame, read_frame
@@ -1722,6 +1723,184 @@ class TestTriage(unittest.TestCase):
     def test_scenario_rejects_bad_triage(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             json.dump({"beds": 1, "triage": {"capacity": 0}}, f)
+            path = f.name
+        try:
+            with self.assertRaises(ValueError):
+                load_scenario(path)
+        finally:
+            os.unlink(path)
+
+
+class TestPoissonArrivals(unittest.TestCase):
+    def test_flat_rate_generates_near_expected_count(self):
+        # 600 one-second ticks at 3600/hr is one arrival per tick on
+        # average; the count should land near 600 (sd ~24).
+        queue = TriageQueue(poisson={"rate_per_hour": 3600}, seed=42)
+        for i in range(600):
+            queue.process_poisson_arrivals(i + 1, 1.0, 8)
+        self.assertEqual(queue.poisson.generated, 595)
+        self.assertGreater(queue.poisson.generated, 500)
+        self.assertLess(queue.poisson.generated, 700)
+        # Most arrivals were diverted: the default queue holds 8.
+        self.assertEqual(queue.diverted, 587)
+        self.assertEqual(queue.summary(600)["arrivals_generated"], 595)
+
+    def test_hourly_rates_vary_by_hour(self):
+        rates = [30] * 6 + [60, 90] + [180] * 4 + [150] * 5 + [120] * 2 + [90] * 3 + [60] * 2
+        model_queue = TriageQueue(poisson={"hourly_rates": rates}, seed=42)
+        model = model_queue.poisson
+        self.assertEqual(model.rate_at(2), 30.0)
+        self.assertEqual(model.rate_at(10), 180.0)
+        self.assertEqual(model.rate_at(22), 60.0)
+        # Hours wrap past midnight.
+        self.assertEqual(model.rate_at(26), 30.0)
+        self.assertEqual(model.rate_at(8.5), 180.0)
+        # A flat rate reads the same at every hour.
+        flat = TriageQueue(poisson={"rate_per_hour": 120}, seed=42).poisson
+        self.assertEqual(flat.rate_at(3), 120.0)
+        self.assertEqual(flat.rate_at(15), 120.0)
+
+    def test_arrival_model_validation(self):
+        with self.assertRaises(ValueError):
+            TriageQueue(poisson={"rate_per_hour": 0}, seed=42)
+        with self.assertRaises(ValueError):
+            TriageQueue(poisson={"rate_per_hour": -5}, seed=42)
+        with self.assertRaises(ValueError):
+            TriageQueue(poisson={}, seed=42)
+        with self.assertRaises(ValueError):
+            TriageQueue(
+                poisson={"rate_per_hour": 60, "hourly_rates": [60] * 24},
+                seed=42,
+            )
+        with self.assertRaises(ValueError):
+            TriageQueue(poisson={"hourly_rates": [60] * 23}, seed=42)
+        with self.assertRaises(ValueError):
+            TriageQueue(
+                poisson={"hourly_rates": [60] * 23 + [-1]}, seed=42
+            )
+        with self.assertRaises(ValueError):
+            TriageQueue(
+                poisson={"rate_per_hour": 60, "acuity_weights": {5: 1.0}},
+                seed=42,
+            )
+        with self.assertRaises(ValueError):
+            TriageQueue(
+                poisson={"rate_per_hour": 60, "profile_weights": {"sick": 1.0}},
+                seed=42,
+            )
+        with self.assertRaises(ValueError):
+            TriageQueue(
+                poisson={"rate_per_hour": 60, "acuity_weights": {1: 0}},
+                seed=42,
+            )
+        with self.assertRaises(ValueError):
+            TriageQueue(poisson="fast", seed=42)
+
+    def test_generated_arrivals_have_valid_acuity_and_profile(self):
+        queue = TriageQueue(poisson={"rate_per_hour": 36000}, seed=42)
+        arrivals = queue.process_poisson_arrivals(1, 3600.0, 8)
+        self.assertGreater(len(arrivals), 0)
+        for arrival in arrivals:
+            self.assertIn(arrival["acuity"], (1, 2, 3, 4))
+            self.assertIn(arrival["profile"], PROFILES)
+            self.assertEqual(arrival["arrival_t"], 1.0)
+
+    def test_seeded_runs_are_reproducible(self):
+        def run():
+            ward = Ward(
+                beds=2,
+                cleaning_s=10.0,
+                seed=42,
+                triage={"capacity": 8, "poisson": {"rate_per_hour": 3600}},
+            )
+            for _ in range(20):
+                ward.tick()
+            return ward.triage_summary()
+
+        first, second = run(), run()
+        self.assertEqual(first, second)
+        self.assertEqual(first["arrivals_generated"], 25)
+
+    def test_poisson_arrivals_feed_queue_and_get_admitted(self):
+        ward = Ward(
+            beds=2,
+            cleaning_s=10.0,
+            seed=42,
+            triage={"capacity": 8, "poisson": {"rate_per_hour": 3600}},
+        )
+        ward.tick()  # t=1
+        ward.discharge(0)
+        for _ in range(14):
+            snap = ward.tick()
+        # Discharged at t=1, cleaning 10 s: bed 0 free at t=11, and
+        # the highest-priority walk-in takes it with fresh vitals.
+        summary = ward.triage_summary()
+        self.assertEqual(summary["arrivals_generated"], 14)
+        self.assertEqual(summary["admitted"], 1)
+        self.assertTrue(snap["beds"][0]["online"])
+        self.assertEqual(snap["beds"][0]["profile"], "febrile")
+        self.assertEqual(snap["beds"][0]["acuity"], 2)
+        # Admitted at t=11, so five readings by t=15: fresh vitals,
+        # not the discharged patient's.
+        self.assertEqual(snap["beds"][0]["seq"], 5)
+
+    def test_triage_summary_carries_arrival_rate(self):
+        ward = Ward(
+            beds=2,
+            seed=42,
+            triage={"poisson": {"rate_per_hour": 120}},
+        )
+        # Before the first tick there is no current rate yet.
+        summary = ward.triage_summary()
+        self.assertIsNone(summary["arrival_rate_per_hour"])
+        self.assertEqual(summary["arrivals_generated"], 0)
+        self.assertIsNone(summary["arrival_hourly_rates"])
+        ward.tick()
+        summary = ward.triage_summary()
+        self.assertEqual(summary["arrival_rate_per_hour"], 120.0)
+        # And a ward with no arrival model reports no rate at all.
+        plain = Ward(beds=2, seed=42)
+        plain.tick()
+        plain_summary = plain.triage_summary()
+        self.assertIsNone(plain_summary["arrival_rate_per_hour"])
+        self.assertEqual(plain_summary["arrivals_generated"], 0)
+
+    def test_scenario_arrivals(self):
+        cfg = load_scenario(os.path.join(HERE, "..", "scenarios", "arrivals.json"))
+        self.assertEqual(cfg["triage"].poisson.rate_at(8), 180.0)
+        self.assertEqual(cfg["triage"].poisson.rate_at(2), 30.0)
+        ward = build_ward(cfg, seed=42)
+        for _ in range(60):
+            ward.tick()
+        # 180/hr over 60 s is 3 arrivals on average; two take the
+        # beds freed by the discharges at 5 s and 8 s, one still waits.
+        summary = ward.triage_summary()
+        self.assertEqual(summary["arrivals_generated"], 3)
+        self.assertEqual(summary["admitted"], 2)
+        self.assertEqual(summary["diverted"], 0)
+        self.assertEqual(summary["waiting_total"], 1)
+        self.assertEqual(summary["arrival_rate_per_hour"], 180.0)
+        self.assertEqual(len(summary["arrival_hourly_rates"]), 24)
+
+    def test_recorder_summary_carries_arrivals(self):
+        cfg = load_scenario(os.path.join(HERE, "..", "scenarios", "arrivals.json"))
+        ward = build_ward(cfg, seed=42)
+        path = os.path.join(tempfile.mkdtemp(), "run.jsonl")
+        with Recorder(path, ward.beds, ward.rate_hz, seed=42) as rec:
+            ward.recorder = rec
+            for _ in range(60):
+                ward.tick()
+        s = summarize(path)
+        self.assertEqual(s["triage"]["admitted"], 2)
+        self.assertEqual(s["triage"]["diverted"], 0)
+        self.assertEqual(s["triage"]["arrivals_generated"], 3)
+        self.assertEqual(s["triage"]["arrival_rate_per_hour"], 180.0)
+
+    def test_scenario_rejects_bad_poisson(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(
+                {"beds": 1, "triage": {"poisson": {"rate_per_hour": 0}}}, f
+            )
             path = f.name
         try:
             with self.assertRaises(ValueError):

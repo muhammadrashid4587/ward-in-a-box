@@ -33,12 +33,20 @@ class Ward:
             raise ValueError("rate_hz must be > 0")
         if cleaning_s <= 0:
             raise ValueError("cleaning_s must be > 0")
+        self.rng = random.Random(seed)
         if triage is None:
-            self.triage = TriageQueue()
+            self.triage = TriageQueue(rng=self.rng)
         elif isinstance(triage, TriageQueue):
             self.triage = triage
+            # A triage queue built elsewhere (e.g. by load_scenario)
+            # gets this ward's seeded RNG for its walk-in arrivals,
+            # so a seeded run reproduces the same arrivals.
+            if self.triage.poisson is not None:
+                self.triage.poisson.rng = self.rng
         elif isinstance(triage, dict):
-            self.triage = TriageQueue(**triage)
+            kwargs = dict(triage)
+            kwargs.setdefault("rng", self.rng)
+            self.triage = TriageQueue(**kwargs)
         else:
             raise ValueError("triage must be a TriageQueue or a dict, got %r" % (triage,))
         self.cleaning_s = float(cleaning_s)
@@ -59,7 +67,6 @@ class Ward:
             raise ValueError("staffing must be a Staffing or a dict, got %r" % (staffing,))
         self.beds = beds
         self.rate_hz = rate_hz
-        self.rng = random.Random(seed)
         self.partitioned = False
         self.elapsed = 0.0
         self.timeline = timeline
@@ -106,11 +113,14 @@ class Ward:
                         and m.state(self.elapsed) == "available"
                     ):
                         m.admitted = True
-        # Triage: scheduled arrivals join the queue, then waiting
-        # patients take any bed that has become available (a discharge
-        # plus its cleaning leaves the bed available; the timeline
-        # above already had first claim on it this tick).
+        # Triage: scheduled arrivals join the queue, walk-ins arrive
+        # by the Poisson process at the ward clock hour's rate, then
+        # waiting patients take any bed that has become available (a
+        # discharge plus its cleaning leaves the bed available; the
+        # timeline above already had first claim on it this tick).
         self.triage.process_arrivals(self.elapsed)
+        hour = (self.staffing.start_hour + self.elapsed / 3600.0) % 24
+        self.triage.process_poisson_arrivals(self.elapsed, dt, hour)
         self.triage.admit_available(self.elapsed, self)
         # After admissions: a patient still waiting past their
         # acuity's threshold raises a wait-time alarm.
