@@ -75,8 +75,9 @@ def summarize(path):
     first appears in a bed's reading, matching the monitor's
     raise/clear transitions), plus intake totals from the last tick —
     patients admitted and diverted, walk-ins generated, and the
-    arrival rate at that hour. Returns ``None`` fields for a recording
-    with no ticks.
+    arrival rate at that hour, with arrivals per ward clock hour so
+    the run's load shape over the day is visible. Returns ``None``
+    fields for a recording with no ticks.
     """
     header = None
     ticks = 0
@@ -132,7 +133,9 @@ def summarize(path):
         "alarms_raised": alarms_raised,
         # Intake totals from the last tick: how many patients the
         # queue admitted and diverted, how many walk-ins the Poisson
-        # process generated, and the arrival rate at that hour.
+        # process generated, and the arrival rate at that hour —
+        # plus arrivals per ward clock hour and the configured
+        # hourly rates, so the run's load shape is visible.
         "triage": (
             {
                 "admitted": last_triage["admitted"],
@@ -140,6 +143,10 @@ def summarize(path):
                 "arrivals_generated": last_triage.get("arrivals_generated", 0),
                 "arrival_rate_per_hour": last_triage.get(
                     "arrival_rate_per_hour"
+                ),
+                "arrivals_by_hour": last_triage.get("arrivals_by_hour", {}),
+                "arrival_hourly_rates": last_triage.get(
+                    "arrival_hourly_rates"
                 ),
             }
             if last_triage is not None

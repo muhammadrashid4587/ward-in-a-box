@@ -51,6 +51,10 @@ class TriageQueue:
         # The arrival rate at the ward clock hour of the last tick
         # (None before the first tick with a model).
         self._current_rate = None
+        # Arrivals per ward clock hour (0-23): every patient who
+        # showed up in that hour, whether they joined the queue or
+        # were diverted — the ED load shape over the day.
+        self.arrivals_by_hour = {}
         # Waiting patients, in arrival order: {"arrival_t", "acuity",
         # "profile", "wait_alarm_t"} — "wait_alarm_t" is the time the
         # wait-time alarm was raised, or None while under threshold.
@@ -135,15 +139,20 @@ class TriageQueue:
             thresholds[acuity] = float(value)
         return thresholds
 
-    def arrive(self, now, acuity, profile="stable"):
+    def arrive(self, now, acuity, profile="stable", hour=None):
         """Add a patient arriving at ``now`` to the queue.
 
         Returns True if the patient joined the queue, False if they
-        were diverted because the queue is full.
+        were diverted because the queue is full. ``hour`` is the ward
+        clock hour (0-23) the arrival falls in; when given, the
+        arrival counts toward that hour's total even if diverted.
         """
         acuity = validate_acuity(acuity)
         if profile not in PROFILES:
             raise ValueError("unknown profile: %r" % profile)
+        if hour is not None:
+            h = int(hour) % 24
+            self.arrivals_by_hour[h] = self.arrivals_by_hour.get(h, 0) + 1
         if len(self.waiting) >= self.capacity:
             self.diverted += 1
             return False
@@ -157,14 +166,20 @@ class TriageQueue:
         )
         return True
 
-    def process_arrivals(self, now):
-        """Move scheduled arrivals due at ``now`` into the queue."""
+    def process_arrivals(self, now, hour=None):
+        """Move scheduled arrivals due at ``now`` into the queue.
+
+        ``hour`` is the ward clock hour (0-23) the arrivals fall in,
+        for the per-hour arrival counts.
+        """
         while self._next_scheduled < len(self._scheduled):
             arrival = self._scheduled[self._next_scheduled]
             if arrival["at"] > now:
                 break
             self._next_scheduled += 1
-            self.arrive(arrival["at"], arrival["acuity"], arrival["profile"])
+            self.arrive(
+                arrival["at"], arrival["acuity"], arrival["profile"], hour=hour
+            )
 
     def process_poisson_arrivals(self, now, dt, hour):
         """Generate this tick's walk-in arrivals and queue them.
@@ -180,7 +195,12 @@ class TriageQueue:
         self._current_rate = self.poisson.rate_at(hour)
         arrivals = self.poisson.generate(now, dt, hour)
         for arrival in arrivals:
-            self.arrive(arrival["arrival_t"], arrival["acuity"], arrival["profile"])
+            self.arrive(
+                arrival["arrival_t"],
+                arrival["acuity"],
+                arrival["profile"],
+                hour=hour,
+            )
         return arrivals
 
     def check_wait_alarms(self, now):
@@ -299,6 +319,9 @@ class TriageQueue:
             "arrivals_generated": (
                 self.poisson.generated if self.poisson is not None else 0
             ),
+            "arrivals_by_hour": {
+                str(h): n for h, n in sorted(self.arrivals_by_hour.items())
+            },
             "arrival_hourly_rates": (
                 list(self.poisson.hourly_rates)
                 if self.poisson is not None

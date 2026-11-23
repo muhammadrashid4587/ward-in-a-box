@@ -1745,6 +1745,46 @@ class TestPoissonArrivals(unittest.TestCase):
         self.assertEqual(queue.diverted, 587)
         self.assertEqual(queue.summary(600)["arrivals_generated"], 595)
 
+    def test_arrivals_by_hour_buckets_by_clock_hour(self):
+        queue = TriageQueue(capacity=2)
+        queue.arrive(0, 3, "stable", hour=8)
+        queue.arrive(10, 2, "hypoxic", hour=9)
+        queue.arrive(20, 4, "stable", hour=8)
+        # The second hour-8 arrival was diverted (capacity 2), but it
+        # still showed up at the ED, so it still counts toward hour 8.
+        self.assertEqual(queue.diverted, 1)
+        self.assertEqual(
+            queue.summary(20)["arrivals_by_hour"], {"8": 2, "9": 1}
+        )
+        # Hours wrap past midnight.
+        queue.arrive(30, 3, "stable", hour=26)
+        self.assertEqual(
+            queue.summary(30)["arrivals_by_hour"], {"2": 1, "8": 2, "9": 1}
+        )
+        # Without an hour, an arrival is not bucketed at all.
+        plain = TriageQueue(capacity=2)
+        plain.arrive(0, 3, "stable")
+        self.assertEqual(plain.summary(0)["arrivals_by_hour"], {})
+
+    def test_arrivals_by_hour_spans_midnight(self):
+        # A ward starting at 23:00 with a flat 3600/hr walk-in rate,
+        # run for just over an hour, sees arrivals in both hour 23
+        # and hour 0 — and the per-hour counts add up to the total.
+        ward = Ward(
+            beds=2,
+            seed=42,
+            staffing={"start_hour": 23},
+            triage={"poisson": {"rate_per_hour": 3600}},
+        )
+        for _ in range(3700):
+            ward.tick()
+        summary = ward.triage_summary()
+        by_hour = summary["arrivals_by_hour"]
+        self.assertIn("23", by_hour)
+        self.assertIn("0", by_hour)
+        self.assertEqual(sum(by_hour.values()), summary["arrivals_generated"])
+        self.assertGreater(sum(by_hour.values()), 3000)
+
     def test_hourly_rates_vary_by_hour(self):
         rates = [30] * 6 + [60, 90] + [180] * 4 + [150] * 5 + [120] * 2 + [90] * 3 + [60] * 2
         model_queue = TriageQueue(poisson={"hourly_rates": rates}, seed=42)
@@ -1881,6 +1921,8 @@ class TestPoissonArrivals(unittest.TestCase):
         self.assertEqual(summary["waiting_total"], 1)
         self.assertEqual(summary["arrival_rate_per_hour"], 180.0)
         self.assertEqual(len(summary["arrival_hourly_rates"]), 24)
+        # All 3 walk-ins arrived in hour 8 (the run starts at 08:00).
+        self.assertEqual(summary["arrivals_by_hour"], {"8": 3})
 
     def test_recorder_summary_carries_arrivals(self):
         cfg = load_scenario(os.path.join(HERE, "..", "scenarios", "arrivals.json"))
@@ -1895,6 +1937,11 @@ class TestPoissonArrivals(unittest.TestCase):
         self.assertEqual(s["triage"]["diverted"], 0)
         self.assertEqual(s["triage"]["arrivals_generated"], 3)
         self.assertEqual(s["triage"]["arrival_rate_per_hour"], 180.0)
+        # The run summary carries the per-hour arrivals and the
+        # configured hourly rates, so the load shape is visible.
+        self.assertEqual(s["triage"]["arrivals_by_hour"], {"8": 3})
+        self.assertEqual(len(s["triage"]["arrival_hourly_rates"]), 24)
+        self.assertEqual(s["triage"]["arrival_hourly_rates"][8], 180.0)
 
     def test_scenario_rejects_bad_poisson(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:

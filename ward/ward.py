@@ -118,8 +118,8 @@ class Ward:
         # waiting patients take any bed that has become available (a
         # discharge plus its cleaning leaves the bed available; the
         # timeline above already had first claim on it this tick).
-        self.triage.process_arrivals(self.elapsed)
         hour = (self.staffing.start_hour + self.elapsed / 3600.0) % 24
+        self.triage.process_arrivals(self.elapsed, hour)
         self.triage.process_poisson_arrivals(self.elapsed, dt, hour)
         self.triage.admit_available(self.elapsed, self)
         # After admissions: a patient still waiting past their
@@ -232,7 +232,8 @@ class Ward:
         Returns True if they joined the queue, False if they were
         diverted because it is full.
         """
-        return self.triage.arrive(self.elapsed, acuity, profile)
+        hour = (self.staffing.start_hour + self.elapsed / 3600.0) % 24
+        return self.triage.arrive(self.elapsed, acuity, profile, hour=hour)
 
     def start(self):
         if self._thread is not None:

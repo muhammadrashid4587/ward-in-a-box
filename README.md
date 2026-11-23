@@ -464,9 +464,14 @@ scheduled arrivals: they wait for a bed freed by discharge and
 cleaning, or are diverted when the queue is full. The triage
 summary carries the current arrival rate
 (`arrival_rate_per_hour`), the hourly rate table, and how many
-walk-ins have been generated (`arrivals_generated`); the run
-summary (`--summary`) reports the same intake totals from the last
-tick. See `scenarios/arrivals.json` for a runnable example: over a
+walk-ins have been generated (`arrivals_generated`); it also
+carries arrivals per ward clock hour (`arrivals_by_hour`), so the
+ED load shape over the day is visible — every arrival counts
+toward its hour, whether it joined the queue or was diverted
+when the queue was full, and the per-hour counts add up to the
+total arrivals. The run summary (`--summary`) reports the same
+per-hour arrivals alongside the configured hourly rates. See
+`scenarios/arrivals.json` for a runnable example: over a
 seeded 60-tick run at 180/hr, 3 walk-ins arrive, 2 take the beds
 freed by the discharges at 5 s and 8 s, and 1 is still waiting.
 
@@ -493,7 +498,7 @@ endpoints returned 503 while it lasted, the ticks did not stop.
 make test
 ```
 
-130 tests: vitals stay inside plausible ranges, dropout actually stops a
+132 tests: vitals stay inside plausible ranges, dropout actually stops a
 monitor's stream, an alarm storm produces alarms, stale readings freeze,
 a partition blocks the snapshot endpoint, the HTTP endpoints serve valid
 JSON, the stream serves JSON lines, scenario files validate, alarm
@@ -567,7 +572,14 @@ reproducing exactly, walk-ins feeding the queue and taking a freed
 bed with fresh vitals, the triage summary carrying the current
 arrival rate, the `arrivals.json` scenario generating 3 walk-ins and
 admitting 2 over a seeded 60-tick run, the run summary carrying
-arrival totals, and rejection of a bad Poisson config.
+arrival totals, and rejection of a bad Poisson config. Per-hour
+arrival tests cover arrivals bucketed by ward clock hour in the
+triage summary (including diverted arrivals still counting and
+hours wrapping past midnight), a ward run spanning midnight
+seeing arrivals in both hour 23 and hour 0 with the per-hour
+counts adding up to the total, the `arrivals.json` scenario
+putting all 3 walk-ins in hour 8, and the run summary carrying
+the per-hour arrivals and the configured hourly rates.
 
 ## Roadmap
 
@@ -596,3 +608,7 @@ arrival totals, and rejection of a bad Poisson config.
   with a flat or hour-of-day rate, seeded so runs are reproducible,
   feeding the triage queue and bed allocation, with the arrival rate
   in the triage and run summaries) — done in v0.13.0
+- Per-hour arrival metrics (every arrival bucketed by ward clock
+  hour in the triage summary, diverted arrivals included, with the
+  per-hour counts and the configured hourly rates carried into the
+  run summary) — done in v0.14.0
