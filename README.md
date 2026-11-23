@@ -57,6 +57,10 @@ python3 -m ward.cli scenarios/stockout.json --seed 42
 # 1 and 2 as they free up after discharge and cleaning
 python3 -m ward.cli scenarios/triage.json --seed 42
 
+# Wait-time alarms: a critical patient waiting 5 s and a low-acuity
+# patient waiting 20 s both raise alarms while the ward stays full
+python3 -m ward.cli scenarios/wait-alarm.json --seed 42
+
 # Reproducible run
 python3 -m ward.cli scenarios/example.json --seed 42
 ```
@@ -406,6 +410,27 @@ while the ward is full, beds 1 and 2 discharge at 5 s and 8 s, and
 the two critical patients are admitted at 15 s and 18 s once
 cleaning finishes, after waiting 15 s and 9 s.
 
+## Triage wait-time alarms
+
+A patient who waits too long raises an alarm. Each acuity has its
+own wait threshold — 300 s for acuity 1, 900 s for acuity 2, 1800 s
+for acuity 3, 3600 s for acuity 4, the same shape as real ED triage
+targets — set per scenario with `wait_thresholds`:
+
+```json
+{"triage": {"capacity": 5, "wait_thresholds": {"1": 300, "4": 3600}}}
+```
+
+The alarm raises at exactly `arrival_t + threshold`, once, and
+clears when the patient is admitted. Each waiting patient in the
+triage summary carries their threshold, whether their alarm is
+raised, and when it raised; the summary also lists the thresholds,
+the total alarms raised, how many are currently active, and the
+full alarm history with raised and cleared times. See
+`scenarios/wait-alarm.json` for a runnable example: over a seeded
+25-tick run the critical patient raises an alarm at 5 s and the
+low-acuity patient at 22 s while the ward stays full.
+
 ## Recording a run
 
 `--record FILE` writes every tick to a JSONL file: a header line with
@@ -429,7 +454,7 @@ endpoints returned 503 while it lasted, the ticks did not stop.
 make test
 ```
 
-115 tests: vitals stay inside plausible ranges, dropout actually stops a
+120 tests: vitals stay inside plausible ranges, dropout actually stops a
 monitor's stream, an alarm storm produces alarms, stale readings freeze,
 a partition blocks the snapshot endpoint, the HTTP endpoints serve valid
 JSON, the stream serves JSON lines, scenario files validate, alarm
@@ -489,7 +514,13 @@ the timeline has not admitted yet, scheduled arrivals with priority
 admission, validation of capacity, acuity, and profile, the
 `/triage` endpoint (503 while partitioned), triage in snapshots, and
 the `triage.json` scenario admitting two critical patients at 15 s
-and 18 s after waits of 15 s and 9 s.
+and 18 s after waits of 15 s and 9 s. Wait-alarm tests cover an alarm
+raising exactly at the threshold and only once, the alarm clearing
+on admission with its cleared time recorded, per-acuity default
+thresholds (a critical patient alarms at 300 s while a low-acuity
+one does not), validation of custom thresholds, and the
+`wait-alarm.json` scenario raising alarms at 5 s and 22 s over a
+seeded run.
 
 ## Roadmap
 
@@ -510,3 +541,7 @@ and 18 s after waits of 15 s and 9 s.
   intake queue, are admitted to beds as they free up with critical
   patients first, or diverted when the queue is full, with queue
   metrics and a `GET /triage` endpoint) — done in v0.11.0
+- Triage wait-time alarms (per-acuity wait thresholds, an alarm
+  raised when a waiting patient passes their threshold and cleared
+  on admission, with alarm history and active/raised counts in the
+  triage summary and `GET /triage`) — done in v0.12.0

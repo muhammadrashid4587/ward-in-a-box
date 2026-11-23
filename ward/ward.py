@@ -112,6 +112,9 @@ class Ward:
         # above already had first claim on it this tick).
         self.triage.process_arrivals(self.elapsed)
         self.triage.admit_available(self.elapsed, self)
+        # After admissions: a patient still waiting past their
+        # acuity's threshold raises a wait-time alarm.
+        self.triage.check_wait_alarms(self.elapsed)
         readings = []
         online = []
         occupied = sum(1 for m in self.monitors if m.admitted)

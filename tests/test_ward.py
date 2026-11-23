@@ -1492,6 +1492,92 @@ class TestTriage(unittest.TestCase):
         self.assertEqual(summary["mean_wait_s"], 0.0)
         self.assertEqual(summary["max_wait_s"], 0.0)
 
+    def test_wait_alarm_raised_at_threshold(self):
+        ward = self._ward(triage={"wait_thresholds": {"1": 10}})
+        ward.triage_arrive(1, "hypoxic")  # t=1
+        for _ in range(9):
+            ward.tick()
+        # t=10: waited 9 s, under the 10 s threshold, no alarm yet.
+        summary = ward.triage_summary()
+        self.assertEqual(summary["wait_alarms_active"], 0)
+        self.assertEqual(summary["wait_alarms_raised"], 0)
+        self.assertFalse(summary["waiting"][0]["wait_alarm"])
+        snap = ward.tick()  # t=11: waited 10 s, alarm raises at t=11
+        self.assertEqual(snap["triage"]["wait_alarms_active"], 1)
+        self.assertEqual(snap["triage"]["wait_alarms_raised"], 1)
+        waiting = snap["triage"]["waiting"][0]
+        self.assertTrue(waiting["wait_alarm"])
+        self.assertEqual(waiting["wait_alarm_t"], 11.0)
+        self.assertEqual(waiting["wait_threshold_s"], 10.0)
+        history = snap["triage"]["wait_alarm_history"]
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["acuity"], 1)
+        self.assertEqual(history[0]["raised_t"], 11.0)
+        self.assertIsNone(history[0]["cleared_t"])
+        # The alarm raises once: a later tick does not re-raise it.
+        ward.tick()  # t=12
+        summary = ward.triage_summary()
+        self.assertEqual(summary["wait_alarms_raised"], 1)
+        self.assertEqual(len(summary["wait_alarm_history"]), 1)
+
+    def test_wait_alarm_clears_on_admission(self):
+        ward = self._ward(triage={"wait_thresholds": {"1": 5}})
+        ward.triage_arrive(1, "hypoxic")  # t=1
+        for _ in range(5):
+            ward.tick()
+        # t=6: waited 5 s, alarm raised at t=6.
+        summary = ward.triage_summary()
+        self.assertEqual(summary["wait_alarms_active"], 1)
+        ward.discharge(0)  # t=6, cleaning 10 s: bed 0 free at t=16
+        for _ in range(10):
+            ward.tick()
+        snap = ward.tick()  # t=17: patient admitted at t=16
+        self.assertEqual(snap["triage"]["admitted"], 1)
+        self.assertEqual(snap["triage"]["wait_alarms_active"], 0)
+        self.assertEqual(snap["triage"]["wait_alarms_raised"], 1)
+        history = snap["triage"]["wait_alarm_history"]
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["raised_t"], 6.0)
+        self.assertEqual(history[0]["cleared_t"], 16.0)
+
+    def test_wait_thresholds_differ_by_acuity(self):
+        # Defaults: acuity 1 gets 300 s, acuity 4 gets 3600 s.
+        ward = self._ward()
+        ward.triage_arrive(1, "hypoxic")  # t=1
+        ward.triage_arrive(4, "stable")  # t=1
+        for _ in range(300):
+            ward.tick()
+        # t=301: the critical patient has waited 300 s (alarm), the
+        # low-acuity patient has waited 300 s of 3600 s (no alarm).
+        summary = ward.triage_summary()
+        self.assertEqual(
+            summary["wait_thresholds_s"],
+            {"1": 300.0, "2": 900.0, "3": 1800.0, "4": 3600.0},
+        )
+        self.assertEqual(summary["wait_alarms_active"], 1)
+        waiting = {w["acuity"]: w for w in summary["waiting"]}
+        self.assertTrue(waiting[1]["wait_alarm"])
+        self.assertFalse(waiting[4]["wait_alarm"])
+
+    def test_wait_threshold_validation(self):
+        from ward.triage import TriageQueue
+
+        with self.assertRaises(ValueError):
+            TriageQueue(wait_thresholds={"5": 10})
+        with self.assertRaises(ValueError):
+            TriageQueue(wait_thresholds={"1": 0})
+        with self.assertRaises(ValueError):
+            TriageQueue(wait_thresholds={"1": -5})
+        with self.assertRaises(ValueError):
+            TriageQueue(wait_thresholds={"1": "soon"})
+        with self.assertRaises(ValueError):
+            TriageQueue(wait_thresholds="soon")
+        # A partial override keeps the defaults for the rest.
+        queue = TriageQueue(wait_thresholds={"1": 60, 4: 120})
+        self.assertEqual(queue.wait_thresholds[1], 60.0)
+        self.assertEqual(queue.wait_thresholds[2], 900.0)
+        self.assertEqual(queue.wait_thresholds[4], 120.0)
+
     def test_triage_does_not_take_a_cleaning_bed(self):
         ward = self._ward()
         ward.triage_arrive(1, "hypoxic")
@@ -1608,6 +1694,30 @@ class TestTriage(unittest.TestCase):
         self.assertEqual(snap["triage"]["mean_wait_s"], 12.0)
         self.assertEqual(snap["triage"]["max_wait_s"], 15.0)
         self.assertEqual(snap["triage"]["waiting_total"], 3)
+
+    def test_scenario_wait_alarm(self):
+        cfg = load_scenario(os.path.join(HERE, "..", "scenarios", "wait-alarm.json"))
+        self.assertEqual(cfg["triage"].wait_thresholds[1], 5.0)
+        self.assertEqual(cfg["triage"].wait_thresholds[4], 20.0)
+        ward = build_ward(cfg, seed=42)
+        for _ in range(5):
+            ward.tick()
+        # t=5: the critical patient (arrived t=0) has waited 5 s and
+        # raised a wait-time alarm; the acuity-4 patient (arrived
+        # t=2) has waited 3 s of 20 s, no alarm yet.
+        summary = ward.triage_summary()
+        self.assertEqual(summary["wait_alarms_active"], 1)
+        self.assertEqual(summary["wait_alarms_raised"], 1)
+        self.assertEqual(summary["wait_alarm_history"][0]["raised_t"], 5.0)
+        self.assertEqual(summary["wait_alarm_history"][0]["acuity"], 1)
+        for _ in range(17):
+            ward.tick()
+        # t=22: the acuity-4 patient has waited 20 s and raised one too.
+        summary = ward.triage_summary()
+        self.assertEqual(summary["wait_alarms_active"], 2)
+        self.assertEqual(summary["wait_alarms_raised"], 2)
+        self.assertEqual(summary["wait_alarm_history"][1]["raised_t"], 22.0)
+        self.assertEqual(summary["wait_alarm_history"][1]["acuity"], 4)
 
     def test_scenario_rejects_bad_triage(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
