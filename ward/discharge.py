@@ -12,6 +12,16 @@ If cleaning is backed up — the ward's ``cleaning_capacity`` is reached
 monitored, until a cleaning slot frees up, and the delay is recorded
 on the order. An order for a bed whose patient already left (a chaos
 ``discharge`` event fired first, say) is cancelled, not forced.
+
+Paperwork timing: the planner also measures how long the discharge
+paperwork takes, from the moment a bed is first flagged
+discharge-ready — ``ready_t`` on the order — to the order being
+placed (``ready_to_order_s``) and to the patient actually leaving
+(``ready_to_discharge_s``). An order placed before the bed was ready
+has no ready-to-order time; an order for a bed that never flags ready
+has no timing at all. The summary aggregates the measured orders
+(mean and max), so a ward can see whether the paperwork or the
+cleaning roster is what holds a bed up.
 """
 
 # Default lead time between a discharge order and the discharge:
@@ -77,8 +87,14 @@ class DischargePlanner:
             )
         self.scheduled_orders.sort(key=lambda o: o["at"])
         self._next_scheduled = 0
+        # When each bed was first flagged discharge-ready in its
+        # current stay, ``{bed: t}`` — the start of the paperwork
+        # clock. The ward notes it (see :meth:`note_ready`) and
+        # clears it when the bed stops being ready or leaves.
+        self._ready_since = {}
         # Placed orders: {"bed", "ordered_t", "expected_t", "status",
-        # "actual_t", "delay_s"} — status is "planned" until the
+        # "actual_t", "delay_s", "ready_t", "ready_to_order_s",
+        # "ready_to_discharge_s"} — status is "planned" until the
         # expected time, then "discharged", "delayed" (cleaning backed
         # up, still waiting), or "cancelled" (patient already gone).
         self.orders = []
@@ -106,6 +122,7 @@ class DischargePlanner:
             or lead <= 0
         ):
             raise ValueError("lead_time_s must be > 0, got %r" % (lead,))
+        ready_t = self._ready_since.get(bed)
         order = {
             "bed": bed,
             "ordered_t": round(ordered_at, 3),
@@ -114,9 +131,48 @@ class DischargePlanner:
             "actual_t": None,
             "delay_s": None,
             "source": source,
+            # When the bed was first flagged discharge-ready, if it
+            # was ready when (or before) the order was placed; the
+            # paperwork timings are filled in when the patient
+            # leaves (see :meth:`_finish_timing`).
+            "ready_t": ready_t,
+            "ready_to_order_s": (
+                round(ordered_at - ready_t, 3)
+                if ready_t is not None and ready_t <= ordered_at
+                else None
+            ),
+            "ready_to_discharge_s": None,
         }
         self.orders.append(order)
         return order
+
+    def note_ready(self, bed, now):
+        """Note that ``bed`` was flagged discharge-ready at ``now``.
+
+        The first flagging in a stay starts the paperwork clock;
+        a bed already flagged keeps its first time. A live order
+        for the bed that was placed before the bed was ready picks
+        the time up too, so its ready-to-discharge time can still
+        be measured.
+        """
+        now = round(now, 3)
+        if bed not in self._ready_since:
+            self._ready_since[bed] = now
+        for order in self.orders:
+            if (
+                order["bed"] == bed
+                and order["status"] in ("planned", "delayed")
+                and order["ready_t"] is None
+            ):
+                order["ready_t"] = now
+
+    def note_not_ready(self, bed):
+        """Clear ``bed``'s paperwork clock: it stopped being ready,
+        or the patient left. An order already discharged keeps the
+        ``ready_t`` it recorded; a live order keeps its own too —
+        the clock restarts only for a fresh flagging, when a new
+        order is placed."""
+        self._ready_since.pop(bed, None)
 
     def has_live_order(self, bed):
         """True when ``bed`` already has a discharge order in flight:
@@ -172,6 +228,7 @@ class DischargePlanner:
                 order["status"] = "discharged"
                 order["actual_t"] = now
                 order["delay_s"] = 0.0
+                self._finish_timing(order, now)
             elif result == "queued":
                 order["status"] = "delayed"
             else:
@@ -190,8 +247,30 @@ class DischargePlanner:
                 order["status"] = "discharged"
                 order["actual_t"] = now
                 order["delay_s"] = round(now - order["expected_t"], 3)
+                self._finish_timing(order, now)
                 return order
         return None
+
+    def _finish_timing(self, order, actual_t):
+        """Fill in an order's paperwork timings at discharge.
+
+        ``ready_to_discharge_s`` is the time from the bed first
+        being flagged ready to the patient leaving — so it includes
+        any cleaning delay. ``ready_to_order_s`` is only meaningful
+        when the bed was already ready when the order was placed;
+        an order placed before the bed was ready has none. An order
+        for a bed that never flagged ready has neither.
+        """
+        ready_t = order.get("ready_t")
+        if ready_t is None:
+            order["ready_to_order_s"] = None
+            order["ready_to_discharge_s"] = None
+            return
+        if ready_t <= order["ordered_t"]:
+            order["ready_to_order_s"] = round(
+                order["ordered_t"] - ready_t, 3
+            )
+        order["ready_to_discharge_s"] = round(actual_t - ready_t, 3)
 
     def summary(self, now):
         """Placed orders and discharge totals as plain JSON data."""
@@ -199,6 +278,23 @@ class DischargePlanner:
         discharged = [o for o in self.orders if o["status"] == "discharged"]
         delayed = [o for o in discharged if (o["delay_s"] or 0) > 0]
         total_delay = round(sum(o["delay_s"] or 0 for o in discharged), 3)
+        # Paperwork timing, over discharged orders whose bed flagged
+        # ready: how long from ready to the order and from ready to
+        # leaving. A ready-to-order time exists only when the bed was
+        # already ready when the order was placed.
+        measured = [
+            o for o in discharged if o.get("ready_t") is not None
+        ]
+        to_order = [
+            o["ready_to_order_s"]
+            for o in measured
+            if o.get("ready_to_order_s") is not None
+        ]
+        to_discharge = [
+            o["ready_to_discharge_s"]
+            for o in measured
+            if o.get("ready_to_discharge_s") is not None
+        ]
         return {
             "t": now,
             "lead_time_s": self.lead_time_s,
@@ -221,4 +317,20 @@ class DischargePlanner:
             "mean_delay_s": (
                 round(total_delay / len(delayed), 3) if delayed else 0.0
             ),
+            "timing": {
+                "measured": len(measured),
+                "mean_ready_to_order_s": (
+                    round(sum(to_order) / len(to_order), 3)
+                    if to_order
+                    else 0.0
+                ),
+                "mean_ready_to_discharge_s": (
+                    round(sum(to_discharge) / len(to_discharge), 3)
+                    if to_discharge
+                    else 0.0
+                ),
+                "max_ready_to_discharge_s": (
+                    round(max(to_discharge), 3) if to_discharge else 0.0
+                ),
+            },
         }

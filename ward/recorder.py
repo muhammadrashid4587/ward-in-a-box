@@ -179,7 +179,9 @@ def summarize(path):
         # how many landed, how many were delayed waiting for a
         # cleaning slot, and the total delay — and how many of the
         # planned orders the ward raised automatically when a bed
-        # was flagged discharge-ready.
+        # was flagged discharge-ready — and the paperwork timing:
+        # how long, on average, from a bed being flagged ready to
+        # the order and to the patient leaving.
         "discharge": (
             {
                 "planned": last_discharge["planned"],
@@ -189,6 +191,15 @@ def summarize(path):
                 "cancelled": last_discharge["cancelled"],
                 "total_delay_s": last_discharge["total_delay_s"],
                 "mean_delay_s": last_discharge["mean_delay_s"],
+                "timing": last_discharge.get(
+                    "timing",
+                    {
+                        "measured": 0,
+                        "mean_ready_to_order_s": 0.0,
+                        "mean_ready_to_discharge_s": 0.0,
+                        "max_ready_to_discharge_s": 0.0,
+                    },
+                ),
             }
             if last_discharge is not None
             else None

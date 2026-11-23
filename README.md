@@ -714,6 +714,31 @@ admission and auto-discharge at 10 s, bed 1's dose lands at 30 s
 and it auto-discharges at 35 s, and bed 2 (missed insulin) never
 flags ready and gets no order — 3 auto orders, 3 discharges.
 
+## Discharge paperwork timing
+
+The discharge summary also measures how long the paperwork takes:
+for each order, `ready_t` is when its bed was first flagged
+discharge-ready in the current stay, `ready_to_order_s` is the
+time from that flag to the order being placed, and
+`ready_to_discharge_s` is the time from the flag to the patient
+actually leaving — so it includes any delay waiting for a
+cleaning slot. An order placed before its bed was ready has no
+ready-to-order time (the order was already in flight when the
+patient became ready), and an order for a bed that never flagged
+ready has no timing at all. The summary aggregates the measured
+orders as `"timing"` — how many were measured, the mean
+ready-to-order and ready-to-discharge times, and the longest
+ready-to-discharge time — so a ward can see whether the
+paperwork or the cleaning roster is what holds a bed up. The
+timing rides along with the discharge summary everywhere it
+goes: every snapshot, WebSocket frame, `GET /discharge`, and
+the run summary (`--summary`). See
+`scenarios/discharge-auto-order.json` for a runnable example:
+over a seeded 40-tick run every order is placed the tick its bed
+flags ready and every patient leaves 5 s after flagging, so the
+timing reports 3 measured orders, a mean ready-to-order time of
+0.0 s, and a mean and max ready-to-discharge time of 5.0 s.
+
 ## Recording a run
 
 `--record FILE` writes every tick to a JSONL file: a header line with
@@ -737,7 +762,7 @@ endpoints returned 503 while it lasted, the ticks did not stop.
 make test
 ```
 
-189 tests: vitals stay inside plausible ranges, dropout actually stops a
+195 tests: vitals stay inside plausible ranges, dropout actually stops a
 monitor's stream, an alarm storm produces alarms, stale readings freeze,
 a partition blocks the snapshot endpoint, the HTTP endpoints serve valid
 JSON, the stream serves JSON lines, scenario files validate, alarm
@@ -878,7 +903,17 @@ flag and the order `source`, the auto order and its count in
 snapshots, the `GET /discharge` endpoint (503 while
 partitioned), and the run summary, and the
 `discharge-auto-order.json` scenario raising 3 auto orders and
-discharging 3 beds over a seeded run.
+discharging 3 beds over a seeded run. Discharge-timing tests cover
+an auto order measuring ready-to-order 0 s and ready-to-discharge
+equal to the lead time, a scheduled order placed before its bed
+was ready having no ready-to-order time but a measured
+ready-to-discharge time, a delayed discharge's ready-to-discharge
+time including the cleaning wait, an order for a bed that never
+flagged ready having no timing, the timing aggregates in the
+snapshot and the run summary, and the
+`discharge-auto-order.json` scenario reporting 3 measured orders
+with a mean ready-to-order time of 0.0 s and a mean and max
+ready-to-discharge time of 5.0 s.
 
 ## Roadmap
 
@@ -942,3 +977,9 @@ discharging 3 beds over a seeded run.
   one per stay and never a duplicate while a live order covers
   the bed, in the discharge summary, the per-bed readiness
   detail, and the run summary) — done in v0.20.0
+- Discharge paperwork timing (per order: when its bed was first
+  flagged ready, ready-to-order and ready-to-discharge times,
+  with the cleaning delay included in the latter, and summary
+  aggregates over the measured orders, in the discharge summary,
+  every snapshot, WebSocket frame, `GET /discharge`, and the run
+  summary) — done in v0.21.0

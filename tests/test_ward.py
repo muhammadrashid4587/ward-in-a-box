@@ -2830,6 +2830,158 @@ class TestAutoDischargeOrders(unittest.TestCase):
             os.unlink(path)
 
 
+class TestDischargeTiming(unittest.TestCase):
+    def _ward(self, beds=1, cleaning_s=10.0, **kw):
+        return Ward(
+            beds=beds, profiles=["stable"] * beds,
+            cleaning_s=cleaning_s, seed=42, **kw
+        )
+
+    def test_auto_order_timing_measured(self):
+        ward = self._ward(
+            discharge_readiness={"stable_window_s": 5, "auto_order": True},
+            discharge_planning={"lead_time_s": 5},
+        )
+        for _ in range(5):
+            ward.tick()  # t=5: ready, so an auto order is raised.
+        order = ward.discharge_summary()["orders"][0]
+        self.assertEqual(order["ready_t"], 5.0)
+        self.assertEqual(order["ready_to_order_s"], 0.0)
+        self.assertIsNone(order["ready_to_discharge_s"])
+        for _ in range(5):
+            snap = ward.tick()  # t=10: the order fires, bed cleans.
+        order = ward.discharge_summary()["orders"][0]
+        self.assertEqual(order["status"], "discharged")
+        self.assertEqual(order["ready_to_discharge_s"], 5.0)
+        timing = ward.discharge_summary()["timing"]
+        self.assertEqual(timing["measured"], 1)
+        self.assertEqual(timing["mean_ready_to_order_s"], 0.0)
+        self.assertEqual(timing["mean_ready_to_discharge_s"], 5.0)
+        self.assertEqual(timing["max_ready_to_discharge_s"], 5.0)
+        self.assertEqual(snap["discharge"]["timing"], timing)
+
+    def test_order_placed_before_ready_has_no_ready_to_order(self):
+        ward = self._ward(
+            discharge_readiness={"stable_window_s": 5},
+            discharge_planning={
+                "lead_time_s": 10,
+                "orders": [{"bed": 0, "at": 0}],
+            },
+        )
+        for _ in range(10):
+            ward.tick()  # t=10: order placed at 0, ready at 5.
+        order = ward.discharge_summary()["orders"][0]
+        self.assertEqual(order["status"], "discharged")
+        self.assertEqual(order["ready_t"], 5.0)
+        self.assertIsNone(order["ready_to_order_s"])
+        self.assertEqual(order["ready_to_discharge_s"], 5.0)
+        timing = ward.discharge_summary()["timing"]
+        self.assertEqual(timing["measured"], 1)
+        self.assertEqual(timing["mean_ready_to_order_s"], 0.0)
+        self.assertEqual(timing["mean_ready_to_discharge_s"], 5.0)
+
+    def test_delayed_discharge_timing_includes_cleaning_delay(self):
+        ward = self._ward(
+            beds=2,
+            cleaning_capacity=1,
+            discharge_readiness={"stable_window_s": 5, "auto_order": True},
+            discharge_planning={"lead_time_s": 5},
+        )
+        for _ in range(20):
+            ward.tick()
+        # Both beds ready at 5 s with orders expected at 10 s; bed 0
+        # leaves at 10 s, bed 1 waits for the one cleaning slot and
+        # leaves at 20 s, so its ready-to-discharge time is 15 s.
+        summary = ward.discharge_summary()
+        self.assertEqual(summary["discharged"], 2)
+        self.assertEqual(summary["delayed"], 1)
+        orders = sorted(summary["orders"], key=lambda o: o["bed"])
+        self.assertEqual(orders[0]["ready_to_discharge_s"], 5.0)
+        self.assertEqual(orders[1]["ready_to_discharge_s"], 15.0)
+        self.assertEqual(orders[1]["delay_s"], 10.0)
+        timing = summary["timing"]
+        self.assertEqual(timing["measured"], 2)
+        self.assertEqual(timing["mean_ready_to_order_s"], 0.0)
+        self.assertEqual(timing["mean_ready_to_discharge_s"], 10.0)
+        self.assertEqual(timing["max_ready_to_discharge_s"], 15.0)
+
+    def test_never_ready_order_has_no_timing(self):
+        ward = self._ward(
+            discharge_planning={
+                "lead_time_s": 5,
+                "orders": [{"bed": 0, "at": 0}],
+            },
+        )
+        for _ in range(5):
+            ward.tick()  # t=5: discharged, long before the 300 s window.
+        order = ward.discharge_summary()["orders"][0]
+        self.assertEqual(order["status"], "discharged")
+        self.assertIsNone(order["ready_t"])
+        self.assertIsNone(order["ready_to_order_s"])
+        self.assertIsNone(order["ready_to_discharge_s"])
+        timing = ward.discharge_summary()["timing"]
+        self.assertEqual(timing["measured"], 0)
+        self.assertEqual(timing["mean_ready_to_order_s"], 0.0)
+        self.assertEqual(timing["mean_ready_to_discharge_s"], 0.0)
+        self.assertEqual(timing["max_ready_to_discharge_s"], 0.0)
+
+    def test_scenario_auto_order_timing(self):
+        cfg = load_scenario(
+            os.path.join(HERE, "..", "scenarios", "discharge-auto-order.json")
+        )
+        ward = build_ward(cfg, seed=42)
+        for _ in range(40):
+            ward.tick()
+        summary = ward.discharge_summary()
+        # Beds 0 and 3 ready at 5 s and gone at 10 s, bed 1 ready at
+        # 30 s and gone at 35 s: every order placed the tick its bed
+        # flagged ready, every patient out 5 s after flagging.
+        self.assertEqual(
+            [(o["bed"], o["ready_t"], o["ready_to_order_s"],
+              o["ready_to_discharge_s"]) for o in summary["orders"]],
+            [
+                (0, 5.0, 0.0, 5.0),
+                (3, 5.0, 0.0, 5.0),
+                (1, 30.0, 0.0, 5.0),
+            ],
+        )
+        self.assertEqual(
+            summary["timing"],
+            {
+                "measured": 3,
+                "mean_ready_to_order_s": 0.0,
+                "mean_ready_to_discharge_s": 5.0,
+                "max_ready_to_discharge_s": 5.0,
+            },
+        )
+
+    def test_recorder_summary_carries_discharge_timing(self):
+        cfg = load_scenario(
+            os.path.join(HERE, "..", "scenarios", "discharge-auto-order.json")
+        )
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".jsonl", delete=False
+        ) as f:
+            path = f.name
+        try:
+            with Recorder(path, cfg["beds"], cfg["rate_hz"], seed=42) as rec:
+                ward = build_ward(cfg, seed=42, recorder=rec)
+                for _ in range(40):
+                    ward.tick()
+            summary = summarize(path)
+            self.assertEqual(
+                summary["discharge"]["timing"],
+                {
+                    "measured": 3,
+                    "mean_ready_to_order_s": 0.0,
+                    "mean_ready_to_discharge_s": 5.0,
+                    "max_ready_to_discharge_s": 5.0,
+                },
+            )
+        finally:
+            os.unlink(path)
+
+
 class TestPoissonArrivals(unittest.TestCase):
     def test_flat_rate_generates_near_expected_count(self):
         # 600 one-second ticks at 3600/hr is one arrival per tick on

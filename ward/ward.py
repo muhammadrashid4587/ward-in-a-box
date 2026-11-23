@@ -202,6 +202,20 @@ class Ward:
         for m in self.monitors:
             for alarm in m.raised_this_tick:
                 self.staffing.alarm_raised(m.bed_id, alarm, self.elapsed, occupied)
+        # Discharge paperwork timing: a bed flagged ready starts
+        # its paperwork clock, and one that stops being ready (or
+        # leaves) drops it until it flags ready again — so the
+        # planner can measure ready -> order and ready -> discharge.
+        for m in self.monitors:
+            if (
+                m.admitted
+                and m.discharge_ready(
+                    self.elapsed, self.readiness.stable_window_s
+                )
+            ):
+                self.discharge_planner.note_ready(m.bed_id, self.elapsed)
+            else:
+                self.discharge_planner.note_not_ready(m.bed_id)
         # Discharge-readiness-driven workflow: when auto-ordering is
         # on, a bed flagged discharge-ready gets a discharge-planning
         # order at once — one per stay, never a second while a live
