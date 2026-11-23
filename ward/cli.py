@@ -9,6 +9,7 @@ from .recorder import Recorder, iter_ticks, summarize
 from .server import serve
 from .staffing import Staffing
 from .timeline import Timeline, TimelinePhase
+from .triage import TriageQueue
 from .meds import validate_med
 from .vitals import PROFILES, validate_acuity
 from .ward import Ward
@@ -89,6 +90,14 @@ def load_scenario(path):
     cleaning_s = data.get("cleaning_s", 30.0)
     if not isinstance(cleaning_s, (int, float)) or cleaning_s <= 0:
         raise ValueError("cleaning_s must be > 0")
+    triage = None
+    if "triage" in data:
+        if not isinstance(data["triage"], dict):
+            raise ValueError("triage must be an object")
+        try:
+            triage = TriageQueue(**data["triage"])
+        except (TypeError, ValueError) as e:
+            raise ValueError("triage: %s" % e)
     return {
         "beds": beds,
         "rate_hz": rate,
@@ -99,6 +108,7 @@ def load_scenario(path):
         "timeline": timeline,
         "staffing": staffing,
         "cleaning_s": float(cleaning_s),
+        "triage": triage,
         "host": data.get("host", "127.0.0.1"),
         "port": data.get("port", 8080),
     }
@@ -116,6 +126,7 @@ def build_ward(cfg, seed=None, recorder=None):
         timeline=cfg.get("timeline"),
         staffing=cfg.get("staffing"),
         cleaning_s=cfg.get("cleaning_s", 30.0),
+        triage=cfg.get("triage"),
         recorder=recorder,
     )
 

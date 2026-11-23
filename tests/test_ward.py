@@ -1396,6 +1396,228 @@ class TestMeds(unittest.TestCase):
                     load_scenario(path)
             finally:
                 os.unlink(path)
+class TestTriage(unittest.TestCase):
+    def _ward(self, beds=2, cleaning_s=10.0, **kw):
+        ward = Ward(beds=beds, cleaning_s=cleaning_s, seed=42, **kw)
+        ward.tick()
+        return ward
+
+    def test_arrival_waits_while_ward_is_full(self):
+        ward = self._ward()
+        self.assertTrue(ward.triage_arrive(2, "febrile"))
+        snap = ward.tick()
+        self.assertEqual(snap["triage"]["waiting_total"], 1)
+        self.assertEqual(snap["triage"]["waiting"][0]["acuity"], 2)
+        self.assertEqual(snap["triage"]["waiting"][0]["profile"], "febrile")
+        self.assertEqual(snap["triage"]["admitted"], 0)
+        self.assertEqual(snap["triage"]["diverted"], 0)
+
+    def test_patient_admitted_when_bed_frees_up(self):
+        ward = self._ward()
+        ward.triage_arrive(2, "febrile")  # arrives at t=1
+        ward.discharge(0)
+        for _ in range(9):
+            ward.tick()
+        # Discharged at t=1, cleaning 10 s: bed 0 free at t=11.
+        snap = ward.tick()
+        self.assertTrue(snap["beds"][0]["online"])
+        self.assertEqual(snap["beds"][0]["profile"], "febrile")
+        self.assertEqual(snap["beds"][0]["acuity"], 2)
+        self.assertEqual(snap["beds"][0]["seq"], 1)
+        self.assertEqual(snap["triage"]["waiting_total"], 0)
+        self.assertEqual(snap["triage"]["admitted"], 1)
+        self.assertEqual(snap["triage"]["mean_wait_s"], 10.0)
+        self.assertEqual(snap["triage"]["max_wait_s"], 10.0)
+
+    def test_critical_patient_jumps_the_queue(self):
+        ward = self._ward()
+        ward.triage_arrive(4, "stable")  # t=1
+        ward.tick()  # t=2
+        ward.triage_arrive(3, "febrile")  # t=2
+        ward.tick()  # t=3
+        ward.triage_arrive(1, "hypoxic")  # t=3, critical, arrives last
+        ward.discharge(0)
+        for _ in range(10):
+            ward.tick()
+        snap = ward.tick()  # t=14: bed 0 free (discharged t=3, +10)
+        self.assertEqual(snap["beds"][0]["acuity"], 1)
+        self.assertEqual(snap["beds"][0]["profile"], "hypoxic")
+        # The critical patient waited 10 s; the others still wait,
+        # acuity 3 ahead of acuity 4.
+        waiting = snap["triage"]["waiting"]
+        self.assertEqual([w["acuity"] for w in waiting], [3, 4])
+        self.assertEqual(snap["triage"]["mean_wait_s"], 10.0)
+
+    def test_fifo_within_one_acuity(self):
+        ward = self._ward()
+        ward.triage_arrive(2, "stable")  # t=1
+        ward.tick()  # t=2
+        ward.triage_arrive(2, "febrile")  # t=2
+        ward.discharge(0)
+        ward.discharge(1)
+        for _ in range(10):
+            ward.tick()
+        snap = ward.tick()  # t=13: both beds free (discharged t=2, +10)
+        self.assertEqual(snap["beds"][0]["profile"], "stable")
+        self.assertEqual(snap["beds"][1]["profile"], "febrile")
+        self.assertEqual(snap["triage"]["admitted"], 2)
+        # Waits 11 s and 10 s: admitted at t=12, arrived at t=1 and t=2.
+        self.assertEqual(snap["triage"]["mean_wait_s"], 10.5)
+        self.assertEqual(snap["triage"]["max_wait_s"], 11.0)
+
+    def test_queue_full_diverts_arrivals(self):
+        ward = self._ward(triage={"capacity": 2})
+        self.assertTrue(ward.triage_arrive(2))
+        self.assertTrue(ward.triage_arrive(3))
+        self.assertFalse(ward.triage_arrive(1))  # diverted
+        self.assertFalse(ward.triage_arrive(4))  # diverted
+        summary = ward.triage_summary()
+        self.assertEqual(summary["waiting_total"], 2)
+        self.assertEqual(summary["diverted"], 2)
+        self.assertEqual(summary["waiting_by_acuity"], {"1": 0, "2": 1, "3": 1, "4": 0})
+        # A freed bed admits one patient, making room for the next arrival.
+        ward.discharge(0)
+        for _ in range(11):
+            ward.tick()
+        self.assertTrue(ward.triage_arrive(1))
+        self.assertEqual(ward.triage_summary()["waiting_total"], 2)
+
+    def test_wait_metrics_track_longest_current_wait(self):
+        ward = self._ward()
+        ward.triage_arrive(3)  # t=1
+        ward.tick()  # t=2
+        ward.tick()  # t=3
+        summary = ward.triage_summary()
+        self.assertEqual(summary["longest_wait_s"], 2.0)
+        self.assertEqual(summary["mean_wait_s"], 0.0)
+        self.assertEqual(summary["max_wait_s"], 0.0)
+
+    def test_triage_does_not_take_a_cleaning_bed(self):
+        ward = self._ward()
+        ward.triage_arrive(1, "hypoxic")
+        ward.discharge(0)
+        for _ in range(5):
+            ward.tick()
+        # Still cleaning at t=7: patient waits, bed stays offline.
+        snap = ward.tick()
+        self.assertFalse(snap["beds"][0]["online"])
+        self.assertEqual(snap["beds"][0]["state"], "cleaning")
+        self.assertEqual(snap["triage"]["waiting_total"], 1)
+        self.assertEqual(snap["triage"]["admitted"], 0)
+
+    def test_triage_does_not_steal_timeline_beds(self):
+        timeline = Timeline([TimelinePhase(0, 1, ramp_s=0)])
+        ward = self._ward(beds=2, timeline=timeline)
+        # Only bed 0 is admitted by the timeline; bed 1 is unadmitted
+        # and "available", but it belongs to the timeline, not triage.
+        ward.triage_arrive(1, "hypoxic")
+        for _ in range(5):
+            ward.tick()
+        snap = ward.tick()
+        self.assertFalse(snap["beds"][1]["online"])
+        self.assertEqual(snap["triage"]["waiting_total"], 1)
+        self.assertEqual(snap["triage"]["admitted"], 0)
+
+    def test_scheduled_arrivals_and_priority_admission(self):
+        ward = self._ward(
+            beds=2,
+            triage={
+                "capacity": 4,
+                "arrivals": [
+                    {"at": 0, "acuity": 3, "profile": "stable"},
+                    {"at": 1, "acuity": 1, "profile": "hypoxic"},
+                ],
+            },
+        )
+        ward.discharge(0)
+        for _ in range(10):
+            ward.tick()
+        snap = ward.tick()  # t=12: bed 0 free, critical patient admitted
+        self.assertEqual(snap["beds"][0]["acuity"], 1)
+        self.assertEqual(snap["triage"]["admitted"], 1)
+        self.assertEqual(snap["triage"]["waiting_total"], 1)
+        self.assertEqual(snap["triage"]["waiting"][0]["acuity"], 3)
+
+    def test_triage_validation(self):
+        from ward.triage import TriageQueue
+
+        with self.assertRaises(ValueError):
+            TriageQueue(capacity=0)
+        with self.assertRaises(ValueError):
+            TriageQueue(arrivals=[{"at": -1, "acuity": 2}])
+        with self.assertRaises(ValueError):
+            TriageQueue(arrivals=[{"at": 0, "acuity": 5}])
+        with self.assertRaises(ValueError):
+            TriageQueue(arrivals=[{"at": 0, "acuity": 2, "profile": "nope"}])
+        with self.assertRaises(ValueError):
+            TriageQueue(arrivals=[{"acuity": 2}])
+        ward = self._ward()
+        with self.assertRaises(ValueError):
+            ward.triage_arrive(0)
+        with self.assertRaises(ValueError):
+            ward.triage_arrive(2, "nope")
+        with self.assertRaises(ValueError):
+            Ward(beds=2, triage="nope")
+
+    def test_triage_endpoint_serves_json_and_is_503_while_partitioned(self):
+        ward = Ward(beds=2, cleaning_s=10.0, seed=1)
+        ward.tick()
+        ward.triage_arrive(2, "febrile")
+        server, port = serve_in_thread(ward)
+        try:
+            status, body = get(port, "/triage")
+            self.assertEqual(status, 200)
+            data = json.loads(body)
+            self.assertEqual(data["waiting_total"], 1)
+            self.assertEqual(data["capacity"], 8)
+            self.assertEqual(data["waiting"][0]["acuity"], 2)
+            ward.partitioned = True
+            status, _ = get(port, "/triage")
+            self.assertEqual(status, 503)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_triage_in_snapshot(self):
+        ward = Ward(beds=2, cleaning_s=10.0, seed=1)
+        ward.tick()
+        ward.triage_arrive(1, "hypoxic")
+        snap = ward.tick()
+        self.assertIn("triage", snap)
+        self.assertEqual(snap["triage"]["waiting_total"], 1)
+
+    def test_scenario_triage(self):
+        cfg = load_scenario(os.path.join(HERE, "..", "scenarios", "triage.json"))
+        self.assertEqual(cfg["triage"].capacity, 5)
+        ward = build_ward(cfg, seed=42)
+        for _ in range(15):
+            ward.tick()
+        snap = ward.tick()  # t=16: bed 1 freed at t=15, critical patient in
+        self.assertTrue(snap["beds"][1]["online"])
+        self.assertEqual(snap["beds"][1]["acuity"], 1)
+        self.assertEqual(snap["beds"][1]["profile"], "hypoxic")
+        self.assertEqual(snap["triage"]["admitted"], 1)
+        self.assertEqual(snap["triage"]["mean_wait_s"], 15.0)
+        self.assertEqual(snap["triage"]["waiting_total"], 4)
+        for _ in range(2):
+            ward.tick()
+        snap = ward.tick()  # t=19: bed 2 freed at t=18, second critical in
+        self.assertTrue(snap["beds"][2]["online"])
+        self.assertEqual(snap["beds"][2]["acuity"], 1)
+        self.assertEqual(snap["triage"]["admitted"], 2)
+        self.assertEqual(snap["triage"]["mean_wait_s"], 12.0)
+        self.assertEqual(snap["triage"]["max_wait_s"], 15.0)
+        self.assertEqual(snap["triage"]["waiting_total"], 3)
+
+    def test_scenario_rejects_bad_triage(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"beds": 1, "triage": {"capacity": 0}}, f)
+            path = f.name
+        try:
+            with self.assertRaises(ValueError):
+                load_scenario(path)
+        finally:
+            os.unlink(path)
 
 
 if __name__ == "__main__":

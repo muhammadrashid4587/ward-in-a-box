@@ -53,6 +53,10 @@ python3 -m ward.cli scenarios/meds.json --seed 42
 # Pharmacy stockout: insulin unavailable 5-3005 s, two doses skipped
 python3 -m ward.cli scenarios/stockout.json --seed 42
 
+# Triage intake: five patients queue up, two critical ones take beds
+# 1 and 2 as they free up after discharge and cleaning
+python3 -m ward.cli scenarios/triage.json --seed 42
+
 # Reproducible run
 python3 -m ward.cli scenarios/example.json --seed 42
 ```
@@ -75,6 +79,10 @@ python3 -m ward.cli scenarios/example.json --seed 42
   totals, as JSON (503 while partitioned)
 - `GET /meds` — per-bed medication schedules, interaction warnings,
   and given/late/missed dose counts, plus ward totals, as JSON
+  (503 while partitioned)
+- `GET /triage` — the ED intake queue: waiting patients in priority
+  order with acuity and wait so far, waiting counts per acuity,
+  admitted/diverted totals, and mean/max wait, as JSON
   (503 while partitioned)
 
 A reading looks like:
@@ -102,9 +110,10 @@ streams one JSON text frame per tick at the ward rate:
 ```
 
 Each frame carries the same snapshot as `/snapshot` plus the alarm
-summary from `/alarms`, the staffing summary from `/staffing`, and the
-medication summary from `/meds`, so a client gets bed occupancy,
-vitals, alarms, staffing, and medication in one message. Ping frames are answered with pong, close frames
+summary from `/alarms`, the staffing summary from `/staffing`, the
+medication summary from `/meds`, and the triage summary from
+`/triage`, so a client gets bed occupancy, vitals, alarms, staffing,
+medication, and the intake queue in one message. Ping frames are answered with pong, close frames
 are echoed and the connection is then closed; text frames from the
 client are accepted and ignored — the ward pushes ticks, it takes no
 input. While a partition is active the upgrade is refused with 503,
@@ -358,6 +367,45 @@ at 1200 s and 2400 s are skipped while the pharmacy is out, the
 doses due at 0 s and 3600 s are given, and the metoprolol on the
 other bed is unaffected.
 
+## Triage / ED intake queue
+
+Patients arrive at triage with an acuity and wait in an intake queue
+until a bed frees up. Arrivals are scheduled in the scenario:
+
+```json
+{
+  "beds": 4,
+  "triage": {
+    "capacity": 5,
+    "arrivals": [
+      {"at": 0, "acuity": 1, "profile": "hypoxic"},
+      {"at": 2, "acuity": 3, "profile": "stable"}
+    ]
+  }
+}
+```
+
+When a bed becomes available — a discharge followed by its cleaning
+— the highest-priority waiting patient is admitted: lowest acuity
+number first (1 is critical), earliest arrival first within an
+acuity, so a critical patient who arrives later still jumps the
+queue. The new admission starts with fresh vitals at that patient's
+acuity and profile. If the queue is full when a patient arrives, the
+patient is diverted (counted, not queued). A bed the scenario
+timeline has not admitted yet is reserved for the timeline: triage
+only takes beds that have freed up through a discharge. Patients can
+also be added live with `ward.triage_arrive(acuity, profile)`.
+
+Every snapshot carries a `"triage"` object with the waiting patients
+in priority order (acuity, profile, arrival time, wait so far),
+waiting counts per acuity, the queue capacity, admitted and diverted
+totals, mean and max wait of admitted patients, and the longest
+current wait. The same summary is served by `GET /triage`. See
+`scenarios/triage.json` for a runnable example: five patients queue
+while the ward is full, beds 1 and 2 discharge at 5 s and 8 s, and
+the two critical patients are admitted at 15 s and 18 s once
+cleaning finishes, after waiting 15 s and 9 s.
+
 ## Recording a run
 
 `--record FILE` writes every tick to a JSONL file: a header line with
@@ -381,7 +429,7 @@ endpoints returned 503 while it lasted, the ticks did not stop.
 make test
 ```
 
-101 tests: vitals stay inside plausible ranges, dropout actually stops a
+115 tests: vitals stay inside plausible ranges, dropout actually stops a
 monitor's stream, an alarm storm produces alarms, stale readings freeze,
 a partition blocks the snapshot endpoint, the HTTP endpoints serve valid
 JSON, the stream serves JSON lines, scenario files validate, alarm
@@ -432,7 +480,16 @@ requiring a medication name, a dose skipped at once with status
 `stockout` and a `missed_dose` alarm that clears on the next given
 dose, a stockout affecting only that medication, and the
 `stockout.json` scenario skipping 2 insulin doses and giving 4 over
-a seeded run.
+a seeded run. Triage tests cover a patient waiting while the ward is
+full, admission with fresh vitals when a bed frees up, a critical
+patient jumping the queue, FIFO order within one acuity, diversion
+when the queue is full, wait metrics (mean, max, longest current
+wait), a cleaning bed not taking a patient, triage not stealing beds
+the timeline has not admitted yet, scheduled arrivals with priority
+admission, validation of capacity, acuity, and profile, the
+`/triage` endpoint (503 while partitioned), triage in snapshots, and
+the `triage.json` scenario admitting two critical patients at 15 s
+and 18 s after waits of 15 s and 9 s.
 
 ## Roadmap
 
@@ -449,3 +506,7 @@ a seeded run.
   unavailable, skipping due doses, recording them as `stockout` in
   the dose history and metrics, and flagging a `missed_dose` alarm) —
   done in v0.10.0
+- Triage / ED intake queue (patients arrive with acuity, wait in an
+  intake queue, are admitted to beds as they free up with critical
+  patients first, or diverted when the queue is full, with queue
+  metrics and a `GET /triage` endpoint) — done in v0.11.0

@@ -8,6 +8,7 @@ from .chaos import ChaosEngine
 from .monitor import Monitor
 from .staffing import Staffing
 from .timeline import Timeline
+from .triage import TriageQueue
 from .vitals import PROFILES, validate_acuity
 
 # Default patient mix when a scenario does not name profiles.
@@ -25,13 +26,21 @@ class Ward:
     snapshot to a JSONL file.
     """
 
-    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None, cleaning_s=30.0, meds=None):
+    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None, cleaning_s=30.0, meds=None, triage=None):
         if not 1 <= beds <= 64:
             raise ValueError("beds must be 1..64")
         if rate_hz <= 0:
             raise ValueError("rate_hz must be > 0")
         if cleaning_s <= 0:
             raise ValueError("cleaning_s must be > 0")
+        if triage is None:
+            self.triage = TriageQueue()
+        elif isinstance(triage, TriageQueue):
+            self.triage = triage
+        elif isinstance(triage, dict):
+            self.triage = TriageQueue(**triage)
+        else:
+            raise ValueError("triage must be a TriageQueue or a dict, got %r" % (triage,))
         self.cleaning_s = float(cleaning_s)
         profiles = profiles or []
         for p in profiles:
@@ -97,6 +106,12 @@ class Ward:
                         and m.state(self.elapsed) == "available"
                     ):
                         m.admitted = True
+        # Triage: scheduled arrivals join the queue, then waiting
+        # patients take any bed that has become available (a discharge
+        # plus its cleaning leaves the bed available; the timeline
+        # above already had first claim on it this tick).
+        self.triage.process_arrivals(self.elapsed)
+        self.triage.admit_available(self.elapsed, self)
         readings = []
         online = []
         occupied = sum(1 for m in self.monitors if m.admitted)
@@ -121,7 +136,7 @@ class Ward:
         for m in self.monitors:
             for alarm in m.raised_this_tick:
                 self.staffing.alarm_raised(m.bed_id, alarm, self.elapsed, occupied)
-        snap = {"t": self.elapsed, "beds": readings, "staffing": self.staffing.summary(self.elapsed, occupied), "turnover": self.turnover_summary(), "meds": self.meds_summary()}
+        snap = {"t": self.elapsed, "beds": readings, "staffing": self.staffing.summary(self.elapsed, occupied), "turnover": self.turnover_summary(), "meds": self.meds_summary(), "triage": self.triage_summary()}
         with self._lock:
             self.latest = snap
         if self.recorder is not None:
@@ -193,6 +208,18 @@ class Ward:
         """Current staffing state and care metrics."""
         occupied = sum(1 for m in self.monitors if m.admitted)
         return self.staffing.summary(self.elapsed, occupied)
+
+    def triage_summary(self):
+        """Current intake queue state and wait metrics."""
+        return self.triage.summary(self.elapsed)
+
+    def triage_arrive(self, acuity, profile="stable"):
+        """Add a patient arriving now to the intake queue.
+
+        Returns True if they joined the queue, False if they were
+        diverted because it is full.
+        """
+        return self.triage.arrive(self.elapsed, acuity, profile)
 
     def start(self):
         if self._thread is not None:
