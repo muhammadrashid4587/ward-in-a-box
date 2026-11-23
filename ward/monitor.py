@@ -6,6 +6,8 @@ from collections import deque
 from .meds import MedSchedule
 from .news2 import (
     ACVPU_LEVELS,
+    BASE_RESPONSE_S,
+    RESPONSE,
     score_signs,
     trend_for,
     validate_consciousness,
@@ -110,7 +112,13 @@ class Monitor:
         # patient's NEWS2 risk is medium or high — raised at the
         # first tick the risk leaves low, closed when it returns.
         # ``escalation_history`` keeps every closed episode; the
-        # open one lives in ``_escalation`` until it closes.
+        # open one lives in ``_escalation`` until it closes. Each
+        # episode also measures the response: the team NEWS2 calls
+        # for at the risk it raised at is due ``BASE_RESPONSE_S``
+        # times the staffing load factor later, and the episode
+        # records when the response landed (``responded_t``) and
+        # how long it took (``time_to_respond_s``) — or neither,
+        # when the episode closed before anyone responded.
         self._escalation = None
         self.escalation_history = []
         self.escalations_raised = 0
@@ -270,7 +278,7 @@ class Monitor:
             "total_discharge_delay_s": self.total_discharge_delay_s,
         }
 
-    def tick(self, now, dt=1.0):
+    def tick(self, now, dt=1.0, load_factor=1.0):
         self.raised_this_tick = []
         if self.cleaning_until is not None and now >= self.cleaning_until:
             self.cleaning_until = None
@@ -330,7 +338,7 @@ class Monitor:
         reading["news2"] = score_signs(
             self.signs, self.on_oxygen, self.consciousness
         )
-        self._track_escalation(reading["news2"], now)
+        self._track_escalation(reading["news2"], now, load_factor)
         # This tick's score joins the bed's history, so a client can
         # see how the patient got here, not just where they are now.
         # Stale ticks never reach this point: they return the
@@ -441,25 +449,48 @@ class Monitor:
             self._stable_since = now
         self._active_alarms = current
 
-    def _track_escalation(self, news2, now):
+    def _track_escalation(self, news2, now, load_factor=1.0):
         """Open, update, or close the deterioration episode.
 
         An episode is open while the NEWS2 risk is medium or high.
         It records when it raised, the worst score it reached, and
         the worst risk — so a client can see a patient who was
         briefly high and came back, not just where they are now.
+        It also measures the response: the team NEWS2 calls for at
+        the risk the episode raised at (ward team for medium,
+        critical care team for high) is due ``BASE_RESPONSE_S``
+        times the staffing load factor at the moment it raised
+        later, and the episode records when that response landed
+        (``responded_t``, the scheduled time, not the tick it was
+        noticed on — the same convention as an alarm ack) and how
+        long it took (``time_to_respond_s``). An episode that
+        closes — the risk returns to low, or the patient is
+        discharged — before the response is due keeps both fields
+        null: it cleared before anyone responded, and that is
+        worth knowing too. When the response falls due on the
+        very tick the risk returns to low, it still lands — the
+        team was already on its way — so the due check runs before
+        the close. Like the score itself, the response
+        never touches the vital-sign alarm list.
         """
         now = round(now, 3)
         risk = news2["risk"]
+        if self._escalation is not None:
+            self._maybe_respond(now)
         if risk == "low":
             self._close_escalation(now)
             return
         if self._escalation is None:
+            due = round(now + BASE_RESPONSE_S * load_factor, 3)
             self._escalation = {
                 "raised_t": now,
                 "cleared_t": None,
                 "peak_score": news2["score"],
                 "peak_risk": risk,
+                "response": RESPONSE[risk],
+                "response_due_t": due,
+                "responded_t": None,
+                "time_to_respond_s": None,
             }
             self.escalations_raised += 1
         else:
@@ -467,6 +498,23 @@ class Monitor:
                 self._escalation["peak_score"] = news2["score"]
             if risk == "high":
                 self._escalation["peak_risk"] = "high"
+
+    def _maybe_respond(self, now):
+        """Record the response when it falls due.
+
+        The response lands at its scheduled time
+        (``response_due_t``), whether or not the risk has already
+        returned to low on this tick — the team was dispatched
+        when the escalation raised, so it arrives on schedule.
+        """
+        ep = self._escalation
+        if ep is None or ep["responded_t"] is not None:
+            return
+        if now >= ep["response_due_t"]:
+            ep["responded_t"] = ep["response_due_t"]
+            ep["time_to_respond_s"] = round(
+                ep["response_due_t"] - ep["raised_t"], 3
+            )
 
     def _close_escalation(self, now):
         """Close the open deterioration episode, if any."""
@@ -533,10 +581,14 @@ class Monitor:
         the bed has no patient or no reading yet); ``escalated`` is
         True while a deterioration episode is open; ``episodes``
         lists the closed ones with raised/cleared times and peak
-        score and risk. ``trend`` is the current rate of change of
-        the score (see :func:`ward.news2.trend_for`), and
-        ``trend_alerts`` lists every trend alert this stay with
-        raised/cleared times and peak score and rise.
+        score and risk, and each episode carries its response
+        timing — which team NEWS2 calls for, when the response
+        was due and when it landed, and how long it took, or nulls
+        when the episode closed before anyone responded. ``trend``
+        is the current rate of change of the score (see
+        :func:`ward.news2.trend_for`), and ``trend_alerts`` lists
+        every trend alert this stay with raised/cleared times and
+        peak score and rise.
         """
         reading = self.last_reading
         offline = (

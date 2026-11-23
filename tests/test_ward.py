@@ -4953,6 +4953,138 @@ class TestNEWS2Trend(unittest.TestCase):
         self.assertEqual(snap["early_warning"]["trend_alerts"], 1)
         self.assertEqual(snap["early_warning"]["trend_alerts_raised"], 3)
 
+    def test_escalation_response_recorded(self):
+        ward = Ward(beds=1, profiles=["hypoxic"], seed=3)
+        for _ in range(40):
+            ward.tick()
+        m = ward.monitors[0]
+        self.assertIsNotNone(m._escalation)
+        ep = m._escalation
+        # Escalated at t=1 on a red SpO2 score; with an adequate
+        # roster the ward team is due 30 s later and lands then.
+        self.assertEqual(ep["raised_t"], 1.0)
+        self.assertEqual(
+            ep["response"],
+            "urgent review by ward team (hourly monitoring)",
+        )
+        self.assertEqual(ep["response_due_t"], 31.0)
+        self.assertEqual(ep["responded_t"], 31.0)
+        self.assertEqual(ep["time_to_respond_s"], 30.0)
+
+    def test_escalation_cleared_before_response_is_unresponded(self):
+        # A storm pushes the febrile patient high, then the episode
+        # clears at t=14 — long before the response due at t=31 —
+        # so it keeps nulls: it cleared before anyone responded.
+        ward = Ward(
+            beds=1,
+            profiles=["febrile"],
+            chaos=[ChaosEvent("alarm_storm", at=1, duration=10, bed=0)],
+            seed=3,
+        )
+        for _ in range(40):
+            ward.tick()
+        first = ward.monitors[0].escalation_history[0]
+        self.assertEqual(first["raised_t"], 1.0)
+        self.assertEqual(first["cleared_t"], 14.0)
+        self.assertEqual(first["response_due_t"], 31.0)
+        self.assertIsNone(first["responded_t"])
+        self.assertIsNone(first["time_to_respond_s"])
+
+    def test_thin_roster_slows_response(self):
+        # No nurse on nights: the load factor is 4.0, so the
+        # response is due 120 s after the escalation raises — still
+        # pending at 40 ticks, landed at 121.
+        ward = Ward(
+            beds=1,
+            profiles=["hypoxic"],
+            seed=3,
+            staffing={
+                "start_hour": 20,
+                "night": {"nurse": 0, "doctor": 1, "tech": 0},
+            },
+        )
+        for _ in range(40):
+            ward.tick()
+        summary = ward.early_warning_summary()
+        self.assertEqual(summary["responses"]["pending"], 1)
+        self.assertEqual(summary["responses"]["responded"], 0)
+        self.assertIsNone(
+            summary["responses"]["mean_time_to_respond_s"]
+        )
+        self.assertIsNone(summary["responses"]["max_time_to_respond_s"])
+        for _ in range(90):
+            ward.tick()
+        summary = ward.early_warning_summary()
+        self.assertEqual(summary["responses"]["responded"], 1)
+        self.assertEqual(summary["responses"]["pending"], 0)
+        self.assertEqual(
+            summary["responses"]["mean_time_to_respond_s"], 120.0
+        )
+        self.assertEqual(
+            summary["responses"]["max_time_to_respond_s"], 120.0
+        )
+        ep = ward.monitors[0].news2_detail(ward.elapsed)["episodes"][0]
+        self.assertEqual(ep["responded_t"], 121.0)
+        self.assertEqual(ep["time_to_respond_s"], 120.0)
+
+    def test_discharge_before_response_is_unresponded(self):
+        ward = Ward(beds=1, profiles=["hypoxic"], seed=3)
+        for _ in range(5):
+            ward.tick()
+        ward.discharge(0)
+        ep = ward.monitors[0].escalation_history[0]
+        self.assertEqual(ep["cleared_t"], 5.0)
+        self.assertIsNone(ep["responded_t"])
+        self.assertIsNone(ep["time_to_respond_s"])
+        self.assertEqual(
+            ward.early_warning_summary()["responses"]["unresponded"], 1
+        )
+
+    def test_scenario_news2_response(self):
+        cfg = load_scenario(
+            os.path.join(HERE, "..", "scenarios", "news2-response.json")
+        )
+        ward = build_ward(cfg, seed=42)
+        for _ in range(40):
+            snap = ward.tick()
+        summary = ward.early_warning_summary()
+        bed1, bed3 = summary["beds"][1], summary["beds"][3]
+        # Hypoxic bed: escalated from t=1, ward team due at 31 —
+        # it went high on its own, so the response recorded is the
+        # critical care team called for at the risk it raised at.
+        ep1 = bed1["episodes"][0]
+        self.assertEqual(ep1["raised_t"], 1.0)
+        self.assertEqual(ep1["response_due_t"], 31.0)
+        self.assertEqual(ep1["responded_t"], 31.0)
+        self.assertEqual(ep1["time_to_respond_s"], 30.0)
+        # Febrile bed: a medium episode at 5-9 s clears before its
+        # response is due at 35 s, so it stays unresponded; the high
+        # episode under the storm is due at 40 s, the very tick the
+        # risk returns to low — and the response still lands, the
+        # team was already on its way.
+        first, second = bed3["episodes"]
+        self.assertEqual(first["raised_t"], 5.0)
+        self.assertEqual(first["cleared_t"], 9.0)
+        self.assertIsNone(first["responded_t"])
+        self.assertIsNone(first["time_to_respond_s"])
+        self.assertEqual(second["raised_t"], 10.0)
+        self.assertEqual(second["responded_t"], 40.0)
+        self.assertEqual(second["cleared_t"], 40.0)
+        self.assertEqual(second["time_to_respond_s"], 30.0)
+        # Ward totals, in the snapshot as well as the summary.
+        self.assertEqual(summary["responses"]["responded"], 2)
+        self.assertEqual(summary["responses"]["unresponded"], 1)
+        self.assertEqual(summary["responses"]["pending"], 0)
+        self.assertEqual(
+            summary["responses"]["mean_time_to_respond_s"], 30.0
+        )
+        self.assertEqual(
+            summary["responses"]["max_time_to_respond_s"], 30.0
+        )
+        self.assertEqual(
+            snap["early_warning"]["responses"]["responded"], 2
+        )
+
     def test_recorder_summary_carries_trend_alerts(self):
         cfg = load_scenario(
             os.path.join(HERE, "..", "scenarios", "news2-trend.json")
@@ -4971,6 +5103,33 @@ class TestNEWS2Trend(unittest.TestCase):
             self.assertEqual(ew["trend_alerts"], 1)
             self.assertEqual(ew["trend_alerts_raised"], 3)
             self.assertEqual(ew["escalations_raised"], 2)
+        finally:
+            os.unlink(path)
+
+    def test_recorder_summary_carries_response_timing(self):
+        cfg = load_scenario(
+            os.path.join(HERE, "..", "scenarios", "news2-response.json")
+        )
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".jsonl", delete=False
+        ) as f:
+            path = f.name
+        try:
+            with Recorder(path, cfg["beds"], cfg["rate_hz"], seed=42) as rec:
+                ward = build_ward(cfg, seed=42, recorder=rec)
+                for _ in range(40):
+                    ward.tick()
+            summary = summarize(path)
+            responses = summary["early_warning"]["responses"]
+            self.assertEqual(responses["responded"], 2)
+            self.assertEqual(responses["unresponded"], 1)
+            self.assertEqual(responses["pending"], 0)
+            self.assertEqual(
+                responses["mean_time_to_respond_s"], 30.0
+            )
+            self.assertEqual(
+                responses["max_time_to_respond_s"], 30.0
+            )
         finally:
             os.unlink(path)
 

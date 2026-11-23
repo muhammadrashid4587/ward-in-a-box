@@ -85,7 +85,11 @@ def summarize(path):
     and early-warning totals from the last tick: how many beds are
     at high, medium, and low NEWS2 risk, how many deterioration
     episodes are open, and how many have raised, and how many
-    NEWS2 trend alerts are open and have raised — and NEWS2 history
+    NEWS2 trend alerts are open and have raised — and how the ward
+    responded to its escalations: how many got a response, how many
+    closed before anyone responded, how many are still waiting, and
+    the mean and longest time from an escalation raising to the
+    response landing — and NEWS2 history
     totals per bed: ticks scored, peak score and risk, and ticks at
     each risk level.
     Returns ``None`` fields for a recording with no ticks.
@@ -263,7 +267,11 @@ def summarize(path):
         # Early-warning totals from the last tick: beds at each
         # NEWS2 risk level, open deterioration episodes, and how
         # many episodes have raised over the run — and how many
-        # patients are not Alert on the ACVPU scale.
+        # patients are not Alert on the ACVPU scale — and the
+        # response timing: how many escalations got a response,
+        # how many closed before anyone responded, how many are
+        # still waiting, and the mean and longest time from an
+        # escalation raising to the response landing.
         "early_warning": (
             {
                 "high_risk": last_early_warning["high_risk"],
@@ -273,6 +281,16 @@ def summarize(path):
                 "escalations_raised": last_early_warning[
                     "escalations_raised"
                 ],
+                "responses": last_early_warning.get(
+                    "responses",
+                    {
+                        "responded": 0,
+                        "unresponded": 0,
+                        "pending": 0,
+                        "mean_time_to_respond_s": None,
+                        "max_time_to_respond_s": None,
+                    },
+                ),
                 "trend_alerts": last_early_warning.get(
                     "trend_alerts", 0
                 ),

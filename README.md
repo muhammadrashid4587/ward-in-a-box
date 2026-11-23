@@ -112,6 +112,13 @@ python3 -m ward.cli scenarios/news2-acvpu.json --seed 42
 # quiet — 3 trend alerts raised, 1 still open at the end
 python3 -m ward.cli scenarios/news2-trend.json --seed 42
 
+# NEWS2 response timing: the hypoxic bed's escalation gets its
+# response 30 s after it raises, the febrile bed's brief medium
+# episode clears before anyone responds, and its high episode
+# gets its response on the very tick it clears — 2 responded,
+# 1 unresponded, mean 30.0 s
+python3 -m ward.cli scenarios/news2-response.json --seed 42
+
 # Reproducible run
 python3 -m ward.cli scenarios/example.json --seed 42
 ```
@@ -1076,6 +1083,51 @@ alert under the alarm storm, from 5 at 1 s to 11, a rise of 6,
 clearing at 15 s when the storm ends — 3 trend alerts raised in
 total, 1 still open.
 
+## NEWS2 response timing
+
+An escalation says a patient needs a response; the response
+timing says how long the ward took to give one. Every
+deterioration episode records the response NEWS2 calls for at
+the risk it raised at — urgent review by the ward team for
+medium, urgent review by the critical care team for high — when
+that response was due, when it landed, and how long it took
+from the escalation raising to the first response action.
+The response is due 30 seconds after the escalation raises with
+an adequate roster, times the staffing load factor at the moment
+it raised — the same clock as an alarm acknowledgement — so a
+ward with one nurse for twelve beds responds in 90 seconds and
+a ward with no nurse on shift in 120, and a handover stretches
+it further, exactly like an alarm ack. The response lands at
+its scheduled time, even when that is the very tick the risk
+returns to low — the team was already on its way. An episode
+that closes before its response is due keeps both times null:
+it cleared before anyone responded, and that is worth knowing
+too — a discharge closes an episode the same way.
+
+The early-warning summary (`GET /news2`, every snapshot and
+WebSocket frame) aggregates the timing across the ward: how many
+escalations got a response, how many closed before anyone
+responded, how many are still waiting, and the mean and longest
+time from an escalation raising to the response landing (null
+before the first response). The run summary (`--summary`)
+reports the same totals from the last tick.
+
+One honest limitation: the response is a scheduled arrival, not
+a modelled intervention. It does not change the patient's vitals
+or score — the team arrives, the patient is still as sick as
+the monitor says — and it pauses while the monitor is offline
+or the reading is stale, because no fresh reading means no
+escalation to respond to, just as an offline monitor's alarms
+are neither raised nor cleared. Like the score itself, the
+response never touches the vital-sign alarm list. See
+`scenarios/news2-response.json` for a runnable example: over a
+seeded 40-tick run the hypoxic bed's escalation gets its
+response 30.0 s after it raises, the febrile bed's brief medium
+episode at 5-9 s clears before its response is due at 35 s and
+stays unresponded, and its high episode under the storm gets
+its response at 40 s, the very tick the risk returns to low —
+2 responded, 1 unresponded, a mean and max of 30.0 s.
+
 ## Recording a run
 
 `--record FILE` writes every tick to a JSONL file: a header line with
@@ -1099,7 +1151,7 @@ endpoints returned 503 while it lasted, the ticks did not stop.
 make test
 ```
 
-256 tests: vitals stay inside plausible ranges, dropout actually stops a
+262 tests: vitals stay inside plausible ranges, dropout actually stops a
 monitor's stream, an alarm storm produces alarms, stale readings freeze,
 a partition blocks the snapshot endpoint, the HTTP endpoints serve valid
 JSON, the stream serves JSON lines, scenario files validate, alarm
@@ -1317,7 +1369,15 @@ endpoint, the trend never adding an alarm to the alarm list,
 and the `news2-trend.json` scenario raising 3 trend alerts over
 a seeded run (a jump alert on the febrile bed peaking at 11 with
 a rise of 6, a creep and a jump alert on the hypoxic bed), with
-the run summary carrying the trend totals.
+the run summary carrying the trend totals. NEWS2-response tests
+cover a response landing 30 s after an escalation raises with an
+adequate roster, an episode clearing before its response is due
+staying unresponded, a thin roster (no nurse on nights) slowing
+the response to 120 s and leaving it pending, a discharge before
+the response closing the episode unresponded, a response due on
+the very tick the risk returns to low still landing, and the
+`news2-response.json` scenario (2 responded, 1 unresponded, mean
+30.0 s) with the run summary carrying the response totals.
 
 ## Roadmap
 
@@ -1441,3 +1501,17 @@ the run summary carrying the trend totals.
   summary, `GET /news2/history`, every snapshot, WebSocket frame,
   and the run summary; the trend never touches the vital-sign
   alarm list) — done in v0.28.0
+- NEWS2 response timing (every deterioration episode records
+  the response NEWS2 calls for at the risk it raised at, when
+  it was due, when it landed, and how long it took — due 30 s
+  after the escalation raises with an adequate roster, times
+  the staffing load factor at the moment it raised, so a thin
+  roster or a handover stretches it like an alarm ack; an
+  episode that closes before its response is due keeps nulls,
+  and a response due on the very tick the risk returns to low
+  still lands — with the responded/unresponded/pending counts
+  and the mean and longest time to respond in the early-warning
+  summary, every snapshot, WebSocket frame, `GET /news2`, and
+  the run summary; the response is a scheduled arrival, not a
+  modelled intervention, and never touches the vital-sign alarm
+  list) — done in v0.29.0

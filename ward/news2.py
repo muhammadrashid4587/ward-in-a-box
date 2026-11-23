@@ -48,6 +48,17 @@ RESPONSE = {
     "high": "urgent review by critical care team (continuous monitoring)",
 }
 
+# Seconds for the responding team to reach a bed after a NEWS2
+# escalation raises, with an adequate roster — the same base as the
+# alarm acknowledgement clock (staffing ``BASE_ACK_S``), so the
+# response time is that base times the staffing load factor at the
+# moment the escalation raised: 30 s with a full roster, longer
+# when the nurses are overloaded or handing over, exactly like an
+# alarm ack. The response is the one NEWS2 calls for at the risk
+# the escalation raised at — ward team for medium, critical care
+# team for high.
+BASE_RESPONSE_S = 30.0
+
 
 def score_resp_rate(rr):
     """NEWS2 points for respiratory rate (breaths per minute)."""

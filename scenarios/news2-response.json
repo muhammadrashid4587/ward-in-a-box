@@ -1,0 +1,1 @@
+{"beds":4,"chaos":[{"at":10,"beds":[3],"duration":20,"type":"alarm_storm"}],"patients":[{"bed":0,"profile":"stable"},{"bed":1,"profile":"hypoxic"},{"bed":2,"profile":"tachycardic"},{"bed":3,"profile":"febrile"}],"rate_hz":1.0}

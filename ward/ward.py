@@ -208,7 +208,7 @@ class Ward:
             # Medication first, so a missed dose raises its alarm in
             # this tick's reading rather than the next one.
             m.meds_tick(self.elapsed, load_factor, stockouts.get(m.bed_id, ()))
-            r = m.tick(self.elapsed, dt)
+            r = m.tick(self.elapsed, dt, load_factor=load_factor)
             if r is None:
                 entry = {"bed": m.bed_id, "online": False, "t": self.elapsed}
                 if not m.admitted:
@@ -383,9 +383,20 @@ class Ward:
         }
 
     def early_warning_summary(self):
-        """Per-patient NEWS2 scores and deterioration episodes."""
+        """Per-patient NEWS2 scores, deterioration episodes, and
+        response timing.
+
+        ``responses`` aggregates every episode this run: how many
+        got a response, how many closed before anyone responded,
+        how many are still waiting for one, and the mean and
+        longest time from an escalation raising to the response
+        landing (null before the first response).
+        """
         beds = [m.news2_detail(self.elapsed) for m in self.monitors]
         scored = [b for b in beds if b["news2"] is not None]
+        episodes = [e for b in beds for e in b["episodes"]]
+        responded = [e for e in episodes if e["responded_t"] is not None]
+        times = [e["time_to_respond_s"] for e in responded]
         return {
             "t": self.elapsed,
             "beds": beds,
@@ -409,6 +420,25 @@ class Ward:
             "escalations_raised": sum(
                 b["escalations_raised"] for b in beds
             ),
+            "responses": {
+                "responded": len(responded),
+                "unresponded": sum(
+                    1
+                    for e in episodes
+                    if e["responded_t"] is None
+                    and e["cleared_t"] is not None
+                ),
+                "pending": sum(
+                    1
+                    for e in episodes
+                    if e["responded_t"] is None
+                    and e["cleared_t"] is None
+                ),
+                "mean_time_to_respond_s": (
+                    round(sum(times) / len(times), 3) if times else None
+                ),
+                "max_time_to_respond_s": max(times) if times else None,
+            },
             "trend_alerts": sum(
                 1 for b in beds if b["trend_alert_active"]
             ),
