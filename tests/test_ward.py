@@ -28,7 +28,7 @@ from ward.server import make_handler
 from ward.staffing import Staffing
 from ward.timeline import Timeline, TimelinePhase
 from ward.triage import TriageQueue
-from ward.news2 import score_signs, score_spo2
+from ward.news2 import score_consciousness, score_signs, score_spo2, validate_consciousness
 from ward.vitals import PROFILES, effective_ranges, validate_acuity
 from ward.ward import Ward
 from ward.websocket import accept_key, encode_frame, read_frame
@@ -3889,6 +3889,261 @@ class TestOxygen(unittest.TestCase):
         self.assertEqual(summary["beds"][0]["escalations_raised"], 2)
         self.assertEqual(summary["beds"][1]["escalations_raised"], 0)
         self.assertEqual(summary["beds"][2]["escalations_raised"], 1)
+
+class TestACVPU(unittest.TestCase):
+    def _signs(self, **over):
+        signs = {
+            "heart_rate": 70,
+            "spo2": 98,
+            "systolic": 120,
+            "diastolic": 80,
+            "temperature": 37.0,
+            "resp_rate": 16,
+        }
+        signs.update(over)
+        return signs
+
+    def test_acvpu_scoring(self):
+        # Alert scores 0; Confusion, Voice, Pain, Unresponsive
+        # each score 3 — NEWS2's sixth parameter is all or nothing.
+        self.assertEqual(score_consciousness("alert"), 0)
+        for level in ("confusion", "voice", "pain", "unresponsive"):
+            self.assertEqual(score_consciousness(level), 3, level)
+        for bad in ("asleep", "ALERT", "Alert", "", None, 0, True):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                validate_consciousness(bad)
+
+    def test_score_signs_includes_consciousness(self):
+        # A normal set of vitals with an Alert patient scores 0
+        # and stays low; the same vitals with a patient responding
+        # only to voice score 3 on consciousness alone, which is a
+        # red score and makes the risk medium.
+        normal = score_signs(self._signs())
+        self.assertEqual(normal["components"]["consciousness"], 0)
+        self.assertEqual(normal["score"], 0)
+        self.assertEqual(normal["risk"], "low")
+        voice = score_signs(self._signs(), consciousness="voice")
+        self.assertEqual(voice["components"]["consciousness"], 3)
+        self.assertEqual(voice["score"], 3)
+        self.assertTrue(voice["red_score"])
+        self.assertEqual(voice["risk"], "medium")
+        self.assertIn("ward team", voice["response"])
+        # The score now has six components, one per NEWS2 parameter.
+        self.assertEqual(
+            set(normal["components"]),
+            {"resp_rate", "spo2", "systolic", "heart_rate",
+             "temperature", "consciousness"},
+        )
+        # Consciousness stacks with the vitals: a hypoxic patient
+        # who is also confused is high, not just medium.
+        high = score_signs(
+            self._signs(spo2=90), consciousness="confusion"
+        )
+        self.assertEqual(high["score"], 6)
+        self.assertEqual(high["risk"], "medium")
+        higher = score_signs(
+            self._signs(spo2=90, resp_rate=22), consciousness="pain"
+        )
+        self.assertEqual(higher["score"], 8)
+        self.assertEqual(higher["risk"], "high")
+
+    def test_reading_carries_consciousness(self):
+        ward = Ward(
+            beds=2,
+            profiles=["stable", "stable"],
+            consciousness=["alert", "voice"],
+            seed=42,
+        )
+        snap = ward.tick()
+        alert, voice = snap["beds"]
+        self.assertEqual(alert["consciousness"], "alert")
+        self.assertEqual(alert["news2"]["components"]["consciousness"], 0)
+        self.assertEqual(voice["consciousness"], "voice")
+        self.assertEqual(voice["news2"]["components"]["consciousness"], 3)
+        self.assertTrue(voice["news2"]["red_score"])
+        # No consciousness named: Alert, the same as before.
+        plain = Ward(beds=1, profiles=["stable"], seed=42)
+        self.assertEqual(plain.tick()["beds"][0]["consciousness"], "alert")
+        # The early-warning summary carries the level per bed and
+        # counts the patients who are not Alert.
+        summary = ward.early_warning_summary()
+        self.assertEqual(summary["beds"][1]["consciousness"], "voice")
+        self.assertEqual(summary["not_alert"], 1)
+
+    def test_consciousness_is_scoring_only(self):
+        # Consciousness changes the score, never the vitals or the
+        # alarms: two wards with the same seed and profiles emit
+        # identical signs and alarm lists, consciousness aside.
+        plain = Ward(beds=2, profiles=["stable", "hypoxic"], seed=42)
+        altered = Ward(
+            beds=2,
+            profiles=["stable", "hypoxic"],
+            consciousness=["pain", "unresponsive"],
+            seed=42,
+        )
+        for _ in range(40):
+            a = plain.tick()
+            b = altered.tick()
+            for ra, rb in zip(a["beds"], b["beds"]):
+                for key in (
+                    "heart_rate", "spo2", "systolic", "diastolic",
+                    "temperature", "resp_rate",
+                ):
+                    self.assertEqual(ra[key], rb[key], key)
+                self.assertEqual(ra["alarms"], rb["alarms"])
+
+    def test_admit_resets_consciousness(self):
+        ward = Ward(
+            beds=1, profiles=["stable"], consciousness=["pain"], seed=42
+        )
+        ward.tick()
+        self.assertEqual(ward.monitors[0].consciousness, "pain")
+        ward.discharge(0)
+        for _ in range(31):
+            ward.tick()
+        ward.admit(0)
+        self.assertEqual(ward.monitors[0].consciousness, "alert")
+        self.assertEqual(ward.tick()["beds"][0]["consciousness"], "alert")
+        ward.discharge(0)
+        for _ in range(31):
+            ward.tick()
+        ward.admit(0, consciousness="voice")
+        self.assertEqual(ward.monitors[0].consciousness, "voice")
+        self.assertEqual(ward.tick()["beds"][0]["consciousness"], "voice")
+        self.assertEqual(
+            ward.tick()["beds"][0]["news2"]["components"]["consciousness"],
+            3,
+        )
+
+    def test_consciousness_validation(self):
+        with self.assertRaises(ValueError):
+            Monitor(0, consciousness="asleep")
+        with self.assertRaises(ValueError):
+            Ward(beds=1, consciousness=["asleep"])
+        with self.assertRaises(ValueError):
+            Ward(beds=1, consciousness=[None])
+        cfg = load_scenario(
+            os.path.join(HERE, "..", "scenarios", "news2-acvpu.json")
+        )
+        cfg["consciousness"] = ["asleep", "alert", "alert", "alert"]
+        with self.assertRaises(ValueError):
+            build_ward(cfg, seed=42)
+
+    def test_scenario_news2_acvpu(self):
+        cfg = load_scenario(
+            os.path.join(HERE, "..", "scenarios", "news2-acvpu.json")
+        )
+        ward = build_ward(cfg, seed=42)
+        snap = ward.tick()
+        # t=1: bed 0 stable and Alert scores 0 and stays low.
+        # Bed 1 is stable but responds only to voice: the
+        # consciousness red score alone makes it medium. Bed 2 is
+        # hypoxic and confused: SpO2 3 plus consciousness 3, high.
+        # Bed 3 is febrile and unresponsive: high on consciousness
+        # plus a febrile heart rate and temperature.
+        self.assertEqual(snap["beds"][0]["news2"]["score"], 0)
+        self.assertEqual(snap["beds"][0]["news2"]["risk"], "low")
+        self.assertEqual(
+            snap["beds"][1]["news2"]["components"]["consciousness"], 3
+        )
+        self.assertTrue(snap["beds"][1]["news2"]["red_score"])
+        self.assertEqual(snap["beds"][1]["news2"]["risk"], "medium")
+        self.assertEqual(snap["beds"][2]["news2"]["score"], 8)
+        self.assertEqual(snap["beds"][2]["news2"]["risk"], "high")
+        self.assertEqual(snap["beds"][3]["news2"]["score"], 7)
+        self.assertEqual(snap["beds"][3]["news2"]["risk"], "high")
+        for _ in range(39):
+            snap = ward.tick()
+        # Consciousness does not change over a run, so all three
+        # non-Alert patients stay escalated from t=1; the two high
+        # ones peak at 9.
+        summary = ward.early_warning_summary()
+        self.assertEqual(summary["not_alert"], 3)
+        self.assertEqual(summary["high_risk"], 2)
+        self.assertEqual(summary["medium_risk"], 1)
+        self.assertEqual(summary["low_risk"], 1)
+        self.assertEqual(summary["escalated"], 3)
+        self.assertEqual(summary["escalations_raised"], 3)
+        self.assertEqual(summary["beds"][0]["escalations_raised"], 0)
+        self.assertEqual(summary["beds"][1]["escalations_raised"], 1)
+        self.assertEqual(summary["beds"][1]["episodes"][0]["peak_score"], 4)
+        self.assertEqual(summary["beds"][1]["episodes"][0]["peak_risk"], "medium")
+        self.assertEqual(summary["beds"][2]["episodes"][0]["peak_score"], 9)
+        self.assertEqual(summary["beds"][2]["episodes"][0]["peak_risk"], "high")
+        self.assertEqual(summary["beds"][3]["episodes"][0]["peak_score"], 9)
+        self.assertEqual(summary["beds"][3]["episodes"][0]["peak_risk"], "high")
+
+    def test_recorder_summary_carries_not_alert(self):
+        cfg = load_scenario(
+            os.path.join(HERE, "..", "scenarios", "news2-acvpu.json")
+        )
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".jsonl", delete=False
+        ) as f:
+            path = f.name
+        try:
+            with Recorder(path, cfg["beds"], cfg["rate_hz"], seed=42) as rec:
+                ward = build_ward(cfg, seed=42, recorder=rec)
+                for _ in range(40):
+                    ward.tick()
+            summary = summarize(path)
+            ew = summary["early_warning"]
+            self.assertEqual(ew["not_alert"], 3)
+            self.assertEqual(ew["high_risk"], 2)
+            self.assertEqual(ew["medium_risk"], 1)
+            self.assertEqual(ew["low_risk"], 1)
+            self.assertEqual(ew["escalated"], 3)
+            self.assertEqual(ew["escalations_raised"], 3)
+        finally:
+            os.unlink(path)
+
+    def test_news2_endpoint_and_ws_frame_carry_consciousness(self):
+        cfg = load_scenario(
+            os.path.join(HERE, "..", "scenarios", "news2-acvpu.json")
+        )
+        ward = build_ward(cfg, seed=42)
+        ward.tick()
+        server, port = serve_in_thread(ward)
+        try:
+            status, body = get(port, "/news2")
+            self.assertEqual(status, 200)
+            data = json.loads(body)
+            self.assertEqual(data["not_alert"], 3)
+            self.assertEqual(data["beds"][1]["consciousness"], "voice")
+            self.assertEqual(
+                data["beds"][1]["news2"]["components"]["consciousness"], 3
+            )
+            self.assertEqual(data["beds"][3]["consciousness"], "unresponsive")
+            ward.partitioned = True
+            status, _ = get(port, "/news2")
+            self.assertEqual(status, 503)
+            ward.partitioned = False
+        finally:
+            server.shutdown()
+            server.server_close()
+        ward2 = Ward(
+            beds=1,
+            profiles=["stable"],
+            consciousness=["pain"],
+            rate_hz=20.0,
+            seed=42,
+        )
+        server, port = serve_in_thread(ward2)
+        try:
+            ws = WsClient(port)
+            try:
+                msg = json.loads(ws.read_until_opcode(1))
+                self.assertIn("early_warning", msg)
+                self.assertEqual(msg["early_warning"]["not_alert"], 1)
+                self.assertEqual(
+                    msg["beds"][0]["news2"]["components"]["consciousness"],
+                    3,
+                )
+            finally:
+                ws.close()
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 if __name__ == "__main__":

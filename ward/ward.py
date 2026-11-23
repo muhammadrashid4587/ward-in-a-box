@@ -7,6 +7,7 @@ import time
 from .chaos import ChaosEngine
 from .discharge import DischargePlanner
 from .monitor import Monitor
+from .news2 import validate_consciousness
 from .readiness import DischargeReadiness
 from .staffing import Staffing
 from .timeline import Timeline
@@ -28,7 +29,7 @@ class Ward:
     snapshot to a JSONL file.
     """
 
-    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None, cleaning_s=30.0, meds=None, triage=None, discharge_planning=None, cleaning_capacity=None, discharge_readiness=None, oxygen=None):
+    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None, cleaning_s=30.0, meds=None, triage=None, discharge_planning=None, cleaning_capacity=None, discharge_readiness=None, oxygen=None, consciousness=None):
         if not 1 <= beds <= 64:
             raise ValueError("beds must be 1..64")
         if rate_hz <= 0:
@@ -97,6 +98,9 @@ class Ward:
         acuities = acuities or []
         for a in acuities:
             validate_acuity(a)
+        consciousness = consciousness or []
+        for c in consciousness:
+            validate_consciousness(c)
         if staffing is None:
             self.staffing = Staffing()
         elif isinstance(staffing, Staffing):
@@ -120,7 +124,12 @@ class Ward:
             acuity = acuities[i] if i < len(acuities) else 3
             bed_meds = meds[i] if meds is not None and i < len(meds) else None
             on_oxygen = oxygen[i] if oxygen is not None and i < len(oxygen) else False
-            monitor = Monitor(i, profile, rng=self.rng, acuity=acuity, meds=bed_meds, on_oxygen=on_oxygen)
+            bed_consciousness = (
+                consciousness[i]
+                if consciousness is not None and i < len(consciousness)
+                else "alert"
+            )
+            monitor = Monitor(i, profile, rng=self.rng, acuity=acuity, meds=bed_meds, on_oxygen=on_oxygen, consciousness=bed_consciousness)
             # With a timeline, beds start unadmitted and come online as
             # the timeline admits them; without one, all beds start open.
             if timeline is not None:
@@ -367,6 +376,9 @@ class Ward:
             "t": self.elapsed,
             "beds": beds,
             "on_oxygen": sum(1 for b in beds if b["on_oxygen"]),
+            "not_alert": sum(
+                1 for b in beds if b["consciousness"] != "alert"
+            ),
             "high_risk": sum(
                 1 for b in scored if b["news2"]["risk"] == "high"
             ),
@@ -392,12 +404,12 @@ class Ward:
         )
         return summary
 
-    def admit(self, bed_id, profile=None, acuity=None, on_oxygen=None):
+    def admit(self, bed_id, profile=None, acuity=None, on_oxygen=None, consciousness=None):
         """Admit a new patient to an available bed.
 
         Raises ValueError if the bed is occupied or still cleaning.
         """
-        self._monitor(bed_id).admit(self.elapsed, profile=profile, acuity=acuity, on_oxygen=on_oxygen)
+        self._monitor(bed_id).admit(self.elapsed, profile=profile, acuity=acuity, on_oxygen=on_oxygen, consciousness=consciousness)
 
     def _monitor(self, bed_id):
         if not 0 <= bed_id < self.beds:

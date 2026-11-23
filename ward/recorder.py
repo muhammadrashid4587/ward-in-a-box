@@ -229,7 +229,8 @@ def summarize(path):
         ),
         # Early-warning totals from the last tick: beds at each
         # NEWS2 risk level, open deterioration episodes, and how
-        # many episodes have raised over the run.
+        # many episodes have raised over the run — and how many
+        # patients are not Alert on the ACVPU scale.
         "early_warning": (
             {
                 "high_risk": last_early_warning["high_risk"],
@@ -239,6 +240,7 @@ def summarize(path):
                 "escalations_raised": last_early_warning[
                     "escalations_raised"
                 ],
+                "not_alert": last_early_warning.get("not_alert", 0),
             }
             if last_early_warning is not None
             else None

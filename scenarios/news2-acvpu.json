@@ -1,0 +1,1 @@
+{"beds":4,"patients":[{"bed":0,"profile":"stable"},{"bed":1,"consciousness":"voice","profile":"stable"},{"bed":2,"consciousness":"confusion","profile":"hypoxic"},{"bed":3,"consciousness":"unresponsive","profile":"febrile"}],"rate_hz":1.0}

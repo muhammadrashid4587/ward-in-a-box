@@ -8,18 +8,22 @@ single parameter scoring 3, a "red score") is medium risk and needs
 an urgent review by the ward team, 7 or more is high risk and needs
 an urgent review by the critical care team.
 
-Two parameters are not modelled here, and the score says so:
+Consciousness is the sixth parameter, scored on the ACVPU scale:
+Alert scores 0, anything else — Confusion, responding to Voice,
+responding to Pain, or Unresponsive — scores 3. It is the only
+parameter that is not a vital: it is set per patient in the scenario
+and does not change over a run, so a patient who starts confused
+stays confused. That is a deliberate honesty limit, not an oversight:
+the simulator generates no consciousness dynamics, so it records a
+fixed state rather than inventing one — a patient whose consciousness
+changes mid-run is outside what this ward models.
 
-- Consciousness (ACVPU) is not a vital this simulator generates, so
-  it is left out entirely rather than guessed. A real NEWS2 always
-  includes it; a score from this ward is therefore a partial score
-  and must never be treated as a clinical assessment.
-- SpO2 is scored on Scale 1 for patients not on supplemental oxygen
-  and on Scale 2 for patients on oxygen (see ``score_spo2``). The
-  flag is per patient, set in the scenario; oxygen therapy is a
-  scoring flag only — it does not change the vitals the monitor
-  generates, so a patient on oxygen keeps whatever SpO2 their
-  profile produces.
+SpO2 is scored on Scale 1 for patients not on supplemental oxygen
+and on Scale 2 for patients on oxygen (see ``score_spo2``). The
+flag is per patient, set in the scenario; oxygen therapy is a
+scoring flag only — it does not change the vitals the monitor
+generates, so a patient on oxygen keeps whatever SpO2 their
+profile produces.
 
 The score is advisory only: this is a test tool for health
 software, not medical software. It exists so a client can be tested
@@ -122,7 +126,29 @@ def score_temperature(temp):
     return 2
 
 
-def score_signs(signs, on_oxygen=False):
+# Consciousness on the ACVPU scale: Alert, Confusion, responding to
+# Voice, responding to Pain, Unresponsive. Lowercase in code and in
+# scenario files; NEWS2 scores Alert 0 and anything else 3.
+ACVPU_LEVELS = ("alert", "confusion", "voice", "pain", "unresponsive")
+
+
+def validate_consciousness(level):
+    """A consciousness level must be one of the ACVPU levels."""
+    if level not in ACVPU_LEVELS:
+        raise ValueError(
+            "consciousness must be one of %s, got %r"
+            % (", ".join(ACVPU_LEVELS), level)
+        )
+    return level
+
+
+def score_consciousness(level):
+    """NEWS2 points for consciousness: Alert 0, anything else 3."""
+    validate_consciousness(level)
+    return 0 if level == "alert" else 3
+
+
+def score_signs(signs, on_oxygen=False, consciousness="alert"):
     """Score a set of vitals.
 
     Returns ``{"score": total, "risk": "low"|"medium"|"high",
@@ -132,6 +158,9 @@ def score_signs(signs, on_oxygen=False):
     parameter scores 3 — that alone makes the risk medium, even
     when the aggregate is low. ``spo2_scale`` says which SpO2
     table was used: 2 when the patient is on oxygen, 1 otherwise.
+    ``consciousness`` is the patient's ACVPU level: Alert scores 0,
+    anything else scores 3 — so a confused patient is medium risk
+    on the consciousness red score alone, whatever their vitals say.
     """
     components = {
         "resp_rate": score_resp_rate(signs["resp_rate"]),
@@ -139,6 +168,7 @@ def score_signs(signs, on_oxygen=False):
         "systolic": score_systolic(signs["systolic"]),
         "heart_rate": score_heart_rate(signs["heart_rate"]),
         "temperature": score_temperature(signs["temperature"]),
+        "consciousness": score_consciousness(consciousness),
     }
     total = sum(components.values())
     red = any(v == 3 for v in components.values())

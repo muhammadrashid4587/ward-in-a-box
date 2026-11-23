@@ -6,6 +6,7 @@ import sys
 
 from .chaos import ChaosEvent
 from .discharge import DischargePlanner
+from .news2 import validate_consciousness
 from .readiness import DischargeReadiness
 from .recorder import Recorder, iter_ticks, summarize
 from .server import serve
@@ -28,6 +29,7 @@ def load_scenario(path):
     profiles = []
     acuities = []
     oxygen = []
+    consciousness = []
     meds = []
     for i, p in enumerate(data.get("patients", [])):
         profile = p.get("profile", "stable") if isinstance(p, dict) else p
@@ -46,6 +48,15 @@ def load_scenario(path):
                 "patient %d: on_oxygen must be a bool, got %r" % (i, on_oxygen)
             )
         oxygen.append(on_oxygen)
+        level = p.get("consciousness", "alert") if isinstance(p, dict) else "alert"
+        try:
+            validate_consciousness(level)
+        except ValueError:
+            raise ValueError(
+                "patient %d: consciousness must be one of alert, confusion, voice, pain, unresponsive, got %r"
+                % (i, level)
+            )
+        consciousness.append(level)
         bed_meds = p.get("meds", []) if isinstance(p, dict) else []
         if not isinstance(bed_meds, list):
             raise ValueError("patient %d: meds must be a list" % i)
@@ -141,6 +152,7 @@ def load_scenario(path):
         "profiles": profiles,
         "acuities": acuities,
         "oxygen": oxygen,
+        "consciousness": consciousness,
         "meds": meds,
         "chaos": chaos,
         "timeline": timeline,
@@ -162,6 +174,7 @@ def build_ward(cfg, seed=None, recorder=None):
         profiles=cfg["profiles"],
         acuities=cfg.get("acuities"),
         oxygen=cfg.get("oxygen"),
+        consciousness=cfg.get("consciousness"),
         meds=cfg.get("meds"),
         chaos=cfg["chaos"],
         seed=seed,

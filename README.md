@@ -101,6 +101,12 @@ python3 -m ward.cli scenarios/news2.json --seed 42
 # target band, and the same hypoxic patient off oxygen is medium
 python3 -m ward.cli scenarios/oxygen.json --seed 42
 
+# Consciousness: a stable patient who responds only to voice is
+# medium risk on the consciousness red score alone, a confused
+# hypoxic patient is high, and an unresponsive febrile patient
+# is high — all three stay escalated, consciousness never changes
+python3 -m ward.cli scenarios/news2-acvpu.json --seed 42
+
 # Reproducible run
 python3 -m ward.cli scenarios/example.json --seed 42
 ```
@@ -802,24 +808,29 @@ tick's vitals:
 {"news2": {"score": 6, "risk": "medium", "red_score": true,
  "spo2_scale": 1,
  "components": {"resp_rate": 2, "spo2": 3, "systolic": 0,
- "heart_rate": 1, "temperature": 0},
+ "heart_rate": 1, "temperature": 0, "consciousness": 0},
  "response": "urgent review by ward team (hourly monitoring)"}}
 ```
 
-Each of the five scored parameters contributes 0 to 3 points on
+Each of the six scored parameters contributes 0 to 3 points on
 the standard NEWS2 bands (respiratory rate, SpO2, systolic blood
-pressure, heart rate, temperature). SpO2 is scored on Scale 1 for
+pressure, heart rate, temperature, consciousness). SpO2 is scored on Scale 1 for
 patients not on oxygen and on Scale 2 for patients on oxygen (see
-Oxygen therapy below). The aggregate drives the risk: 0-4 low, 5-6
+Oxygen therapy below). Consciousness is scored on the ACVPU scale
+(see below): Alert scores 0, anything else scores 3. The aggregate drives the risk: 0-4 low, 5-6
 medium, 7 or more high — and any single parameter scoring 3 is a
 red score, which makes the risk medium even when the aggregate is
 low. The response is NEWS2's own: routine monitoring at low risk,
 urgent review by the ward team at medium, urgent review by the
 critical care team at high.
 
-One honest limitation remains. Consciousness (ACVPU) is not scored:
-the simulator generates no consciousness state, so a ward score is a
-partial NEWS2, missing one of its six parameters. The score is
+One honest limitation remains. Consciousness is set per patient in
+the scenario and does not change over a run: a patient who starts
+confused stays confused, so a non-Alert patient stays escalated
+until they are discharged. No consciousness dynamics are modelled —
+a patient whose level of responsiveness changes mid-run is outside
+what this ward simulates, and the score says so rather than
+inventing a change. The score is
 advisory only — a test signal for health software, not a clinical
 judgement.
 
@@ -888,6 +899,49 @@ inside 88-92 and never escalates, and the same hypoxic patient
 off oxygen stays escalated from 1 s — 3 episodes raised in total,
 2 patients on oxygen.
 
+## Consciousness (ACVPU) and NEWS2
+
+A patient can have a consciousness level on the ACVPU scale, set
+per patient in the scenario:
+
+```json
+{"bed": 1, "profile": "stable", "consciousness": "voice"}
+```
+
+The levels are `alert`, `confusion`, `voice`, `pain`, and
+`unresponsive` — Alert, Confusion, responding to Voice,
+responding to Pain, Unresponsive. NEWS2 scores Alert 0 and
+anything else 3, so a non-Alert patient is medium risk on the
+consciousness red score alone, whatever their vitals say: a
+stable patient who responds only to voice sits at medium risk
+from the first tick, and a confused hypoxic patient is high,
+because the two red scores stack.
+
+Every reading carries the level (`"consciousness"`) and every
+score carries its component (`"consciousness": 0` or `3`), so a
+client can tell why two patients with the same vitals scored
+differently. The early-warning summary carries the per-bed level
+and a ward count of patients who are not Alert
+(`"not_alert"`), and the run summary (`--summary`) reports the
+same count. A new admission starts Alert unless the admission
+says otherwise — the previous patient's level never carries over
+to the next patient in the bed, and a triage admission is Alert
+by default.
+
+One honest limitation: consciousness is a fixed state, not a
+vital. It does not change over a run — the monitor generates no
+consciousness dynamics, so a confused patient stays confused
+and stays escalated until discharge. The score is still NEWS2's
+own for the level the scenario sets; it just does not model a
+patient waking up or deteriorating in responsiveness. See
+`scenarios/news2-acvpu.json` for a runnable example: over a
+seeded 40-tick run the Alert stable bed scores 0 and never
+escalates, the stable bed responding only to voice sits at
+medium on the consciousness red score and stays escalated from
+1 s, the confused hypoxic bed is high from 1 s peaking at 9,
+and the unresponsive febrile bed is high from 1 s peaking at 9
+— 3 episodes raised in total, 3 patients not Alert.
+
 ## Recording a run
 
 `--record FILE` writes every tick to a JSONL file: a header line with
@@ -911,7 +965,7 @@ endpoints returned 503 while it lasted, the ticks did not stop.
 make test
 ```
 
-219 tests: vitals stay inside plausible ranges, dropout actually stops a
+228 tests: vitals stay inside plausible ranges, dropout actually stops a
 monitor's stream, an alarm storm produces alarms, stale readings freeze,
 a partition blocks the snapshot endpoint, the HTTP endpoints serve valid
 JSON, the stream serves JSON lines, scenario files validate, alarm
@@ -1091,7 +1145,17 @@ alarms (identical signs and alarm lists with and without it over
 a seeded 40-tick run), a new admission resetting the flag (and
 an admission explicitly on oxygen keeping it), validation of a
 bad flag, and the `oxygen.json` scenario raising 3 episodes over
-a seeded run with 2 patients on oxygen.
+a seeded run with 2 patients on oxygen. ACVPU tests cover the
+consciousness bands (Alert 0, anything else 3) and validation of
+bad levels, the sixth component in the score and a non-Alert
+patient reaching medium risk on the consciousness red score
+alone, the reading and early-warning summary carrying the level
+and the ward not-Alert count, consciousness changing the score
+and never the vitals or the alarms (identical signs and alarm
+lists with and without it over a seeded 40-tick run), a new
+admission resetting to Alert (and an admission explicitly
+non-Alert keeping it), and the `news2-acvpu.json` scenario raising
+3 episodes over a seeded run with 3 patients not Alert.
 
 ## Roadmap
 
@@ -1180,3 +1244,10 @@ a seeded run with 2 patients on oxygen.
   in every reading and the early-warning summary, a new admission
   starting off oxygen; oxygen is scoring only and does not
   change the vitals, documented as a limitation) — done in v0.24.0
+- Consciousness (ACVPU) as NEWS2's sixth parameter (a per-patient
+  `consciousness` level in the scenario — alert, confusion, voice,
+  pain, unresponsive — Alert scoring 0 and anything else 3, the
+  level in every reading and the early-warning summary with a ward
+  not-Alert count, a new admission starting Alert; consciousness
+  is a fixed state that does not change over a run, documented as
+  a limitation) — done in v0.25.0

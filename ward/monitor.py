@@ -4,7 +4,7 @@ import random
 from collections import deque
 
 from .meds import MedSchedule
-from .news2 import score_signs
+from .news2 import score_signs, validate_consciousness
 from .vitals import alarms_for, initial_signs, step, validate_acuity
 
 # Where an alarm storm drags each vital. All of them trip an alarm.
@@ -31,11 +31,12 @@ class Monitor:
     seconds); the monitor clears each one when its time passes.
     """
 
-    def __init__(self, bed_id, profile="stable", rng=None, acuity=3, meds=None, on_oxygen=False):
+    def __init__(self, bed_id, profile="stable", rng=None, acuity=3, meds=None, on_oxygen=False, consciousness="alert"):
         self.bed_id = bed_id
         self.profile = profile
         self.acuity = validate_acuity(acuity)
         self.on_oxygen = self._validate_on_oxygen(on_oxygen)
+        self.consciousness = validate_consciousness(consciousness)
         self.meds = MedSchedule(bed_id, meds)
         self.rng = rng if rng is not None else random.Random()
         self.signs = initial_signs(profile, self.rng, self.acuity)
@@ -163,14 +164,16 @@ class Monitor:
         self.turnovers += 1
         self.total_cleaning_s = round(self.total_cleaning_s + cleaning_s, 3)
 
-    def admit(self, now, profile=None, acuity=None, on_oxygen=None):
+    def admit(self, now, profile=None, acuity=None, on_oxygen=None, consciousness=None):
         """Admit a new patient to an available bed.
 
         Raises ValueError if the bed is occupied or still cleaning.
         A new admission starts with fresh vitals, so the previous
         patient's readings and alarms do not carry over. The new
         patient is not on oxygen unless ``on_oxygen`` says so —
-        the previous patient's oxygen flag never carries over.
+        the previous patient's oxygen flag never carries over — and
+        is Alert unless ``consciousness`` says otherwise: the
+        previous patient's consciousness never carries over either.
         """
         state = self.state(now)
         if state == "occupied":
@@ -185,6 +188,9 @@ class Monitor:
             self.acuity = validate_acuity(acuity)
         self.on_oxygen = self._validate_on_oxygen(
             False if on_oxygen is None else on_oxygen
+        )
+        self.consciousness = validate_consciousness(
+            "alert" if consciousness is None else consciousness
         )
         self.signs = initial_signs(self.profile, self.rng, self.acuity)
         self.seq = 0
@@ -253,6 +259,7 @@ class Monitor:
             "profile": self.profile,
             "acuity": self.acuity,
             "on_oxygen": self.on_oxygen,
+            "consciousness": self.consciousness,
             "stale": False,
             **self.signs,
         }
@@ -266,7 +273,9 @@ class Monitor:
         # adds or removes an alarm, so alarm counts and readiness
         # are exactly as before — it only records how sick the
         # patient looks on the NEWS2 scale.
-        reading["news2"] = score_signs(self.signs, self.on_oxygen)
+        reading["news2"] = score_signs(
+            self.signs, self.on_oxygen, self.consciousness
+        )
         self._track_escalation(reading["news2"], now)
         self._record_alarm_transitions(reading["alarms"], now)
         self.last_reading = reading
@@ -365,6 +374,7 @@ class Monitor:
             "bed": self.bed_id,
             "admitted": self.admitted,
             "on_oxygen": self.on_oxygen,
+            "consciousness": self.consciousness,
             "news2": news2,
             "escalated": self._escalation is not None,
             "escalations_raised": self.escalations_raised,
