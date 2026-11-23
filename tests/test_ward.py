@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from ward.chaos import ChaosEvent
 from ward.cli import build_ward, load_scenario, main
+from ward.discharge import DischargePlanner
 from ward.monitor import Monitor
 from ward.recorder import Recorder, iter_ticks, summarize
 from ward.server import make_handler
@@ -1949,6 +1950,263 @@ class TestBoarding(unittest.TestCase):
         self.assertEqual(snap["triage"]["mean_wait_s"], 18.0)
         self.assertEqual(snap["triage"]["waiting_total"], 0)
         self.assertEqual(snap["triage"]["boarding_total"], 0)
+
+
+class TestDischargePlanning(unittest.TestCase):
+    def _ward(self, beds=2, cleaning_s=10.0, **kw):
+        ward = Ward(beds=beds, cleaning_s=cleaning_s, seed=42, **kw)
+        ward.tick()
+        return ward
+
+    def test_planned_discharge_fires_at_expected_time(self):
+        ward = self._ward(
+            discharge_planning={
+                "lead_time_s": 5,
+                "orders": [{"bed": 0, "at": 0}],
+            }
+        )
+        for _ in range(3):
+            ward.tick()
+        self.assertEqual(ward.turnover_summary()["occupied"], 2)
+        snap = ward.tick()  # t=5: expected discharge
+        self.assertEqual(snap["beds"][0]["state"], "cleaning")
+        self.assertFalse(snap["beds"][0]["online"])
+        summary = ward.discharge_summary()
+        self.assertEqual(summary["planned"], 1)
+        self.assertEqual(summary["discharged"], 1)
+        self.assertEqual(summary["delayed"], 0)
+        order = summary["orders"][0]
+        self.assertEqual(order["status"], "discharged")
+        self.assertEqual(order["ordered_t"], 0.0)
+        self.assertEqual(order["expected_t"], 5.0)
+        self.assertEqual(order["actual_t"], 5.0)
+        self.assertEqual(order["delay_s"], 0.0)
+
+    def test_discharge_delayed_when_cleaning_backed_up(self):
+        ward = self._ward(
+            cleaning_capacity=1,
+            discharge_planning={
+                "lead_time_s": 5,
+                "orders": [{"bed": 0, "at": 0}, {"bed": 1, "at": 0}],
+            },
+        )
+        for _ in range(4):
+            ward.tick()
+        snap = ward.tick()  # t=5: bed 0 cleans, bed 1 queues
+        self.assertEqual(snap["beds"][0]["state"], "cleaning")
+        self.assertTrue(snap["beds"][1]["online"])
+        self.assertEqual(snap["turnover"]["beds"][1]["state"], "occupied")
+        self.assertTrue(snap["turnover"]["beds"][1]["awaiting_cleaning"])
+        self.assertEqual(snap["discharge"]["awaiting_cleaning"], 1)
+        self.assertEqual(snap["discharge"]["pending"], 1)
+        for _ in range(9):
+            ward.tick()
+        snap = ward.tick()  # t=15: bed 0 done, bed 1 starts cleaning
+        self.assertEqual(snap["beds"][1]["state"], "cleaning")
+        summary = ward.discharge_summary()
+        self.assertEqual(summary["discharged"], 2)
+        self.assertEqual(summary["delayed"], 1)
+        self.assertEqual(summary["total_delay_s"], 10.0)
+        self.assertEqual(summary["mean_delay_s"], 10.0)
+        self.assertEqual(summary["orders"][1]["actual_t"], 15.0)
+        self.assertEqual(summary["orders"][1]["delay_s"], 10.0)
+        self.assertEqual(
+            ward.turnover_summary()["total_discharge_delay_s"], 10.0
+        )
+
+    def test_queued_patient_still_monitored(self):
+        ward = self._ward(
+            cleaning_capacity=1,
+            discharge_planning={
+                "lead_time_s": 5,
+                "orders": [{"bed": 0, "at": 0}, {"bed": 1, "at": 0}],
+            },
+        )
+        for _ in range(5):
+            ward.tick()
+        # Bed 1 is awaiting a cleaning slot but still in the bed:
+        # it keeps emitting readings while it waits.
+        snap = ward.tick()
+        reading = snap["beds"][1]
+        self.assertTrue(reading["online"])
+        self.assertIn("heart_rate", reading)
+        self.assertEqual(snap["turnover"]["beds"][1]["state"], "occupied")
+        self.assertTrue(snap["turnover"]["beds"][1]["awaiting_cleaning"])
+
+    def test_order_cancelled_when_patient_discharged_early(self):
+        ward = self._ward(
+            chaos=[ChaosEvent("discharge", 3, bed=0)],
+            discharge_planning={
+                "lead_time_s": 5,
+                "orders": [{"bed": 0, "at": 0}],
+            },
+        )
+        for _ in range(5):
+            ward.tick()
+        summary = ward.discharge_summary()
+        self.assertEqual(summary["orders"][0]["status"], "cancelled")
+        self.assertEqual(summary["cancelled"], 1)
+        self.assertEqual(summary["discharged"], 0)
+
+    def test_live_order_uses_default_lead_time(self):
+        ward = self._ward(discharge_planning={"lead_time_s": 5})
+        order = ward.discharge_planner.place_order(1, ward.elapsed)
+        self.assertEqual(order["expected_t"], 6.0)
+        for _ in range(5):
+            ward.tick()
+        self.assertEqual(ward.turnover_summary()["beds"][1]["state"], "cleaning")
+
+    def test_discharge_planning_validation(self):
+        with self.assertRaises(ValueError):
+            DischargePlanner(lead_time_s=0)
+        with self.assertRaises(ValueError):
+            DischargePlanner(orders=[{"bed": 0}])
+        with self.assertRaises(ValueError):
+            DischargePlanner(orders=[{"bed": -1, "at": 0}])
+        with self.assertRaises(ValueError):
+            DischargePlanner(orders=[{"bed": 0, "at": -1}])
+        with self.assertRaises(ValueError):
+            DischargePlanner(orders=[{"bed": 0, "at": 0, "lead_time_s": 0}])
+        with self.assertRaises(ValueError):
+            DischargePlanner(orders=[{"bed": 0, "at": 0, "lead_time_s": "soon"}])
+        with self.assertRaises(ValueError):
+            self._ward(
+                discharge_planning={
+                    "orders": [{"bed": 99, "at": 0}],
+                }
+            )
+        with self.assertRaises(ValueError):
+            Ward(beds=2, discharge_planning="tomorrow")
+
+    def test_cleaning_capacity_validation(self):
+        with self.assertRaises(ValueError):
+            Ward(beds=2, cleaning_capacity=0)
+        with self.assertRaises(ValueError):
+            Ward(beds=2, cleaning_capacity=True)
+        with self.assertRaises(ValueError):
+            Ward(beds=2, cleaning_capacity=1.5)
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"beds": 2, "cleaning_capacity": 0}, f)
+            path = f.name
+        try:
+            with self.assertRaises(ValueError):
+                load_scenario(path)
+        finally:
+            os.unlink(path)
+
+    def test_chaos_discharge_queues_when_cleaning_full(self):
+        ward = self._ward(
+            cleaning_capacity=1,
+            chaos=[
+                ChaosEvent("discharge", 5, bed=0),
+                ChaosEvent("discharge", 5, bed=1),
+            ],
+        )
+        for _ in range(5):
+            ward.tick()
+        snap = ward.tick()  # t=6: bed 0 cleaning, bed 1 still in bed
+        self.assertEqual(snap["beds"][0]["state"], "cleaning")
+        self.assertTrue(snap["turnover"]["beds"][1]["awaiting_cleaning"])
+        for _ in range(9):
+            ward.tick()
+        snap = ward.tick()  # t=15: bed 1 starts cleaning, 10 s late
+        self.assertEqual(snap["beds"][1]["state"], "cleaning")
+        self.assertEqual(
+            ward.turnover_summary()["total_discharge_delay_s"], 10.0
+        )
+
+    def test_discharge_in_snapshot_and_endpoint(self):
+        ward = self._ward(
+            discharge_planning={
+                "lead_time_s": 5,
+                "orders": [{"bed": 0, "at": 0}],
+            }
+        )
+        snap = ward.tick()
+        self.assertIn("discharge", snap)
+        self.assertEqual(snap["discharge"]["planned"], 1)
+        self.assertEqual(snap["discharge"]["cleaning_capacity"], None)
+        server, port = serve_in_thread(ward)
+        try:
+            status, body = get(port, "/discharge")
+            self.assertEqual(status, 200)
+            data = json.loads(body)
+            self.assertEqual(data["planned"], 1)
+            self.assertEqual(data["lead_time_s"], 5.0)
+            ward.partitioned = True
+            status, _ = get(port, "/discharge")
+            self.assertEqual(status, 503)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_ws_frame_carries_discharge(self):
+        ward = Ward(
+            beds=2,
+            rate_hz=20.0,
+            seed=5,
+            discharge_planning={
+                "lead_time_s": 5,
+                "orders": [{"bed": 0, "at": 0}],
+            },
+        )
+        server, port = serve_in_thread(ward)
+        try:
+            ws = WsClient(port)
+            try:
+                msg = json.loads(ws.read_until_opcode(1))
+                self.assertIn("discharge", msg)
+                self.assertEqual(msg["discharge"]["planned"], 1)
+            finally:
+                ws.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_scenario_discharge(self):
+        cfg = load_scenario(
+            os.path.join(HERE, "..", "scenarios", "discharge.json")
+        )
+        self.assertEqual(cfg["cleaning_capacity"], 1)
+        ward = build_ward(cfg, seed=42)
+        for _ in range(40):
+            ward.tick()
+        summary = ward.discharge_summary()
+        self.assertEqual(summary["planned"], 3)
+        self.assertEqual(summary["discharged"], 3)
+        self.assertEqual(summary["delayed"], 2)
+        self.assertEqual(summary["cancelled"], 0)
+        self.assertEqual(summary["total_delay_s"], 18.0)
+        self.assertEqual(summary["mean_delay_s"], 9.0)
+        orders = summary["orders"]
+        self.assertEqual(orders[0]["actual_t"], 5.0)
+        self.assertEqual(orders[0]["delay_s"], 0.0)
+        self.assertEqual(orders[1]["actual_t"], 15.0)
+        self.assertEqual(orders[1]["delay_s"], 10.0)
+        self.assertEqual(orders[2]["actual_t"], 25.0)
+        self.assertEqual(orders[2]["delay_s"], 8.0)
+
+    def test_recorder_summary_carries_discharge(self):
+        cfg = load_scenario(
+            os.path.join(HERE, "..", "scenarios", "discharge.json")
+        )
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".jsonl", delete=False
+        ) as f:
+            path = f.name
+        try:
+            with Recorder(path, cfg["beds"], cfg["rate_hz"], seed=42) as rec:
+                ward = build_ward(cfg, seed=42, recorder=rec)
+                for _ in range(40):
+                    ward.tick()
+            summary = summarize(path)
+            self.assertEqual(summary["discharge"]["planned"], 3)
+            self.assertEqual(summary["discharge"]["discharged"], 3)
+            self.assertEqual(summary["discharge"]["delayed"], 2)
+            self.assertEqual(summary["discharge"]["total_delay_s"], 18.0)
+            self.assertEqual(summary["discharge"]["mean_delay_s"], 9.0)
+        finally:
+            os.unlink(path)
 
 
 class TestPoissonArrivals(unittest.TestCase):

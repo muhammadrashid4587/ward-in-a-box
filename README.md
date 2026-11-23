@@ -69,6 +69,10 @@ python3 -m ward.cli scenarios/arrivals.json --seed 42
 # diverted; the boarded patient takes the first freed bed
 python3 -m ward.cli scenarios/boarding.json --seed 42
 
+# Discharge planning: three orders, one cleaning slot — two
+# discharges wait for a slot and land 10 s and 8 s late
+python3 -m ward.cli scenarios/discharge.json --seed 42
+
 # Reproducible run
 python3 -m ward.cli scenarios/example.json --seed 42
 ```
@@ -100,6 +104,10 @@ python3 -m ward.cli scenarios/example.json --seed 42
   arrivals in the last hour of ward time, arrivals per ward clock
   hour so far, and diversion status, as JSON
   (503 while partitioned)
+- `GET /discharge` — planned discharges: orders with their expected
+  and actual discharge times, delays when cleaning was backed up,
+  and the cleaning capacity and how many beds are cleaning or
+  awaiting a slot, as JSON (503 while partitioned)
 
 A reading looks like:
 
@@ -128,7 +136,8 @@ streams one JSON text frame per tick at the ward rate:
 Each frame carries the same snapshot as `/snapshot` plus the alarm
 summary from `/alarms`, the staffing summary from `/staffing`, the
 medication summary from `/meds`, the triage summary from
-`/triage`, and the live arrivals view from `/arrivals`, so a client gets bed occupancy, vitals, alarms, staffing,
+`/triage`, the live arrivals view from `/arrivals`, and the
+discharge summary from `/discharge`, so a client gets bed occupancy, vitals, alarms, staffing,
 medication, and the intake queue in one message. Ping frames are answered with pong, close frames
 are echoed and the connection is then closed; text frames from the
 client are accepted and ignored — the ward pushes ticks, it takes no
@@ -550,6 +559,57 @@ bedside monitor until they are admitted to a bed — the model only
 tracks that they are waiting, how long, and whether they raised a
 wait-time alarm.
 
+## Discharge planning
+
+A discharge is not instant in a real ward: the doctor orders it in
+the morning and the patient leaves hours later, and the bed only
+frees up once cleaning finishes. A scenario can plan discharges
+with a lead time:
+
+```json
+{
+  "beds": 4,
+  "cleaning_s": 10,
+  "cleaning_capacity": 1,
+  "discharge_planning": {
+    "lead_time_s": 5,
+    "orders": [
+      {"bed": 0, "at": 0},
+      {"bed": 1, "at": 0},
+      {"bed": 2, "at": 12}
+    ]
+  }
+}
+```
+
+Each order names a bed and when it is placed; the patient is
+discharged at `at + lead_time_s` (the planner's default lead time,
+an hour by default, when an order does not set its own). The bed
+then goes through cleaning as usual, so a planned discharge
+followed by a triage admission tests exactly the gap between the
+order and the bed being free. An order for a bed whose patient
+already left — a chaos `discharge` event fired first — is
+cancelled, not forced. Orders can also be placed live with
+`ward.discharge_planner.place_order(bed, now)`.
+
+`cleaning_capacity` caps how many beds can be cleaned at once
+(unlimited by default, so existing scenarios behave exactly as
+before). When every slot is busy, a discharge is delayed: the
+patient stays in the bed, still monitored and still emitting
+vitals, until a slot frees up, and the delay is recorded — on the
+order, in the per-bed turnover totals, and in the ward totals.
+Every snapshot carries a `"discharge"` object with the orders
+(bed, ordered, expected, and actual times, status, and delay),
+how many were planned, discharged, delayed, and cancelled, and
+the total and mean delay, plus the cleaning capacity, how many
+beds are cleaning, and how many are awaiting a slot. The same
+summary is served by `GET /discharge` and carried in every
+WebSocket frame, and the run summary (`--summary`) reports the
+discharge totals. See `scenarios/discharge.json` for a runnable
+example: over a seeded 40-tick run with one cleaning slot, all
+three planned discharges land, two of them late — bed 1 by 10 s
+and bed 2 by 8 s, 18 s of delay in total.
+
 ## Recording a run
 
 `--record FILE` writes every tick to a JSONL file: a header line with
@@ -573,7 +633,7 @@ endpoints returned 503 while it lasted, the ticks did not stop.
 make test
 ```
 
-148 tests: vitals stay inside plausible ranges, dropout actually stops a
+160 tests: vitals stay inside plausible ranges, dropout actually stops a
 monitor's stream, an alarm storm produces alarms, stale readings freeze,
 a partition blocks the snapshot endpoint, the HTTP endpoints serve valid
 JSON, the stream serves JSON lines, scenario files validate, alarm
@@ -672,7 +732,18 @@ capacity, the live arrivals view carrying boarding counts and
 `diverting` only when queue and boarding are both full, boarding
 in snapshots and the `GET /arrivals` endpoint, and the
 `boarding.json` scenario admitting the boarded patient at 15 s
-and the queued patient at 18 s.
+and the queued patient at 18 s. Discharge planning tests cover a
+planned discharge firing at its expected time, a discharge
+delayed when the cleaning roster is full (the patient stays in
+the bed, still monitored, until a slot frees up), an order
+cancelled when the patient is discharged early by a chaos event,
+a chaos discharge queuing behind a full cleaning roster, live
+orders using the default lead time, validation of lead times,
+order fields, and cleaning capacity, the discharge summary in
+snapshots, the `GET /discharge` endpoint (503 while partitioned),
+and WebSocket frames, the run summary carrying discharge totals,
+and the `discharge.json` scenario landing all three discharges
+with 18 s of total delay (10 s and 8 s) over a seeded run.
 
 ## Roadmap
 
@@ -715,3 +786,8 @@ and the queued patient at 18 s.
   diverted, take freed beds before queued patients, raise the same
   wait-time alarms, with boarding counts and wait metrics in the
   triage summary and live arrivals view) — done in v0.16.0
+- Discharge planning (orders with a lead time, discharges delayed
+  when the cleaning roster is full with the patient still monitored
+  in the bed, delays recorded per order and in the ward totals, a
+  `cleaning_capacity` cap, in every snapshot, WebSocket frame, a
+  `GET /discharge` endpoint, and the run summary) — done in v0.17.0

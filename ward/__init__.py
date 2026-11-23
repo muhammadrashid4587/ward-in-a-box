@@ -1,9 +1,10 @@
 """ward-in-a-box: a simulated hospital ward as a load/chaos generator."""
 
-__version__ = "0.15.0"
+__version__ = "0.17.0"
 
 from .arrivals import ArrivalModel
 from .chaos import ChaosEngine, ChaosEvent
+from .discharge import DischargePlanner
 from .meds import MedSchedule, interaction_warnings, validate_med
 from .monitor import Monitor
 from .recorder import Recorder, iter_ticks, summarize
@@ -17,6 +18,7 @@ __all__ = [
     "ArrivalModel",
     "ChaosEngine",
     "ChaosEvent",
+    "DischargePlanner",
     "MedSchedule",
     "Monitor",
     "PROFILES",

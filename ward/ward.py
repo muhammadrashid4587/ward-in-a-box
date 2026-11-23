@@ -5,6 +5,7 @@ import threading
 import time
 
 from .chaos import ChaosEngine
+from .discharge import DischargePlanner
 from .monitor import Monitor
 from .staffing import Staffing
 from .timeline import Timeline
@@ -26,13 +27,40 @@ class Ward:
     snapshot to a JSONL file.
     """
 
-    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None, cleaning_s=30.0, meds=None, triage=None):
+    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None, cleaning_s=30.0, meds=None, triage=None, discharge_planning=None, cleaning_capacity=None):
         if not 1 <= beds <= 64:
             raise ValueError("beds must be 1..64")
         if rate_hz <= 0:
             raise ValueError("rate_hz must be > 0")
         if cleaning_s <= 0:
             raise ValueError("cleaning_s must be > 0")
+        if cleaning_capacity is not None and (
+            not isinstance(cleaning_capacity, int)
+            or isinstance(cleaning_capacity, bool)
+            or cleaning_capacity < 1
+        ):
+            raise ValueError(
+                "cleaning_capacity must be an int >= 1, got %r"
+                % (cleaning_capacity,)
+            )
+        self.cleaning_capacity = cleaning_capacity
+        if discharge_planning is None:
+            self.discharge_planner = DischargePlanner()
+        elif isinstance(discharge_planning, DischargePlanner):
+            self.discharge_planner = discharge_planning
+        elif isinstance(discharge_planning, dict):
+            self.discharge_planner = DischargePlanner(**discharge_planning)
+        else:
+            raise ValueError(
+                "discharge_planning must be a DischargePlanner or a dict, got %r"
+                % (discharge_planning,)
+            )
+        for order in self.discharge_planner.scheduled_orders:
+            if not 0 <= order["bed"] < beds:
+                raise ValueError(
+                    "discharge order targets bed %r, ward has %d beds"
+                    % (order["bed"], beds)
+                )
         self.rng = random.Random(seed)
         if triage is None:
             self.triage = TriageQueue(rng=self.rng)
@@ -100,6 +128,16 @@ class Ward:
         dt = dt if dt is not None else 1.0 / self.rate_hz
         self.elapsed = round(self.elapsed + dt, 3)
         self.chaos.apply(self, self.elapsed)
+        # Discharge planning: orders due now are placed, and orders
+        # whose expected time has arrived are discharged — or queued
+        # behind a full cleaning roster until a slot frees up.
+        self.discharge_planner.tick(self.elapsed, self)
+        # Cleaning slots freed by now (a bed's turnover ends when
+        # ``now`` reaches its cleaning time, by the state check, not
+        # by the monitor loop below) go to queued discharges,
+        # earliest expected discharge first — before the monitor loop
+        # runs, so the snapshot is consistent within the tick.
+        self._start_queued_cleanings()
         if self.timeline is not None:
             for i, m in enumerate(self.monitors):
                 if not m.admitted:
@@ -149,7 +187,7 @@ class Ward:
         for m in self.monitors:
             for alarm in m.raised_this_tick:
                 self.staffing.alarm_raised(m.bed_id, alarm, self.elapsed, occupied)
-        snap = {"t": self.elapsed, "beds": readings, "staffing": self.staffing.summary(self.elapsed, occupied), "turnover": self.turnover_summary(), "meds": self.meds_summary(), "triage": self.triage_summary(), "arrivals": self.arrivals_summary()}
+        snap = {"t": self.elapsed, "beds": readings, "staffing": self.staffing.summary(self.elapsed, occupied), "turnover": self.turnover_summary(), "meds": self.meds_summary(), "triage": self.triage_summary(), "arrivals": self.arrivals_summary(), "discharge": self.discharge_summary()}
         with self._lock:
             self.latest = snap
         if self.recorder is not None:
@@ -171,13 +209,91 @@ class Ward:
             "rate_per_min": round(sum(b["rate_per_min"] for b in beds), 3),
         }
 
+    def cleaning_active_count(self, now):
+        """Beds being cleaned at elapsed time ``now``."""
+        return sum(1 for m in self.monitors if m.state(now) == "cleaning")
+
     def discharge(self, bed_id):
         """Discharge the patient in ``bed_id``.
 
         The bed goes into cleaning for ``cleaning_s`` seconds and
-        cannot take a new admission until turnover finishes.
+        cannot take a new admission until turnover finishes. When
+        ``cleaning_capacity`` is set and every cleaning slot is busy,
+        the discharge is queued instead: the patient stays in the bed,
+        still monitored, until a slot frees up (see
+        :meth:`_start_queued_cleanings`). A bed whose discharge is
+        already queued is left alone.
         """
-        self._monitor(bed_id).discharge(self.elapsed, self.cleaning_s)
+        m = self._monitor(bed_id)
+        if m.awaiting_cleaning:
+            return
+        if not m.admitted:
+            raise ValueError("bed %d is not occupied" % bed_id)
+        if (
+            self.cleaning_capacity is not None
+            and self.cleaning_active_count(self.elapsed)
+            >= self.cleaning_capacity
+        ):
+            m.queue_discharge(self.elapsed)
+            return
+        m.discharge(self.elapsed, self.cleaning_s)
+
+    def discharge_planned(self, bed_id, expected_t):
+        """Discharge a planned discharge due at ``expected_t``.
+
+        Returns ``"discharged"`` when the bed went into cleaning at
+        once, ``"queued"`` when cleaning is backed up and the patient
+        stays in the bed, or ``"cancelled"`` when the patient already
+        left (a chaos discharge fired first, say).
+        """
+        m = self._monitor(bed_id)
+        if m.awaiting_cleaning:
+            return "queued"
+        if not m.admitted:
+            return "cancelled"
+        if (
+            self.cleaning_capacity is not None
+            and self.cleaning_active_count(self.elapsed)
+            >= self.cleaning_capacity
+        ):
+            m.queue_discharge(self.elapsed, expected_t)
+            return "queued"
+        m.discharge(self.elapsed, self.cleaning_s)
+        return "discharged"
+
+    def _start_queued_cleanings(self):
+        """Start cleaning for discharges queued behind a full roster.
+
+        Earliest expected discharge first; each one frees its patient
+        from the bed and tells the discharge planner the order is
+        complete, with its delay.
+        """
+        queued = [m for m in self.monitors if m.awaiting_cleaning]
+        queued.sort(
+            key=lambda m: (
+                m.pending_since if m.pending_since is not None else 0,
+                m.bed_id,
+            )
+        )
+        for m in queued:
+            if (
+                self.cleaning_capacity is not None
+                and self.cleaning_active_count(self.elapsed)
+                >= self.cleaning_capacity
+            ):
+                break
+            m.begin_cleaning(self.elapsed, self.cleaning_s)
+            self.discharge_planner.complete(m.bed_id, self.elapsed)
+
+    def discharge_summary(self):
+        """Planned discharges, cleaning capacity, and queued beds."""
+        summary = self.discharge_planner.summary(self.elapsed)
+        summary["cleaning_capacity"] = self.cleaning_capacity
+        summary["cleaning_active"] = self.cleaning_active_count(self.elapsed)
+        summary["awaiting_cleaning"] = sum(
+            1 for m in self.monitors if m.awaiting_cleaning
+        )
+        return summary
 
     def admit(self, bed_id, profile=None, acuity=None):
         """Admit a new patient to an available bed.
@@ -200,8 +316,15 @@ class Ward:
             "occupied": sum(1 for b in beds if b["state"] == "occupied"),
             "cleaning": sum(1 for b in beds if b["state"] == "cleaning"),
             "available": sum(1 for b in beds if b["state"] == "available"),
+            "awaiting_cleaning": sum(
+                1 for b in beds if b["awaiting_cleaning"]
+            ),
             "total_turnovers": sum(b["turnovers"] for b in beds),
             "total_cleaning_s": round(sum(b["total_cleaning_s"] for b in beds), 3),
+            "total_discharge_delays": sum(b["discharge_delays"] for b in beds),
+            "total_discharge_delay_s": round(
+                sum(b["total_discharge_delay_s"] for b in beds), 3
+            ),
         }
 
     def meds_summary(self):

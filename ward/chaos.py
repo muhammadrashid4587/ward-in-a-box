@@ -93,8 +93,11 @@ class ChaosEngine:
                 if id(ev) not in self._discharged and now >= ev.at:
                     self._discharged.add(id(ev))
                     for b in ev.targets(ward):
+                        # Through Ward.discharge, so a full cleaning
+                        # roster queues the discharge like any other
+                        # instead of starting cleaning at once.
                         if ward.monitors[b].admitted:
-                            ward.monitors[b].discharge(now, ward.cleaning_s)
+                            ward.discharge(b)
                 continue
             if not ev.active(now):
                 continue

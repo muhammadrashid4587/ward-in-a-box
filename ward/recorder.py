@@ -76,8 +76,10 @@ def summarize(path):
     raise/clear transitions), plus intake totals from the last tick —
     patients admitted and diverted, walk-ins generated, and the
     arrival rate at that hour, with arrivals per ward clock hour so
-    the run's load shape over the day is visible. Returns ``None``
-    fields for a recording with no ticks.
+    the run's load shape over the day is visible — and discharge
+    totals from the last tick: planned discharges, how many landed,
+    how many were delayed by a backed-up cleaning roster, and the
+    total delay. Returns ``None`` fields for a recording with no ticks.
     """
     header = None
     ticks = 0
@@ -88,6 +90,7 @@ def summarize(path):
     alarms_raised = 0
     active = {}
     last_triage = None
+    last_discharge = None
     with open(path) as f:
         for line in f:
             line = line.strip()
@@ -106,6 +109,8 @@ def summarize(path):
             last_t = t
             if isinstance(obj.get("triage"), dict):
                 last_triage = obj["triage"]
+            if isinstance(obj.get("discharge"), dict):
+                last_discharge = obj["discharge"]
             for bed in obj["beds"]:
                 b = bed["bed"]
                 if not bed.get("online", True):
@@ -150,6 +155,21 @@ def summarize(path):
                 ),
             }
             if last_triage is not None
+            else None
+        ),
+        # Discharge totals from the last tick: planned discharges,
+        # how many landed, how many were delayed waiting for a
+        # cleaning slot, and the total delay.
+        "discharge": (
+            {
+                "planned": last_discharge["planned"],
+                "discharged": last_discharge["discharged"],
+                "delayed": last_discharge["delayed"],
+                "cancelled": last_discharge["cancelled"],
+                "total_delay_s": last_discharge["total_delay_s"],
+                "mean_delay_s": last_discharge["mean_delay_s"],
+            }
+            if last_discharge is not None
             else None
         ),
     }

@@ -55,6 +55,16 @@ class Monitor:
         self.cleaning_until = None
         self.turnovers = 0
         self.total_cleaning_s = 0.0
+        # A discharge ordered while every cleaning slot is busy does
+        # not start cleaning at once: the patient stays in the bed
+        # (still monitored) until a slot frees up. ``pending_since``
+        # is when the discharge was first attempted — the expected
+        # discharge time — so the delay is measurable; the totals
+        # below accumulate it across discharges.
+        self.awaiting_cleaning = False
+        self.pending_since = None
+        self.discharge_delays = 0
+        self.total_discharge_delay_s = 0.0
         # Alarms raised by the most recent tick; the ward reads this to
         # hand them to the staffing model for acknowledgement.
         self.raised_this_tick = []
@@ -83,6 +93,45 @@ class Monitor:
             raise ValueError("cleaning_s must be > 0")
         if not self.admitted:
             raise ValueError("bed %d is not occupied" % self.bed_id)
+        if self.awaiting_cleaning:
+            raise ValueError(
+                "bed %d discharge is already pending" % self.bed_id
+            )
+        self.begin_cleaning(now, cleaning_s)
+
+    def queue_discharge(self, now, expected_t=None):
+        """Hold a discharge until a cleaning slot frees up.
+
+        The patient stays in the bed — admitted, still monitored —
+        and the bed starts cleaning when the ward calls
+        :meth:`begin_cleaning`. ``expected_t`` is when the discharge
+        was due (a planned discharge's expected time, or ``now`` for
+        an immediate one); the delay is measured from it.
+        """
+        if not self.admitted:
+            raise ValueError("bed %d is not occupied" % self.bed_id)
+        if self.awaiting_cleaning:
+            return
+        self.awaiting_cleaning = True
+        self.pending_since = round(
+            expected_t if expected_t is not None else now, 3
+        )
+
+    def begin_cleaning(self, now, cleaning_s):
+        """Start turnover for a discharged (or queued) patient.
+
+        Records the discharge delay when one was queued: how long
+        past the expected discharge time cleaning actually started.
+        """
+        if self.pending_since is not None:
+            delay = round(now - self.pending_since, 3)
+            if delay > 0:
+                self.discharge_delays += 1
+                self.total_discharge_delay_s = round(
+                    self.total_discharge_delay_s + delay, 3
+                )
+            self.pending_since = None
+        self.awaiting_cleaning = False
         self._record_alarm_transitions([], now)
         self.meds.reset()
         self.admitted = False
@@ -130,6 +179,10 @@ class Monitor:
             else None,
             "turnovers": self.turnovers,
             "total_cleaning_s": self.total_cleaning_s,
+            "awaiting_cleaning": self.awaiting_cleaning,
+            "discharge_expected_t": self.pending_since,
+            "discharge_delays": self.discharge_delays,
+            "total_discharge_delay_s": self.total_discharge_delay_s,
         }
 
     def tick(self, now, dt=1.0):

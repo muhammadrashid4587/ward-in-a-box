@@ -5,6 +5,7 @@ import json
 import sys
 
 from .chaos import ChaosEvent
+from .discharge import DischargePlanner
 from .recorder import Recorder, iter_ticks, summarize
 from .server import serve
 from .staffing import Staffing
@@ -90,6 +91,16 @@ def load_scenario(path):
     cleaning_s = data.get("cleaning_s", 30.0)
     if not isinstance(cleaning_s, (int, float)) or cleaning_s <= 0:
         raise ValueError("cleaning_s must be > 0")
+    cleaning_capacity = data.get("cleaning_capacity")
+    if cleaning_capacity is not None and (
+        not isinstance(cleaning_capacity, int)
+        or isinstance(cleaning_capacity, bool)
+        or cleaning_capacity < 1
+    ):
+        raise ValueError(
+            "cleaning_capacity must be an int >= 1, got %r"
+            % (cleaning_capacity,)
+        )
     triage = None
     if "triage" in data:
         if not isinstance(data["triage"], dict):
@@ -98,6 +109,14 @@ def load_scenario(path):
             triage = TriageQueue(**data["triage"])
         except (TypeError, ValueError) as e:
             raise ValueError("triage: %s" % e)
+    discharge_planning = None
+    if "discharge_planning" in data:
+        if not isinstance(data["discharge_planning"], dict):
+            raise ValueError("discharge_planning must be an object")
+        try:
+            discharge_planning = DischargePlanner(**data["discharge_planning"])
+        except (TypeError, ValueError) as e:
+            raise ValueError("discharge_planning: %s" % e)
     return {
         "beds": beds,
         "rate_hz": rate,
@@ -108,6 +127,8 @@ def load_scenario(path):
         "timeline": timeline,
         "staffing": staffing,
         "cleaning_s": float(cleaning_s),
+        "cleaning_capacity": cleaning_capacity,
+        "discharge_planning": discharge_planning,
         "triage": triage,
         "host": data.get("host", "127.0.0.1"),
         "port": data.get("port", 8080),
@@ -126,6 +147,8 @@ def build_ward(cfg, seed=None, recorder=None):
         timeline=cfg.get("timeline"),
         staffing=cfg.get("staffing"),
         cleaning_s=cfg.get("cleaning_s", 30.0),
+        cleaning_capacity=cfg.get("cleaning_capacity"),
+        discharge_planning=cfg.get("discharge_planning"),
         triage=cfg.get("triage"),
         recorder=recorder,
     )
@@ -174,6 +197,8 @@ def main(argv=None):
             "chaos": [],
             "timeline": None,
             "staffing": None,
+            "cleaning_capacity": None,
+            "discharge_planning": None,
             "host": args.host or "127.0.0.1",
             "port": args.port if args.port is not None else 8080,
         }
