@@ -81,7 +81,10 @@ def summarize(path):
     totals from the last tick: planned discharges, how many landed,
     how many were delayed by a backed-up cleaning roster, and the
     total delay — and discharge-readiness totals from the last tick:
-    how many occupied beds are flagged ready and how many are not.
+    how many occupied beds are flagged ready and how many are not —
+    and early-warning totals from the last tick: how many beds are
+    at high, medium, and low NEWS2 risk, how many deterioration
+    episodes are open, and how many have raised.
     Returns ``None`` fields for a recording with no ticks.
     """
     header = None
@@ -95,6 +98,7 @@ def summarize(path):
     last_triage = None
     last_discharge = None
     last_readiness = None
+    last_early_warning = None
     with open(path) as f:
         for line in f:
             line = line.strip()
@@ -117,6 +121,8 @@ def summarize(path):
                 last_discharge = obj["discharge"]
             if isinstance(obj.get("discharge_readiness"), dict):
                 last_readiness = obj["discharge_readiness"]
+            if isinstance(obj.get("early_warning"), dict):
+                last_early_warning = obj["early_warning"]
             for bed in obj["beds"]:
                 b = bed["bed"]
                 if not bed.get("online", True):
@@ -219,6 +225,22 @@ def summarize(path):
                 ),
             }
             if last_readiness is not None
+            else None
+        ),
+        # Early-warning totals from the last tick: beds at each
+        # NEWS2 risk level, open deterioration episodes, and how
+        # many episodes have raised over the run.
+        "early_warning": (
+            {
+                "high_risk": last_early_warning["high_risk"],
+                "medium_risk": last_early_warning["medium_risk"],
+                "low_risk": last_early_warning["low_risk"],
+                "escalated": last_early_warning["escalated"],
+                "escalations_raised": last_early_warning[
+                    "escalations_raised"
+                ],
+            }
+            if last_early_warning is not None
             else None
         ),
     }

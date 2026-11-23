@@ -28,6 +28,7 @@ from ward.server import make_handler
 from ward.staffing import Staffing
 from ward.timeline import Timeline, TimelinePhase
 from ward.triage import TriageQueue
+from ward.news2 import score_signs
 from ward.vitals import PROFILES, effective_ranges, validate_acuity
 from ward.ward import Ward
 from ward.websocket import accept_key, encode_frame, read_frame
@@ -3493,6 +3494,245 @@ class TestPoissonArrivals(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+
+class TestNEWS2(unittest.TestCase):
+    def _signs(self, **over):
+        signs = {
+            "heart_rate": 70,
+            "spo2": 98,
+            "systolic": 120,
+            "diastolic": 80,
+            "temperature": 37.0,
+            "resp_rate": 16,
+        }
+        signs.update(over)
+        return signs
+
+    def test_component_boundaries(self):
+        # Respiratory rate: <=8: 3, 9-11: 1, 12-20: 0, 21-24: 2, >=25: 3.
+        for rr, want in ((8, 3), (9, 1), (11, 1), (12, 0), (20, 0), (21, 2), (24, 2), (25, 3)):
+            self.assertEqual(score_signs(self._signs(resp_rate=rr))["components"]["resp_rate"], want, rr)
+        # SpO2 Scale 1: <=91: 3, 92-93: 2, 94-95: 1, >=96: 0.
+        for spo2, want in ((91, 3), (92, 2), (93, 2), (94, 1), (95, 1), (96, 0)):
+            self.assertEqual(score_signs(self._signs(spo2=spo2))["components"]["spo2"], want, spo2)
+        # Systolic: <=90: 3, 91-100: 2, 101-110: 1, 111-219: 0, >=220: 3.
+        for sys, want in ((90, 3), (91, 2), (100, 2), (101, 1), (110, 1), (111, 0), (219, 0), (220, 3)):
+            self.assertEqual(score_signs(self._signs(systolic=sys))["components"]["systolic"], want, sys)
+        # Heart rate: <=40: 3, 41-50: 1, 51-90: 0, 91-110: 1, 111-130: 2, >=131: 3.
+        for hr, want in ((40, 3), (41, 1), (50, 1), (51, 0), (90, 0), (91, 1), (110, 1), (111, 2), (130, 2), (131, 3)):
+            self.assertEqual(score_signs(self._signs(heart_rate=hr))["components"]["heart_rate"], want, hr)
+        # Temperature: <=35.0: 3, 35.1-36.0: 1, 36.1-38.0: 0, 38.1-39.0: 1, >=39.1: 2.
+        for temp, want in ((35.0, 3), (35.1, 1), (36.0, 1), (36.1, 0), (38.0, 0), (38.1, 1), (39.0, 1), (39.1, 2)):
+            self.assertEqual(score_signs(self._signs(temperature=temp))["components"]["temperature"], want, temp)
+
+    def test_aggregate_risk_and_red_score(self):
+        normal = score_signs(self._signs())
+        self.assertEqual(normal["score"], 0)
+        self.assertEqual(normal["risk"], "low")
+        self.assertFalse(normal["red_score"])
+        self.assertIn("routine monitoring", normal["response"])
+        # One parameter scoring 3 is a red score: medium risk even
+        # when the aggregate is low.
+        red = score_signs(self._signs(spo2=90))
+        self.assertEqual(red["score"], 3)
+        self.assertTrue(red["red_score"])
+        self.assertEqual(red["risk"], "medium")
+        self.assertIn("ward team", red["response"])
+        # 5-6 without a red score is medium.
+        medium = score_signs(self._signs(spo2=93, resp_rate=22, heart_rate=95))
+        self.assertEqual(medium["score"], 5)
+        self.assertFalse(medium["red_score"])
+        self.assertEqual(medium["risk"], "medium")
+        # 7 or more is high.
+        high = score_signs(self._signs(spo2=90, resp_rate=22, heart_rate=95, temperature=38.5))
+        self.assertEqual(high["score"], 7)
+        self.assertEqual(high["risk"], "high")
+        self.assertIn("critical care", high["response"])
+
+    def test_reading_carries_news2(self):
+        ward = Ward(beds=2, profiles=["stable", "hypoxic"], seed=42)
+        snap = ward.tick()
+        stable = snap["beds"][0]["news2"]
+        self.assertEqual(stable["risk"], "low")
+        self.assertFalse(stable["red_score"])
+        hypoxic = snap["beds"][1]["news2"]
+        self.assertEqual(hypoxic["risk"], "medium")
+        self.assertTrue(hypoxic["red_score"])
+        self.assertEqual(hypoxic["components"]["spo2"], 3)
+
+    def test_news2_does_not_touch_the_alarm_list(self):
+        # The score is a parallel track: a hypoxic patient's alarms
+        # are only the ones alarms_for raises, never a NEWS2 alarm.
+        known = {
+            "tachycardia", "bradycardia", "low_spo2", "hypertension",
+            "hypotension", "fever", "hypothermia", "tachypnea",
+            "missed_dose",
+        }
+        ward = Ward(beds=1, profiles=["hypoxic"], seed=7)
+        for _ in range(600):
+            snap = ward.tick()
+            self.assertTrue(set(snap["beds"][0]["alarms"]) <= known)
+
+    def test_storm_pushes_patient_high_then_episode_clears(self):
+        ward = Ward(
+            beds=1,
+            profiles=["febrile"],
+            chaos=[ChaosEvent("alarm_storm", at=1, duration=10, bed=0)],
+            seed=3,
+        )
+        snap = ward.tick()  # t=1: storm starts
+        self.assertEqual(snap["beds"][0]["news2"]["risk"], "high")
+        self.assertGreaterEqual(snap["beds"][0]["news2"]["score"], 7)
+        for _ in range(39):
+            ward.tick()
+        m = ward.monitors[0]
+        self.assertEqual(m.escalations_raised, 2)
+        first = m.escalation_history[0]
+        self.assertEqual(first["raised_t"], 1.0)
+        self.assertEqual(first["cleared_t"], 14.0)
+        self.assertEqual(first["peak_score"], 11)
+        self.assertEqual(first["peak_risk"], "high")
+        self.assertIsNone(m._escalation)
+
+    def test_hypoxic_patient_stays_escalated(self):
+        ward = Ward(beds=1, profiles=["hypoxic"], seed=3)
+        for _ in range(5):
+            snap = ward.tick()
+        self.assertTrue(snap["beds"][0]["news2"]["red_score"])
+        m = ward.monitors[0]
+        self.assertIsNotNone(m._escalation)
+        self.assertEqual(m._escalation["raised_t"], 1.0)
+        # The red SpO2 score alone is 3 points, so the peak is at
+        # least that; the episode raised at medium risk.
+        self.assertGreaterEqual(m._escalation["peak_score"], 3)
+        self.assertEqual(m._escalation["peak_risk"], "medium")
+
+    def test_discharge_closes_open_episode(self):
+        ward = Ward(beds=1, profiles=["hypoxic"], seed=3)
+        for _ in range(5):
+            ward.tick()
+        self.assertIsNotNone(ward.monitors[0]._escalation)
+        ward.discharge(0)
+        m = ward.monitors[0]
+        self.assertIsNone(m._escalation)
+        self.assertEqual(m.escalation_history[0]["cleared_t"], 5.0)
+
+    def test_no_score_while_offline_or_unadmitted(self):
+        ward = Ward(
+            beds=1,
+            profiles=["hypoxic"],
+            chaos=[ChaosEvent("dropout", at=1, duration=5, bed=0)],
+            seed=3,
+        )
+        ward.tick()
+        ward.tick()
+        self.assertIsNone(
+            ward.monitors[0].news2_detail(ward.elapsed)["news2"]
+        )
+        for _ in range(5):
+            ward.tick()
+        self.assertIsNotNone(
+            ward.monitors[0].news2_detail(ward.elapsed)["news2"]
+        )
+        ward2 = Ward(
+            beds=2,
+            profiles=["stable", "stable"],
+            timeline=Timeline([TimelinePhase(0, 1, ramp_s=0)]),
+            seed=3,
+        )
+        ward2.tick()
+        detail = ward2.monitors[1].news2_detail(ward2.elapsed)
+        self.assertFalse(detail["admitted"])
+        self.assertIsNone(detail["news2"])
+        self.assertFalse(detail["escalated"])
+
+    def test_news2_in_snapshot_endpoint_and_ws_frame(self):
+        ward = Ward(beds=2, profiles=["stable", "hypoxic"], seed=42)
+        ward.tick()
+        snap = ward.snapshot()
+        self.assertIn("early_warning", snap)
+        self.assertEqual(snap["early_warning"]["medium_risk"], 1)
+        self.assertEqual(snap["early_warning"]["low_risk"], 1)
+        self.assertEqual(snap["early_warning"]["escalated"], 1)
+        server, port = serve_in_thread(ward)
+        try:
+            status, body = get(port, "/news2")
+            self.assertEqual(status, 200)
+            data = json.loads(body)
+            self.assertEqual(data["escalations_raised"], 1)
+            self.assertEqual(data["beds"][1]["news2"]["risk"], "medium")
+            ward.partitioned = True
+            status, _ = get(port, "/news2")
+            self.assertEqual(status, 503)
+            ward.partitioned = False
+        finally:
+            server.shutdown()
+            server.server_close()
+        ward2 = Ward(beds=1, profiles=["hypoxic"], rate_hz=20.0, seed=42)
+        server, port = serve_in_thread(ward2)
+        try:
+            ws = WsClient(port)
+            try:
+                msg = json.loads(ws.read_until_opcode(1))
+                self.assertIn("early_warning", msg)
+                self.assertEqual(msg["early_warning"]["escalated"], 1)
+            finally:
+                ws.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_scenario_news2(self):
+        cfg = load_scenario(
+            os.path.join(HERE, "..", "scenarios", "news2.json")
+        )
+        ward = build_ward(cfg, seed=42)
+        for _ in range(40):
+            snap = ward.tick()
+        # Bed 0 stable: low, never escalates. Bed 1 hypoxic: medium
+        # on a red SpO2 score, escalated from t=1. Bed 2
+        # tachycardic: low. Bed 3 febrile: a medium episode on its
+        # own at t=5-9, then a high one under the storm at t=10,
+        # peaking at 11 and clearing at t=40.
+        self.assertEqual(snap["beds"][0]["news2"]["risk"], "low")
+        self.assertEqual(snap["beds"][1]["news2"]["risk"], "medium")
+        self.assertTrue(snap["beds"][1]["news2"]["red_score"])
+        self.assertEqual(snap["beds"][2]["news2"]["risk"], "low")
+        summary = ward.early_warning_summary()
+        self.assertEqual(summary["medium_risk"], 1)
+        self.assertEqual(summary["low_risk"], 3)
+        self.assertEqual(summary["escalated"], 1)
+        self.assertEqual(summary["escalations_raised"], 3)
+        bed3 = summary["beds"][3]
+        self.assertEqual(bed3["escalations_raised"], 2)
+        self.assertEqual(bed3["episodes"][0]["raised_t"], 5.0)
+        self.assertEqual(bed3["episodes"][0]["peak_score"], 6)
+        self.assertEqual(bed3["episodes"][1]["peak_score"], 11)
+        self.assertEqual(bed3["episodes"][1]["peak_risk"], "high")
+        self.assertEqual(bed3["episodes"][1]["cleared_t"], 40.0)
+
+    def test_recorder_summary_carries_early_warning(self):
+        cfg = load_scenario(
+            os.path.join(HERE, "..", "scenarios", "news2.json")
+        )
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".jsonl", delete=False
+        ) as f:
+            path = f.name
+        try:
+            with Recorder(path, cfg["beds"], cfg["rate_hz"], seed=42) as rec:
+                ward = build_ward(cfg, seed=42, recorder=rec)
+                for _ in range(40):
+                    ward.tick()
+            summary = summarize(path)
+            ew = summary["early_warning"]
+            self.assertEqual(ew["medium_risk"], 1)
+            self.assertEqual(ew["low_risk"], 3)
+            self.assertEqual(ew["escalated"], 1)
+            self.assertEqual(ew["escalations_raised"], 3)
+        finally:
+            os.unlink(path)
 
 
 if __name__ == "__main__":

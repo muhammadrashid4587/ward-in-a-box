@@ -4,6 +4,7 @@ import random
 from collections import deque
 
 from .meds import MedSchedule
+from .news2 import score_signs
 from .vitals import alarms_for, initial_signs, step, validate_acuity
 
 # Where an alarm storm drags each vital. All of them trip an alarm.
@@ -73,6 +74,14 @@ class Monitor:
         # cleared, or admission when they never alarmed. None while
         # an alarm is active.
         self._stable_since = 0.0
+        # Early warning: a deterioration episode is open while the
+        # patient's NEWS2 risk is medium or high — raised at the
+        # first tick the risk leaves low, closed when it returns.
+        # ``escalation_history`` keeps every closed episode; the
+        # open one lives in ``_escalation`` until it closes.
+        self._escalation = None
+        self.escalation_history = []
+        self.escalations_raised = 0
 
     def state(self, now):
         """Bed state at elapsed time ``now``.
@@ -138,6 +147,7 @@ class Monitor:
             self.pending_since = None
         self.awaiting_cleaning = False
         self._record_alarm_transitions([], now)
+        self._close_escalation(now)
         self.meds.reset()
         self.admitted = False
         self.cleaning_until = round(now + cleaning_s, 3)
@@ -236,6 +246,13 @@ class Monitor:
             # A missed dose raises an alarm until that medication's
             # next dose is given.
             reading["alarms"] = reading["alarms"] + ["missed_dose"]
+        # NEWS2 early-warning score for this tick's vitals. The
+        # score is a parallel track to the alarm list: it never
+        # adds or removes an alarm, so alarm counts and readiness
+        # are exactly as before — it only records how sick the
+        # patient looks on the NEWS2 scale.
+        reading["news2"] = score_signs(self.signs)
+        self._track_escalation(reading["news2"], now)
         self._record_alarm_transitions(reading["alarms"], now)
         self.last_reading = reading
         return reading
@@ -273,6 +290,70 @@ class Monitor:
             # clock keeps running from admission or the last clear.)
             self._stable_since = now
         self._active_alarms = current
+
+    def _track_escalation(self, news2, now):
+        """Open, update, or close the deterioration episode.
+
+        An episode is open while the NEWS2 risk is medium or high.
+        It records when it raised, the worst score it reached, and
+        the worst risk — so a client can see a patient who was
+        briefly high and came back, not just where they are now.
+        """
+        now = round(now, 3)
+        risk = news2["risk"]
+        if risk == "low":
+            self._close_escalation(now)
+            return
+        if self._escalation is None:
+            self._escalation = {
+                "raised_t": now,
+                "cleared_t": None,
+                "peak_score": news2["score"],
+                "peak_risk": risk,
+            }
+            self.escalations_raised += 1
+        else:
+            if news2["score"] > self._escalation["peak_score"]:
+                self._escalation["peak_score"] = news2["score"]
+            if risk == "high":
+                self._escalation["peak_risk"] = "high"
+
+    def _close_escalation(self, now):
+        """Close the open deterioration episode, if any."""
+        if self._escalation is not None:
+            self._escalation["cleared_t"] = round(now, 3)
+            self.escalation_history.append(self._escalation)
+            self._escalation = None
+
+    def news2_detail(self, now):
+        """Per-patient early-warning state as plain JSON data.
+
+        ``news2`` is the score from the latest reading (None while
+        the bed has no patient or no reading yet); ``escalated`` is
+        True while a deterioration episode is open; ``episodes``
+        lists the closed ones with raised/cleared times and peak
+        score and risk.
+        """
+        reading = self.last_reading
+        offline = (
+            self.offline_until is not None and now < self.offline_until
+        )
+        news2 = (
+            reading.get("news2")
+            if reading is not None and self.admitted and not offline
+            else None
+        )
+        episodes = [dict(e) for e in self.escalation_history]
+        if self._escalation is not None:
+            episodes.append(dict(self._escalation))
+        return {
+            "bed": self.bed_id,
+            "admitted": self.admitted,
+            "news2": news2,
+            "escalated": self._escalation is not None,
+            "escalations_raised": self.escalations_raised,
+            "episodes": episodes,
+        }
 
     def stable_s(self, now):
         """Seconds the patient's vitals have been alarm-free: since

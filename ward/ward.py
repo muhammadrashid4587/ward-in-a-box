@@ -237,7 +237,7 @@ class Ward:
                         lead_time_s=self.readiness.auto_order_lead_time_s,
                         source="auto",
                     )
-        snap = {"t": self.elapsed, "beds": readings, "staffing": self.staffing.summary(self.elapsed, occupied), "turnover": self.turnover_summary(), "meds": self.meds_summary(), "triage": self.triage_summary(), "arrivals": self.arrivals_summary(), "discharge": self.discharge_summary(), "discharge_readiness": self.readiness_summary()}
+        snap = {"t": self.elapsed, "beds": readings, "staffing": self.staffing.summary(self.elapsed, occupied), "turnover": self.turnover_summary(), "meds": self.meds_summary(), "triage": self.triage_summary(), "arrivals": self.arrivals_summary(), "discharge": self.discharge_summary(), "discharge_readiness": self.readiness_summary(), "early_warning": self.early_warning_summary()}
         with self._lock:
             self.latest = snap
         if self.recorder is not None:
@@ -355,6 +355,28 @@ class Ward:
             "ready": sum(1 for b in beds if b["ready"]),
             "not_ready": sum(
                 1 for b in beds if b["admitted"] and not b["ready"]
+            ),
+        }
+
+    def early_warning_summary(self):
+        """Per-patient NEWS2 scores and deterioration episodes."""
+        beds = [m.news2_detail(self.elapsed) for m in self.monitors]
+        scored = [b for b in beds if b["news2"] is not None]
+        return {
+            "t": self.elapsed,
+            "beds": beds,
+            "high_risk": sum(
+                1 for b in scored if b["news2"]["risk"] == "high"
+            ),
+            "medium_risk": sum(
+                1 for b in scored if b["news2"]["risk"] == "medium"
+            ),
+            "low_risk": sum(
+                1 for b in scored if b["news2"]["risk"] == "low"
+            ),
+            "escalated": sum(1 for b in beds if b["escalated"]),
+            "escalations_raised": sum(
+                b["escalations_raised"] for b in beds
             ),
         }
 

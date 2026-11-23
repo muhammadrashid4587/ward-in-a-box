@@ -91,6 +91,11 @@ python3 -m ward.cli scenarios/discharge-auto-order.json --seed 42
 # beds discharge 2 s after flagging ready, not 5 s after
 python3 -m ward.cli scenarios/discharge-auto-order-lead-time.json --seed 42
 
+# Early warning: a hypoxic patient sits at medium NEWS2 risk, a
+# febrile patient deteriorates on its own, and an alarm storm at
+# 10 s pushes the febrile patient to high risk
+python3 -m ward.cli scenarios/news2.json --seed 42
+
 # Reproducible run
 python3 -m ward.cli scenarios/example.json --seed 42
 ```
@@ -130,6 +135,9 @@ python3 -m ward.cli scenarios/example.json --seed 42
   awaiting a slot, as JSON (503 while partitioned)
 - `GET /discharge-readiness` — per-patient discharge-readiness
   flags (see below), as JSON (503 while partitioned)
+- `GET /news2` — per-patient NEWS2 early-warning scores and
+  deterioration episodes (see below), as JSON (503 while
+  partitioned)
 
 A reading looks like:
 
@@ -159,8 +167,9 @@ Each frame carries the same snapshot as `/snapshot` plus the alarm
 summary from `/alarms`, the staffing summary from `/staffing`, the
 medication summary from `/meds`, the triage summary from
 `/triage`, the live arrivals view from `/arrivals`, the
-discharge summary from `/discharge`, and the discharge-readiness
-summary from `/discharge-readiness`, so a client gets bed occupancy, vitals, alarms, staffing,
+discharge summary from `/discharge`, the discharge-readiness
+summary from `/discharge-readiness`, and the early-warning
+summary from `/news2`, so a client gets bed occupancy, vitals, alarms, staffing,
 medication, and the intake queue in one message. Ping frames are answered with pong, close frames
 are echoed and the connection is then closed; text frames from the
 client are accepted and ignored — the ward pushes ticks, it takes no
@@ -778,6 +787,56 @@ window, a 5-second planner default, and a 2-second override, beds
 (missed insulin) never flags ready and gets no order — 3 auto
 orders, 3 discharges, a mean ready-to-discharge time of 2.0 s.
 
+## NEWS2 early-warning scoring
+
+Every reading carries a NEWS2 score — the Royal College of
+Physicians' National Early Warning Score 2 — computed from that
+tick's vitals:
+
+```json
+{"news2": {"score": 6, "risk": "medium", "red_score": true,
+ "components": {"resp_rate": 2, "spo2": 3, "systolic": 0,
+ "heart_rate": 1, "temperature": 0},
+ "response": "urgent review by ward team (hourly monitoring)"}}
+```
+
+Each of the five scored parameters contributes 0 to 3 points on
+the standard NEWS2 bands (respiratory rate, SpO2 on Scale 1,
+systolic blood pressure, heart rate, temperature). The aggregate
+drives the risk: 0-4 low, 5-6 medium, 7 or more high — and any
+single parameter scoring 3 is a red score, which makes the risk
+medium even when the aggregate is low. The response is NEWS2's
+own: routine monitoring at low risk, urgent review by the ward
+team at medium, urgent review by the critical care team at high.
+
+Two honest limitations. Consciousness (ACVPU) is not scored: the
+simulator generates no consciousness state, so a ward score is a
+partial NEWS2, missing one of its six parameters. And SpO2 uses
+Scale 1 only, because the ward has no oxygen-therapy state for
+Scale 2 to apply to. The score is advisory only — a test signal
+for health software, not a clinical judgement.
+
+A patient whose risk leaves low opens a deterioration episode:
+it records when it raised, the worst score it reached, and the
+worst risk, and it closes when the risk returns to low (or when
+the patient is discharged). Every snapshot carries an
+`"early_warning"` object with the per-bed scores, whether an
+episode is open, the episode history, and ward totals (beds at
+each risk level, open episodes, episodes raised), served on its
+own by `GET /news2` and carried in every WebSocket frame, and
+the run summary (`--summary`) reports the same totals from the
+last tick. The score never touches the alarm list: a hypoxic
+patient's alarms are exactly the ones their vitals raise, so
+alarm counts, alarm rates, and discharge readiness are
+unchanged. See `scenarios/news2.json` for a runnable example:
+over a seeded 40-tick run the stable bed scores 0 and never
+escalates, the hypoxic bed sits at medium risk on a red SpO2
+score and stays escalated from 1 s, the tachycardic bed stays
+low, and the febrile bed deteriorates on its own (a medium
+episode at 5-9 s) and then goes high under the alarm storm at
+10 s, peaking at 11 and clearing at 40 s — 3 episodes raised in
+total.
+
 ## Recording a run
 
 `--record FILE` writes every tick to a JSONL file: a header line with
@@ -801,7 +860,7 @@ endpoints returned 503 while it lasted, the ticks did not stop.
 make test
 ```
 
-201 tests: vitals stay inside plausible ranges, dropout actually stops a
+212 tests: vitals stay inside plausible ranges, dropout actually stops a
 monitor's stream, an alarm storm produces alarms, stale readings freeze,
 a partition blocks the snapshot endpoint, the HTTP endpoints serve valid
 JSON, the stream serves JSON lines, scenario files validate, alarm
@@ -960,7 +1019,19 @@ value and of a bad scenario value, the override in the readiness
 summary and the run summary, and the
 `discharge-auto-order-lead-time.json` scenario raising 3 auto
 orders and discharging 3 beds with a mean ready-to-discharge time
-of 2.0 s.
+of 2.0 s. NEWS2 tests cover every component's band boundaries, the
+aggregate risk levels and the red-score rule, a stable bed scoring
+low and a hypoxic bed scoring medium on a red SpO2 score, the score
+never adding an alarm to the alarm list, an alarm storm pushing a
+febrile patient to high risk with the episode recording its peak
+score and clearing after the storm, a hypoxic patient staying
+escalated, a discharge closing an open episode, no score while a
+bed is offline or unadmitted, the early-warning summary in
+snapshots, the `GET /news2` endpoint (503 while partitioned), and
+WebSocket frames, the run summary carrying the early-warning
+totals, and the `news2.json` scenario raising 3 episodes over a
+seeded run (a medium one on the hypoxic bed, a medium and a high
+one on the febrile bed, the high one peaking at 11).
 
 ## Roadmap
 
@@ -1036,3 +1107,10 @@ of 2.0 s.
   planner default, surfaced in the readiness summary, every
   snapshot, WebSocket frame, `GET /discharge-readiness`, and the
   run summary) — done in v0.22.0
+- NEWS2 early-warning scoring (a NEWS2 score on every reading
+  with per-parameter components, aggregate risk, and the red-score
+  rule, deterioration episodes with raised/cleared times and peak
+  score and risk, in every snapshot, WebSocket frame, a
+  `GET /news2` endpoint, and the run summary; consciousness not
+  scored and SpO2 on Scale 1 only, documented as limitations;
+  the score never touches the alarm list) — done in v0.23.0
