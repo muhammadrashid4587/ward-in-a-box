@@ -94,7 +94,12 @@ class MedSchedule:
     their administration time (or the end of their grace window)
     arrives. ``missed_active`` holds the names of medications with a
     missed dose not yet followed by a given one — the monitor turns
-    that into a ``missed_dose`` alarm.
+    that into a ``missed_dose`` alarm. A dose that falls due while its
+    medication is stocked out (``stockout_meds`` passed to ``tick``)
+    is skipped at once: it is recorded in the history with status
+    ``stockout``, counted separately, and also flagged in
+    ``missed_active``, because a skipped dose is a missed dose from
+    the patient's point of view.
     """
 
     def __init__(self, bed_id, meds=None):
@@ -112,7 +117,10 @@ class MedSchedule:
         self.given = 0
         self.late = 0
         self.missed = 0
+        self.stockout = 0
         self.missed_active = set()
+        # Medications currently stocked out (set by tick's caller).
+        self.stockout_active = set()
 
     def reset(self):
         """Clear all schedule state (a new patient takes the bed)."""
@@ -122,16 +130,36 @@ class MedSchedule:
         self.given = 0
         self.late = 0
         self.missed = 0
+        self.stockout = 0
         self.missed_active = set()
+        self.stockout_active = set()
 
-    def tick(self, now, load_factor):
-        """Advance doses due by ``now`` under this staffing load."""
+    def tick(self, now, load_factor, stockout_meds=()):
+        """Advance doses due by ``now`` under this staffing load.
+
+        ``stockout_meds`` is the set of medication names (lower-case)
+        the pharmacy currently has none of: doses of those that fall
+        due are skipped, not queued.
+        """
         now = round(now, 3)
+        canonical = {m["name"].lower(): m["name"] for m in self.meds}
+        self.stockout_active = {
+            canonical[m] for m in (s.lower() for s in stockout_meds)
+            if m in canonical
+        }
         for med in self.meds:
             name = med["name"]
             while self._next_due[name] <= now:
                 due_t = round(self._next_due[name], 3)
                 self._next_due[name] = round(due_t + self._every[name], 3)
+                if name in self.stockout_active:
+                    self.history.append(
+                        {"med": name, "due_t": due_t, "admin_t": None,
+                         "status": "stockout", "delay_s": None}
+                    )
+                    self.stockout += 1
+                    self.missed_active.add(name)
+                    continue
                 delay = round(BASE_ADMIN_S * load_factor, 3)
                 admin_t = round(due_t + delay, 3)
                 if admin_t <= round(due_t + self._grace[name], 3):
@@ -177,8 +205,10 @@ class MedSchedule:
                 "given": self.given,
                 "late": self.late,
                 "missed": self.missed,
+                "stockout": self.stockout,
                 "pending": len(self._pending),
             },
             "missed_active": sorted(self.missed_active),
+            "stockouts": sorted(self.stockout_active),
             "history": [dict(h) for h in self.history],
         }

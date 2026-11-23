@@ -1,22 +1,33 @@
 """Chaos events: device dropout, alarm storms, stale readings, partitions,
-discharges."""
+discharges, pharmacy stockouts."""
 
-VALID_TYPES = ("dropout", "alarm_storm", "stale", "partition", "discharge")
+VALID_TYPES = ("dropout", "alarm_storm", "stale", "partition", "discharge", "stockout")
 
 
 class ChaosEvent:
     """One chaos event.
 
-    ``type`` is one of dropout, alarm_storm, stale, partition, discharge.
-    ``at`` is the start time in elapsed seconds, ``duration`` in seconds.
-    ``bed`` targets one bed; ``beds`` targets several. ``partition`` is
-    ward-wide and ignores bed/beds. ``discharge`` is instant — it fires
-    once at ``at`` and ``duration`` is ignored, so it may be omitted.
+    ``type`` is one of dropout, alarm_storm, stale, partition, discharge,
+    stockout. ``at`` is the start time in elapsed seconds, ``duration``
+    in seconds. ``bed`` targets one bed; ``beds`` targets several.
+    ``partition`` is ward-wide and ignores bed/beds. ``discharge`` is
+    instant — it fires once at ``at`` and ``duration`` is ignored, so it
+    may be omitted. ``stockout`` needs ``med`` (the medication name,
+    matched case-insensitively): while it is active, doses of that
+    medication due on the target beds are skipped — recorded as
+    ``stockout`` in the dose history, counted in the medication
+    metrics, and flagged with a ``missed_dose`` alarm — because the
+    pharmacy has none to give. Doses already pending when the stockout
+    starts still resolve normally; only doses that fall due inside the
+    window are skipped.
     """
 
-    def __init__(self, type, at, duration=None, bed=None, beds=None):
+    def __init__(self, type, at, duration=None, bed=None, beds=None, med=None):
         if type not in VALID_TYPES:
             raise ValueError("unknown chaos type: %r" % type)
+        if type == "stockout":
+            if not isinstance(med, str) or not med.strip():
+                raise ValueError("stockout needs a medication name, got %r" % (med,))
         if type == "discharge":
             duration = 0 if duration is None else duration
             if duration < 0:
@@ -30,6 +41,7 @@ class ChaosEvent:
         self.duration = float(duration)
         self.bed = bed
         self.beds = list(beds) if beds is not None else None
+        self.med = med.strip().lower() if isinstance(med, str) else None
 
     @property
     def end(self):
@@ -54,6 +66,23 @@ class ChaosEngine:
         self.events = list(events)
         # Discharge events fire once, when their time is reached.
         self._discharged = set()
+
+    def stockouts(self, ward, now):
+        """Active pharmacy stockouts: ``{bed_id: {med, ...}}``.
+
+        Only beds that actually have the stocked-out medication in
+        their schedule are listed, so a ward-wide stockout of insulin
+        does not flag beds with no insulin prescribed.
+        """
+        out = {}
+        for ev in self.events:
+            if ev.type != "stockout" or not ev.active(now):
+                continue
+            for b in ev.targets(ward):
+                meds = ward.monitors[b].meds.meds
+                if any(m["name"].lower() == ev.med for m in meds):
+                    out.setdefault(b, set()).add(ev.med)
+        return out
 
     def apply(self, ward, now):
         ward.partitioned = any(

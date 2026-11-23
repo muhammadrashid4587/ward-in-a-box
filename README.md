@@ -50,6 +50,9 @@ python3 -m ward.cli scenarios/turnover.json --seed 42
 # Medication: interaction warnings up front, insulin missed on thin nights
 python3 -m ward.cli scenarios/meds.json --seed 42
 
+# Pharmacy stockout: insulin unavailable 5-3005 s, two doses skipped
+python3 -m ward.cli scenarios/stockout.json --seed 42
+
 # Reproducible run
 python3 -m ward.cli scenarios/example.json --seed 42
 ```
@@ -182,6 +185,13 @@ Chaos types:
 - `discharge` — the target beds' patients are discharged at `at`
   (instant, so `duration` is ignored and may be omitted); see
   Bed turnover below.
+- `stockout` — the pharmacy runs out of a medication for `duration`
+  seconds; needs `"med"`. Doses of that medication that fall due on
+  the target beds while the stockout is active are skipped, recorded
+  with status `stockout` in the dose history, counted in the
+  medication metrics, and flagged with a `missed_dose` alarm; see
+  Pharmacy stockouts below. Without `bed`/`beds` it applies to every
+  bed that has the medication prescribed.
 
 `bed` targets one bed, `beds` targets several, neither targets all beds
 (`partition` is always ward-wide). Times are elapsed seconds from start.
@@ -323,6 +333,31 @@ lisinopril and spironolactone. Over a seeded 7200-tick run the day
 shift gives every dose, the night shift (one nurse for twelve beds)
 misses the insulin dose, and 2 interaction warnings are raised.
 
+## Pharmacy stockouts
+
+A `stockout` chaos event makes one medication unavailable for a
+window:
+
+```json
+{"type": "stockout", "med": "insulin", "bed": 1, "at": 5, "duration": 3000}
+```
+
+A dose of that medication that falls due while the stockout is active
+is skipped at once — it is never queued for administration. The
+skipped dose is recorded in the dose history with status `stockout`
+(`admin_t` null), counted separately in the per-bed dose counts and
+the ward `total_stockout`, and it raises a `missed_dose` alarm on the
+bed until that medication's next dose is given, exactly like a dose
+missed for staffing reasons. The per-bed summary also lists the
+medications currently stocked out (`"stockouts"`), so a client can
+tell a skipped dose from a staffing miss. Doses already pending when
+the stockout starts still resolve normally; only doses that fall due
+inside the window are skipped. See `scenarios/stockout.json` for a
+runnable example: over a seeded 3700-tick run the insulin doses due
+at 1200 s and 2400 s are skipped while the pharmacy is out, the
+doses due at 0 s and 3600 s are given, and the metoprolol on the
+other bed is unaffected.
+
 ## Recording a run
 
 `--record FILE` writes every tick to a JSONL file: a header line with
@@ -346,7 +381,7 @@ endpoints returned 503 while it lasted, the ticks did not stop.
 make test
 ```
 
-96 tests: vitals stay inside plausible ranges, dropout actually stops a
+101 tests: vitals stay inside plausible ranges, dropout actually stops a
 monitor's stream, an alarm storm produces alarms, stale readings freeze,
 a partition blocks the snapshot endpoint, the HTTP endpoints serve valid
 JSON, the stream serves JSON lines, scenario files validate, alarm
@@ -392,7 +427,12 @@ missed dose raising a `missed_dose` alarm in the bed's reading, the
 `/meds` endpoint (503 while partitioned), a discharge resetting the
 medication state, interaction warnings for warfarin + aspirin and
 lisinopril + spironolactone, and the `meds.json` scenario giving 7
-doses and missing 1 over a seeded run.
+doses and missing 1 over a seeded run. Stockout tests cover the event
+requiring a medication name, a dose skipped at once with status
+`stockout` and a `missed_dose` alarm that clears on the next given
+dose, a stockout affecting only that medication, and the
+`stockout.json` scenario skipping 2 insulin doses and giving 4 over
+a seeded run.
 
 ## Roadmap
 
@@ -405,3 +445,7 @@ doses and missing 1 over a seeded run.
 - Medication administration (scheduled doses, staffing-driven late
   and missed doses with missed-dose alarms, interaction warnings) —
   done in v0.9.0
+- Pharmacy stockouts (a chaos event that makes a medication
+  unavailable, skipping due doses, recording them as `stockout` in
+  the dose history and metrics, and flagging a `missed_dose` alarm) —
+  done in v0.10.0

@@ -1291,6 +1291,97 @@ class TestMeds(unittest.TestCase):
         self.assertEqual(summary["total_missed"], 1)
         self.assertEqual(summary["beds"][1]["doses"]["missed"], 1)
 
+    def test_stockout_event_requires_a_medication(self):
+        from ward.chaos import ChaosEvent
+
+        for bad in (None, "", "   ", 42):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                ChaosEvent("stockout", 5, 60, med=bad)
+        ev = ChaosEvent("stockout", 5, 60, med="Insulin")
+        self.assertEqual(ev.med, "insulin")
+        with self.assertRaises(ValueError):
+            ChaosEvent("stockout", 5, 0, med="insulin")
+
+    def test_dose_skipped_during_stockout(self):
+        from ward.meds import MedSchedule
+
+        sched = MedSchedule(0, [
+            {"name": "insulin", "every_s": 3600, "first_at": 0},
+        ])
+        sched.tick(0, 1.0, {"insulin"})
+        self.assertEqual(sched.stockout, 1)
+        self.assertEqual(sched.given, 0)
+        self.assertEqual(sched.history[0]["status"], "stockout")
+        self.assertIsNone(sched.history[0]["admin_t"])
+        self.assertEqual(sched.missed_active, {"insulin"})
+        self.assertEqual(sched.stockout_active, {"insulin"})
+        # Next dose, after the stockout ends, is given and clears the flag.
+        sched.tick(3600, 1.0)
+        self.assertEqual(sched.stockout_active, set())
+        sched.tick(3630, 1.0)
+        self.assertEqual(sched.given, 1)
+        self.assertEqual(sched.missed_active, set())
+        self.assertEqual(sched.history[1]["status"], "given")
+
+    def test_stockout_raises_missed_dose_alarm_and_counts(self):
+        from ward.chaos import ChaosEvent
+
+        ward = Ward(
+            beds=1,
+            meds=[[{"name": "insulin", "every_s": 3600, "first_at": 0}]],
+            chaos=[ChaosEvent("stockout", 0, 60, bed=0, med="insulin")],
+            seed=42,
+        )
+        snap = ward.tick()  # t=1: insulin due at 0, pharmacy is out
+        self.assertIn("missed_dose", snap["beds"][0]["alarms"])
+        self.assertEqual(snap["meds"]["beds"][0]["stockouts"], ["insulin"])
+        self.assertEqual(ward.meds_summary()["total_stockout"], 1)
+        history = ward.monitors[0].alarm_history
+        self.assertTrue(any(e["alarm"] == "missed_dose" for e in history))
+        for _ in range(60):
+            ward.tick()  # stockout over at t=60
+        self.assertEqual(
+            ward.meds_summary()["beds"][0]["stockouts"], []
+        )
+
+    def test_stockout_only_affects_that_medication(self):
+        from ward.chaos import ChaosEvent
+
+        ward = Ward(
+            beds=2,
+            meds=[
+                [{"name": "metoprolol", "every_s": 3600, "first_at": 0}],
+                [{"name": "insulin", "every_s": 3600, "first_at": 0}],
+            ],
+            chaos=[ChaosEvent("stockout", 0, 3600, med="insulin")],
+            seed=42,
+        )
+        for _ in range(40):
+            ward.tick()
+        summary = ward.meds_summary()
+        self.assertEqual(summary["beds"][0]["doses"]["given"], 1)
+        self.assertEqual(summary["beds"][0]["doses"]["stockout"], 0)
+        self.assertEqual(summary["beds"][1]["doses"]["given"], 0)
+        self.assertEqual(summary["beds"][1]["doses"]["stockout"], 1)
+        self.assertEqual(summary["total_stockout"], 1)
+
+    def test_scenario_stockout(self):
+        cfg = load_scenario(os.path.join(HERE, "..", "scenarios", "stockout.json"))
+        ward = build_ward(cfg, seed=42)
+        for _ in range(3700):
+            ward.tick()
+        summary = ward.meds_summary()
+        # Insulin due at 0 is given; due at 1200 and 2400 fall inside
+        # the 5-3005 s stockout and are skipped; due at 3600 is given.
+        self.assertEqual(summary["beds"][1]["doses"]["stockout"], 2)
+        self.assertEqual(summary["beds"][1]["doses"]["given"], 2)
+        self.assertEqual(summary["total_stockout"], 2)
+        self.assertEqual(summary["total_given"], 4)
+        self.assertEqual(
+            [h["status"] for h in summary["beds"][1]["history"]],
+            ["given", "stockout", "stockout", "given"],
+        )
+
     def test_scenario_rejects_bad_meds(self):
         for patients in (
             [{"meds": [{"name": "insulin", "every_s": 0}]}],

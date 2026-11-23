@@ -1,0 +1,1 @@
+{"beds":2,"chaos":[{"at":5,"bed":1,"duration":3000,"med":"insulin","type":"stockout"}],"host":"127.0.0.1","patients":[{"bed":0,"meds":[{"every_s":3600,"first_at":0,"name":"metoprolol"}],"profile":"stable"},{"bed":1,"meds":[{"every_s":1200,"first_at":0,"name":"insulin"}],"profile":"tachycardic"}],"port":8080,"rate_hz":1.0}

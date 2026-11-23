@@ -101,10 +101,11 @@ class Ward:
         online = []
         occupied = sum(1 for m in self.monitors if m.admitted)
         load_factor = self.staffing.load_factor(occupied, self.elapsed)
+        stockouts = self.chaos.stockouts(self, self.elapsed)
         for m in self.monitors:
             # Medication first, so a missed dose raises its alarm in
             # this tick's reading rather than the next one.
-            m.meds_tick(self.elapsed, load_factor)
+            m.meds_tick(self.elapsed, load_factor, stockouts.get(m.bed_id, ()))
             r = m.tick(self.elapsed, dt)
             if r is None:
                 entry = {"bed": m.bed_id, "online": False, "t": self.elapsed}
@@ -184,6 +185,7 @@ class Ward:
             "total_given": sum(b["doses"]["given"] for b in beds),
             "total_late": sum(b["doses"]["late"] for b in beds),
             "total_missed": sum(b["doses"]["missed"] for b in beds),
+            "total_stockout": sum(b["doses"]["stockout"] for b in beds),
             "total_warnings": sum(len(b["warnings"]) for b in beds),
         }
 

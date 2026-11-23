@@ -115,10 +115,10 @@ class Monitor:
         self.admitted = True
         self.meds.reset()
 
-    def meds_tick(self, now, load_factor):
+    def meds_tick(self, now, load_factor, stockout_meds=()):
         """Advance the medication schedule (no-op while unadmitted)."""
         if self.admitted:
-            self.meds.tick(now, load_factor)
+            self.meds.tick(now, load_factor, stockout_meds)
 
     def turnover_summary(self, now):
         """Per-bed turnover state and totals as plain JSON data."""
