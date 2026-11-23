@@ -1,0 +1,1 @@
+{"beds":2,"chaos":[{"at":5,"bed":0,"type":"discharge"},{"at":8,"bed":1,"type":"discharge"}],"cleaning_s":10,"patients":[{"bed":0,"profile":"stable"},{"bed":1,"profile":"tachycardic"}],"rate_hz":1.0,"triage":{"arrivals":[{"acuity":3,"at":0,"profile":"stable"},{"acuity":3,"at":1,"profile":"febrile"},{"acuity":1,"at":2,"profile":"hypoxic"}],"boarding_capacity":1,"capacity":1}}

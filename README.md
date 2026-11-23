@@ -65,6 +65,10 @@ python3 -m ward.cli scenarios/wait-alarm.json --seed 42
 # up after discharge and cleaning
 python3 -m ward.cli scenarios/arrivals.json --seed 42
 
+# ED boarding: one patient queues, one boards in the ED, a third is
+# diverted; the boarded patient takes the first freed bed
+python3 -m ward.cli scenarios/boarding.json --seed 42
+
 # Reproducible run
 python3 -m ward.cli scenarios/example.json --seed 42
 ```
@@ -489,7 +493,8 @@ own by `GET /arrivals` and included in every WebSocket frame:
 ```json
 {"t": 600.0, "arrival_rate_per_hour": 180.0, "arrivals_last_hour": 178,
  "arrivals_total": 178, "arrivals_by_hour": {"8": 178},
- "waiting_total": 3, "capacity": 8, "admitted": 2, "diverted": 0,
+ "waiting_total": 3, "capacity": 8, "boarding_total": 0,
+ "boarding_capacity": 0, "boarded": 0, "admitted": 2, "diverted": 0,
  "diverted_last_hour": 0, "diverting": false}
 ```
 
@@ -499,11 +504,51 @@ count). `arrivals_last_hour` counts arrivals in the trailing hour
 of ward time, `(now - 3600, now]`, so it slides forward as the ward
 runs; `arrivals_total` counts every patient who showed up, whether
 they joined the queue or were diverted. `diverting` is true while
-the queue is full and new arrivals are being turned away, with
-`diverted` and `diverted_last_hour` counting them. Over a seeded
-60-tick run of `scenarios/arrivals.json` the view reports 3
-arrivals in the last hour, all in hour 8, matching the triage
-summary.
+the queue is full and boarding is full too, so new arrivals are
+being turned away, with `diverted` and `diverted_last_hour`
+counting them; `boarding_total`, `boarding_capacity`, and
+`boarded` say how many patients are boarding now, how many
+boarding spots the ED has, and how many have boarded in total
+(see ED boarding below). Over a seeded 60-tick run of
+`scenarios/arrivals.json` the view reports 3 arrivals in the last
+hour, all in hour 8, matching the triage summary.
+
+## ED boarding (overflow)
+
+When the intake queue is full, a patient is not always diverted: if
+the scenario sets a `boarding_capacity` on its `triage` block, the
+patient boards instead — they wait in the ED for an inpatient bed,
+up to that many boarded patients at once. Boarding is off by
+default (`boarding_capacity` 0), so scenarios that do not set it
+behave exactly as before.
+
+```json
+{"triage": {"capacity": 1, "boarding_capacity": 1, "arrivals": [...]}}
+```
+
+A boarded patient is already admitted to the hospital, so when a
+bed frees up they take it before a patient still waiting in the
+intake queue — within each group the usual triage priority applies
+(lowest acuity first, earliest arrival first). Boarded patients
+raise the same wait-time alarms as queued ones, marked
+`"boarding": true` in the wait-alarm history, and their waits are
+tracked separately (`mean_boarding_wait_s`, `max_boarding_wait_s`,
+`longest_boarding_wait_s`). The triage summary lists the boarded
+patients, the boarding total and capacity, and how many have
+boarded in total; the live arrivals view carries the same counts,
+and `diverting` is true only when the queue and boarding are both
+full. See `scenarios/boarding.json` for a runnable example: over a
+seeded run three patients arrive while the ward is full — one
+queues, one boards, the critical third is diverted — and the
+boarded patient takes the bed freed at 15 s after waiting 14 s,
+while the queued patient takes the bed freed at 18 s after
+waiting 18 s.
+
+Limitation: boarding is an overflow buffer, not a second ward.
+Boarded patients get no vitals, no medication schedules, and no
+bedside monitor until they are admitted to a bed — the model only
+tracks that they are waiting, how long, and whether they raised a
+wait-time alarm.
 
 ## Recording a run
 
@@ -528,7 +573,7 @@ endpoints returned 503 while it lasted, the ticks did not stop.
 make test
 ```
 
-137 tests: vitals stay inside plausible ranges, dropout actually stops a
+148 tests: vitals stay inside plausible ranges, dropout actually stops a
 monitor's stream, an alarm storm produces alarms, stale readings freeze,
 a partition blocks the snapshot endpoint, the HTTP endpoints serve valid
 JSON, the stream serves JSON lines, scenario files validate, alarm
@@ -617,7 +662,17 @@ exactly an hour old, the rate appearing once the Poisson model
 ticks, the view in snapshots and the `GET /arrivals` endpoint
 (503 while partitioned) with the count growing as the ward ticks,
 and WebSocket frames carrying the view with the count growing
-frame to frame.
+frame to frame. Boarding tests cover overflow into boarding when
+the queue is full and diversion only once boarding is full too,
+boarding off by default, a boarded patient taking a freed bed
+before a queued one, boarded patients raising wait-time alarms
+(marked as boarding in the history) and the alarm clearing on
+admission, boarding wait metrics, validation of the boarding
+capacity, the live arrivals view carrying boarding counts and
+`diverting` only when queue and boarding are both full, boarding
+in snapshots and the `GET /arrivals` endpoint, and the
+`boarding.json` scenario admitting the boarded patient at 15 s
+and the queued patient at 18 s.
 
 ## Roadmap
 
@@ -655,3 +710,8 @@ frame to frame.
   and diversion status, in every snapshot, WebSocket frame, and a
   `GET /arrivals` endpoint, updating as arrivals happen) — done in
   v0.15.0
+- ED boarding / overflow (when the intake queue is full, patients
+  board in the ED up to a configured capacity instead of being
+  diverted, take freed beds before queued patients, raise the same
+  wait-time alarms, with boarding counts and wait metrics in the
+  triage summary and live arrivals view) — done in v0.16.0

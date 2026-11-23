@@ -10,6 +10,15 @@ queue is full when a patient arrives, that patient is diverted
 
 Arrivals can be scheduled in a scenario (``{"at": t, "acuity": n,
 "profile": ...}``) or added live with :meth:`TriageQueue.arrive`.
+
+Boarding: when the queue is full, a patient who would be diverted
+boards instead — they wait in the ED for an inpatient bed — up to
+``boarding_capacity`` (0 by default, so boarding is off unless a
+scenario turns it on). A boarded patient is already admitted to the
+hospital, so when a bed frees up they take it before a patient still
+waiting in the intake queue; within each group the usual triage
+priority applies. Boarded patients raise the same wait-time alarms
+as queued ones, and their waits are tracked separately.
 """
 
 from .arrivals import ArrivalModel
@@ -17,6 +26,11 @@ from .vitals import PROFILES, validate_acuity
 
 # Default intake queue capacity when a scenario does not set one.
 DEFAULT_CAPACITY = 8
+
+# Default boarding capacity: 0, boarding off unless a scenario
+# enables it. Boarding is an overflow for the intake queue, not a
+# second queue — it only ever holds patients the queue could not.
+DEFAULT_BOARDING_CAPACITY = 0
 
 # Default wait-time alarm thresholds, seconds per acuity: a waiting
 # patient raises a wait-time alarm once they have waited this long.
@@ -28,10 +42,20 @@ DEFAULT_WAIT_THRESHOLDS = {1: 300.0, 2: 900.0, 3: 1800.0, 4: 3600.0}
 class TriageQueue:
     """The ED intake queue for one ward."""
 
-    def __init__(self, capacity=DEFAULT_CAPACITY, arrivals=None, wait_thresholds=None, poisson=None, rng=None, seed=None):
+    def __init__(self, capacity=DEFAULT_CAPACITY, boarding_capacity=DEFAULT_BOARDING_CAPACITY, arrivals=None, wait_thresholds=None, poisson=None, rng=None, seed=None):
         if not isinstance(capacity, int) or capacity < 1:
             raise ValueError("triage capacity must be an int >= 1, got %r" % (capacity,))
+        if (
+            not isinstance(boarding_capacity, int)
+            or isinstance(boarding_capacity, bool)
+            or boarding_capacity < 0
+        ):
+            raise ValueError(
+                "triage boarding_capacity must be an int >= 0, got %r"
+                % (boarding_capacity,)
+            )
         self.capacity = capacity
+        self.boarding_capacity = boarding_capacity
         self.wait_thresholds = self._validate_thresholds(wait_thresholds)
         # Optional walk-in arrival model (a Poisson process): a dict
         # configures one, an ArrivalModel is used as-is. ``rng`` is
@@ -64,6 +88,10 @@ class TriageQueue:
         # "profile", "wait_alarm_t"} — "wait_alarm_t" is the time the
         # wait-time alarm was raised, or None while under threshold.
         self.waiting = []
+        # Boarded patients, same shape as waiting: they arrived when
+        # the queue was full and wait in the ED for an inpatient bed.
+        self.boarding = []
+        self.boarded = 0
         # Scheduled arrivals not yet due, sorted by time.
         self._scheduled = []
         for i, a in enumerate(arrivals or []):
@@ -94,8 +122,10 @@ class TriageQueue:
         self._next_scheduled = 0
         self.admitted = 0
         self.diverted = 0
-        # Wait times (seconds) of patients admitted so far.
+        # Wait times (seconds) of patients admitted so far, split by
+        # where they waited: the intake queue, or boarding.
         self._waits = []
+        self._boarding_waits = []
         # Wait-time alarm events: {"acuity", "profile", "arrival_t",
         # "raised_t", "cleared_t"} — cleared when the patient is
         # admitted (or None while the patient still waits).
@@ -147,10 +177,12 @@ class TriageQueue:
     def arrive(self, now, acuity, profile="stable", hour=None):
         """Add a patient arriving at ``now`` to the queue.
 
-        Returns True if the patient joined the queue, False if they
-        were diverted because the queue is full. ``hour`` is the ward
-        clock hour (0-23) the arrival falls in; when given, the
-        arrival counts toward that hour's total even if diverted.
+        Returns True if the patient joined the queue (or boarded when
+        the queue was full and boarding had room), False if they were
+        diverted because both the queue and boarding are full.
+        ``hour`` is the ward clock hour (0-23) the arrival falls in;
+        when given, the arrival counts toward that hour's total even
+        if diverted.
         """
         acuity = validate_acuity(acuity)
         if profile not in PROFILES:
@@ -161,6 +193,17 @@ class TriageQueue:
             h = int(hour) % 24
             self.arrivals_by_hour[h] = self.arrivals_by_hour.get(h, 0) + 1
         if len(self.waiting) >= self.capacity:
+            if len(self.boarding) < self.boarding_capacity:
+                self.boarding.append(
+                    {
+                        "arrival_t": now,
+                        "acuity": acuity,
+                        "profile": profile,
+                        "wait_alarm_t": None,
+                    }
+                )
+                self.boarded += 1
+                return True
             self.diverted += 1
             self._diverted_times.append(now)
             return False
@@ -217,12 +260,16 @@ class TriageQueue:
         A patient's alarm raises at exactly ``arrival_t + threshold``
         for their acuity, once — later ticks do not re-raise it. The
         alarm clears when the patient is admitted (see
-        :meth:`admit_available`). Returns the patients whose alarm
-        was raised by this call.
+        :meth:`admit_available`). Boarded patients raise the same
+        alarms as queued ones; their history events are marked
+        ``"boarding": true``. Returns the patients whose alarm was
+        raised by this call.
         """
         now = round(now, 3)
         raised = []
-        for patient in self.waiting:
+        for patient, boarding in [(p, False) for p in self.waiting] + [
+            (p, True) for p in self.boarding
+        ]:
             if patient["wait_alarm_t"] is not None:
                 continue
             threshold = self.wait_thresholds[patient["acuity"]]
@@ -236,20 +283,23 @@ class TriageQueue:
                         "arrival_t": patient["arrival_t"],
                         "raised_t": raised_t,
                         "cleared_t": None,
+                        "boarding": boarding,
                     }
                 )
                 self.wait_alarms_raised += 1
                 raised.append(patient)
         return raised
 
-    def _priority_order(self):
+    def _priority_order(self, patients=None):
         """Waiting patients, highest triage priority first.
 
         Lowest acuity number first (1 is critical), earliest arrival
-        first within an acuity.
+        first within an acuity. Defaults to the intake queue; pass
+        the boarding list to order boarded patients the same way.
         """
         return sorted(
-            self.waiting, key=lambda p: (p["acuity"], p["arrival_t"])
+            self.waiting if patients is None else patients,
+            key=lambda p: (p["acuity"], p["arrival_t"]),
         )
 
     def admit_available(self, now, ward):
@@ -257,11 +307,22 @@ class TriageQueue:
 
         Returns the list of bed ids filled this call. A patient is
         admitted only to a bed in state ``"available"`` — occupied
-        beds stay occupied and cleaning beds stay cleaning.
+        beds stay occupied and cleaning beds stay cleaning. Boarded
+        patients take freed beds before queued ones, in triage
+        priority order within each group.
         """
         filled = []
-        while self.waiting:
-            patient = self._priority_order()[0]
+        while True:
+            boarding = self._priority_order(self.boarding)
+            waiting = self._priority_order()
+            if boarding:
+                patient = boarding[0]
+                from_boarding = True
+            elif waiting:
+                patient = waiting[0]
+                from_boarding = False
+            else:
+                break
             bed_id = None
             for m in ward.monitors:
                 # Only a bed that has freed up takes a triage patient:
@@ -272,7 +333,10 @@ class TriageQueue:
                     break
             if bed_id is None:
                 break
-            self.waiting.remove(patient)
+            if from_boarding:
+                self.boarding.remove(patient)
+            else:
+                self.waiting.remove(patient)
             if patient["wait_alarm_t"] is not None:
                 # The patient's wait-time alarm clears on admission.
                 for event in reversed(self.wait_alarm_history):
@@ -280,11 +344,16 @@ class TriageQueue:
                         event["cleared_t"] is None
                         and event["arrival_t"] == patient["arrival_t"]
                         and event["acuity"] == patient["acuity"]
+                        and event.get("boarding", False) == from_boarding
                     ):
                         event["cleared_t"] = round(now, 3)
                         break
             ward.admit(bed_id, profile=patient["profile"], acuity=patient["acuity"])
-            self._waits.append(round(now - patient["arrival_t"], 3))
+            wait = round(now - patient["arrival_t"], 3)
+            if from_boarding:
+                self._boarding_waits.append(wait)
+            else:
+                self._waits.append(wait)
             self.admitted += 1
             filled.append(bed_id)
         return filled
@@ -294,12 +363,14 @@ class TriageQueue:
 
         The current walk-in rate, arrivals in the last hour of ward
         time, arrivals per ward clock hour so far, and diversion
-        status — whether the queue is currently full and turning
-        patients away. ``arrivals_total`` counts every patient who
-        showed up (scheduled, walk-in, or added live), including
-        diverted ones; ``arrivals_by_hour`` only counts arrivals
-        given a ward clock hour. The last-hour window is
-        ``(now - 3600, now]``.
+        status — whether new arrivals are being turned away, which
+        now means the queue is full and boarding is full too. Boarding
+        counts ride along: how many patients are boarding now, how
+        many have boarded in total, and how many boarding spots the
+        ED has. ``arrivals_total`` counts every patient who showed up
+        (scheduled, walk-in, or added live), including diverted ones;
+        ``arrivals_by_hour`` only counts arrivals given a ward clock
+        hour. The last-hour window is ``(now - 3600, now]``.
         """
         now = round(now, 3)
         window_start = now - 3600.0
@@ -317,16 +388,21 @@ class TriageQueue:
             },
             "waiting_total": len(self.waiting),
             "capacity": self.capacity,
+            "boarding_total": len(self.boarding),
+            "boarding_capacity": self.boarding_capacity,
+            "boarded": self.boarded,
             "admitted": self.admitted,
             "diverted": self.diverted,
             "diverted_last_hour": len(diverted_recent),
-            "diverting": len(self.waiting) >= self.capacity,
+            "diverting": len(self.waiting) >= self.capacity
+            and len(self.boarding) >= self.boarding_capacity,
         }
 
     def summary(self, now):
         """Queue state and wait metrics as plain JSON data."""
         now = round(now, 3)
         waits = self._waits
+        boarding_waits = self._boarding_waits
         return {
             "t": now,
             "waiting": [
@@ -347,6 +423,21 @@ class TriageQueue:
             },
             "waiting_total": len(self.waiting),
             "capacity": self.capacity,
+            "boarding": [
+                {
+                    "acuity": p["acuity"],
+                    "profile": p["profile"],
+                    "arrival_t": p["arrival_t"],
+                    "wait_s": round(now - p["arrival_t"], 3),
+                    "wait_threshold_s": self.wait_thresholds[p["acuity"]],
+                    "wait_alarm": p["wait_alarm_t"] is not None,
+                    "wait_alarm_t": p["wait_alarm_t"],
+                }
+                for p in self._priority_order(self.boarding)
+            ],
+            "boarding_total": len(self.boarding),
+            "boarding_capacity": self.boarding_capacity,
+            "boarded": self.boarded,
             "admitted": self.admitted,
             "diverted": self.diverted,
             "wait_thresholds_s": {
@@ -354,7 +445,9 @@ class TriageQueue:
             },
             "wait_alarms_raised": self.wait_alarms_raised,
             "wait_alarms_active": sum(
-                1 for p in self.waiting if p["wait_alarm_t"] is not None
+                1
+                for p in list(self.waiting) + list(self.boarding)
+                if p["wait_alarm_t"] is not None
             ),
             "wait_alarm_history": [dict(e) for e in self.wait_alarm_history],
             "arrival_rate_per_hour": self._current_rate,
@@ -376,5 +469,18 @@ class TriageQueue:
                 now - min(p["arrival_t"] for p in self.waiting), 3
             )
             if self.waiting
+            else 0.0,
+            "mean_boarding_wait_s": (
+                round(sum(boarding_waits) / len(boarding_waits), 3)
+                if boarding_waits
+                else 0.0
+            ),
+            "max_boarding_wait_s": (
+                round(max(boarding_waits), 3) if boarding_waits else 0.0
+            ),
+            "longest_boarding_wait_s": round(
+                now - min(p["arrival_t"] for p in self.boarding), 3
+            )
+            if self.boarding
             else 0.0,
         }

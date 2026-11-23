@@ -1731,6 +1731,226 @@ class TestTriage(unittest.TestCase):
             os.unlink(path)
 
 
+class TestBoarding(unittest.TestCase):
+    def _ward(self, beds=2, cleaning_s=10.0, **kw):
+        ward = Ward(beds=beds, cleaning_s=cleaning_s, seed=42, **kw)
+        ward.tick()
+        return ward
+
+    def _full_ward(self):
+        # Queue of 1, boarding of 1, both occupied: one patient
+        # waiting (t=1), one boarding (t=2).
+        ward = self._ward(triage={"capacity": 1, "boarding_capacity": 1})
+        self.assertTrue(ward.triage_arrive(3, "stable"))  # t=1, queue
+        ward.tick()  # t=2
+        self.assertTrue(ward.triage_arrive(3, "febrile"))  # t=2, boards
+        return ward
+
+    def test_boarding_takes_overflow_when_queue_full(self):
+        ward = self._full_ward()
+        summary = ward.triage_summary()
+        self.assertEqual(summary["waiting_total"], 1)
+        self.assertEqual(summary["boarding_total"], 1)
+        self.assertEqual(summary["boarded"], 1)
+        self.assertEqual(summary["boarding_capacity"], 1)
+        self.assertEqual(summary["diverted"], 0)
+        self.assertEqual(summary["boarding"][0]["profile"], "febrile")
+        self.assertEqual(summary["boarding"][0]["arrival_t"], 2.0)
+        self.assertEqual(summary["longest_boarding_wait_s"], 0.0)
+
+    def test_boarding_full_diverts_arrivals(self):
+        ward = self._full_ward()
+        self.assertFalse(ward.triage_arrive(1, "hypoxic"))  # diverted
+        self.assertFalse(ward.triage_arrive(4))  # diverted
+        summary = ward.triage_summary()
+        self.assertEqual(summary["waiting_total"], 1)
+        self.assertEqual(summary["boarding_total"], 1)
+        self.assertEqual(summary["diverted"], 2)
+
+    def test_boarding_off_by_default(self):
+        ward = self._ward(triage={"capacity": 1})
+        self.assertEqual(ward.triage.boarding_capacity, 0)
+        self.assertTrue(ward.triage_arrive(3))
+        self.assertFalse(ward.triage_arrive(3))  # diverted, no boarding
+        self.assertEqual(ward.triage_summary()["boarding_total"], 0)
+        self.assertEqual(ward.triage_summary()["diverted"], 1)
+
+    def test_boarded_patient_admitted_before_queued_patient(self):
+        ward = self._full_ward()
+        ward.discharge(0)  # t=2, bed 0 free at t=12
+        for _ in range(10):
+            ward.tick()
+        snap = ward.tick()  # t=12: the boarded patient takes bed 0,
+        # even though the queued patient arrived first.
+        self.assertEqual(snap["beds"][0]["profile"], "febrile")
+        self.assertEqual(snap["triage"]["boarding_total"], 0)
+        self.assertEqual(snap["triage"]["waiting_total"], 1)
+        self.assertEqual(snap["triage"]["admitted"], 1)
+        self.assertEqual(snap["triage"]["mean_boarding_wait_s"], 10.0)
+        self.assertEqual(snap["triage"]["max_boarding_wait_s"], 10.0)
+        self.assertEqual(snap["triage"]["mean_wait_s"], 0.0)
+        ward.discharge(1)  # t=13, bed 1 free at t=23
+        for _ in range(10):
+            ward.tick()
+        snap = ward.tick()  # t=24: the queued patient takes bed 1.
+        self.assertEqual(snap["beds"][1]["profile"], "stable")
+        self.assertEqual(snap["triage"]["waiting_total"], 0)
+        self.assertEqual(snap["triage"]["admitted"], 2)
+        self.assertEqual(snap["triage"]["mean_wait_s"], 22.0)
+
+    def test_boarded_patient_raises_wait_alarm(self):
+        ward = self._ward(
+            triage={
+                "capacity": 1,
+                "boarding_capacity": 1,
+                "wait_thresholds": {"3": 5},
+            }
+        )
+        ward.triage_arrive(3, "stable")  # t=1, queue
+        ward.tick()  # t=2
+        ward.triage_arrive(3, "febrile")  # t=2, boards
+        for _ in range(4):
+            ward.tick()
+        # t=6: the queued patient (arrived t=1) has waited 5 s and
+        # raised an alarm; the boarded one (arrived t=2) has not.
+        summary = ward.triage_summary()
+        self.assertEqual(summary["wait_alarms_active"], 1)
+        self.assertFalse(summary["boarding"][0]["wait_alarm"])
+        snap = ward.tick()  # t=7: the boarded patient waited 5 s too.
+        self.assertEqual(snap["triage"]["wait_alarms_active"], 2)
+        self.assertEqual(snap["triage"]["wait_alarms_raised"], 2)
+        self.assertTrue(snap["triage"]["boarding"][0]["wait_alarm"])
+        self.assertEqual(snap["triage"]["boarding"][0]["wait_alarm_t"], 7.0)
+        history = snap["triage"]["wait_alarm_history"]
+        self.assertEqual(len(history), 2)
+        self.assertFalse(history[0]["boarding"])
+        self.assertTrue(history[1]["boarding"])
+        self.assertEqual(history[1]["raised_t"], 7.0)
+        # The alarm raises once: a later tick does not re-raise it.
+        ward.tick()  # t=8
+        self.assertEqual(ward.triage_summary()["wait_alarms_raised"], 2)
+
+    def test_boarded_wait_alarm_clears_on_admission(self):
+        ward = self._ward(
+            triage={
+                "capacity": 1,
+                "boarding_capacity": 1,
+                "wait_thresholds": {"3": 5},
+            }
+        )
+        ward.triage_arrive(3, "stable")  # t=1, queue
+        ward.tick()  # t=2
+        ward.triage_arrive(3, "febrile")  # t=2, boards
+        for _ in range(5):
+            ward.tick()
+        # t=7: the boarded patient's alarm has raised.
+        self.assertEqual(ward.triage_summary()["wait_alarms_active"], 2)
+        ward.discharge(0)  # t=7, bed 0 free at t=17
+        for _ in range(10):
+            ward.tick()
+        snap = ward.tick()  # t=17: boarded patient admitted, alarm clears.
+        self.assertEqual(snap["triage"]["wait_alarms_active"], 1)
+        history = snap["triage"]["wait_alarm_history"]
+        boarded = [e for e in history if e["boarding"]]
+        self.assertEqual(len(boarded), 1)
+        self.assertEqual(boarded[0]["cleared_t"], 17.0)
+
+    def test_boarding_wait_metrics(self):
+        ward = self._full_ward()
+        ward.tick()  # t=3
+        ward.tick()  # t=4
+        summary = ward.triage_summary()
+        self.assertEqual(summary["longest_boarding_wait_s"], 2.0)
+        self.assertEqual(summary["mean_boarding_wait_s"], 0.0)
+        self.assertEqual(summary["max_boarding_wait_s"], 0.0)
+
+    def test_boarding_capacity_validation(self):
+        from ward.triage import TriageQueue
+
+        self.assertEqual(TriageQueue().boarding_capacity, 0)
+        for bad in (-1, 1.5, "1", True):
+            with self.assertRaises(ValueError):
+                TriageQueue(boarding_capacity=bad)
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(
+                {"beds": 1, "triage": {"boarding_capacity": -1}}, f
+            )
+            path = f.name
+        try:
+            with self.assertRaises(ValueError):
+                load_scenario(path)
+        finally:
+            os.unlink(path)
+
+    def test_arrivals_view_carries_boarding_and_diverting(self):
+        ward = self._ward(triage={"capacity": 1, "boarding_capacity": 1})
+        view = ward.arrivals_summary()
+        self.assertEqual(view["boarding_total"], 0)
+        self.assertEqual(view["boarding_capacity"], 1)
+        self.assertEqual(view["boarded"], 0)
+        self.assertFalse(view["diverting"])
+        ward.triage_arrive(3)  # t=1, queue full, boarding still open
+        view = ward.arrivals_summary()
+        self.assertFalse(view["diverting"])
+        ward.tick()  # t=2
+        ward.triage_arrive(3)  # t=2, boards: queue and boarding full now
+        view = ward.arrivals_summary()
+        self.assertTrue(view["diverting"])
+        self.assertEqual(view["boarding_total"], 1)
+        self.assertEqual(view["boarded"], 1)
+        self.assertEqual(view["diverted"], 0)
+        ward.triage_arrive(1)  # t=2, diverted
+        view = ward.arrivals_summary()
+        self.assertEqual(view["diverted"], 1)
+        self.assertEqual(view["diverted_last_hour"], 1)
+
+    def test_boarding_in_snapshot_and_arrivals_endpoint(self):
+        ward = self._full_ward()
+        snap = ward.tick()  # t=3
+        self.assertEqual(snap["triage"]["boarding_total"], 1)
+        self.assertEqual(snap["triage"]["boarded"], 1)
+        self.assertEqual(snap["arrivals"]["boarding_total"], 1)
+        self.assertEqual(snap["arrivals"]["boarded"], 1)
+        self.assertTrue(snap["arrivals"]["diverting"])
+        server, port = serve_in_thread(ward)
+        try:
+            status, body = get(port, "/arrivals")
+            self.assertEqual(status, 200)
+            data = json.loads(body)
+            self.assertEqual(data["boarding_total"], 1)
+            self.assertEqual(data["boarding_capacity"], 1)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_scenario_boarding(self):
+        cfg = load_scenario(os.path.join(HERE, "..", "scenarios", "boarding.json"))
+        self.assertEqual(cfg["triage"].capacity, 1)
+        self.assertEqual(cfg["triage"].boarding_capacity, 1)
+        ward = build_ward(cfg, seed=42)
+        ward.tick()  # t=1: first arrival queues, second boards
+        ward.tick()  # t=2: third arrival (critical) diverted
+        summary = ward.triage_summary()
+        self.assertEqual(summary["waiting_total"], 1)
+        self.assertEqual(summary["boarding_total"], 1)
+        self.assertEqual(summary["boarded"], 1)
+        self.assertEqual(summary["diverted"], 1)
+        for _ in range(13):
+            ward.tick()
+        snap = ward.tick()  # t=16: bed 0 freed at t=15, boarded patient in
+        self.assertEqual(snap["beds"][0]["profile"], "febrile")
+        self.assertEqual(snap["triage"]["admitted"], 1)
+        self.assertEqual(snap["triage"]["mean_boarding_wait_s"], 14.0)
+        for _ in range(2):
+            ward.tick()
+        snap = ward.tick()  # t=19: bed 1 freed at t=18, queued patient in
+        self.assertEqual(snap["beds"][1]["profile"], "stable")
+        self.assertEqual(snap["triage"]["admitted"], 2)
+        self.assertEqual(snap["triage"]["mean_wait_s"], 18.0)
+        self.assertEqual(snap["triage"]["waiting_total"], 0)
+        self.assertEqual(snap["triage"]["boarding_total"], 0)
+
+
 class TestPoissonArrivals(unittest.TestCase):
     def test_flat_rate_generates_near_expected_count(self):
         # 600 one-second ticks at 3600/hr is one arrival per tick on
