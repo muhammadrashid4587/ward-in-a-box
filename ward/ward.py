@@ -202,6 +202,24 @@ class Ward:
         for m in self.monitors:
             for alarm in m.raised_this_tick:
                 self.staffing.alarm_raised(m.bed_id, alarm, self.elapsed, occupied)
+        # Discharge-readiness-driven workflow: when auto-ordering is
+        # on, a bed flagged discharge-ready gets a discharge-planning
+        # order at once — one per stay, never a second while a live
+        # order already covers the bed. Placed after the monitor loop
+        # so this tick's readiness already reflects the latest vitals
+        # and doses, and before the snapshot so the order is in it.
+        if self.readiness.auto_order:
+            for m in self.monitors:
+                if (
+                    m.admitted
+                    and m.discharge_ready(
+                        self.elapsed, self.readiness.stable_window_s
+                    )
+                    and not self.discharge_planner.has_live_order(m.bed_id)
+                ):
+                    self.discharge_planner.place_order(
+                        m.bed_id, self.elapsed, source="auto"
+                    )
         snap = {"t": self.elapsed, "beds": readings, "staffing": self.staffing.summary(self.elapsed, occupied), "turnover": self.turnover_summary(), "meds": self.meds_summary(), "triage": self.triage_summary(), "arrivals": self.arrivals_summary(), "discharge": self.discharge_summary(), "discharge_readiness": self.readiness_summary()}
         with self._lock:
             self.latest = snap
@@ -303,7 +321,11 @@ class Ward:
     def readiness_summary(self):
         """Per-patient discharge-readiness flags and ward totals."""
         beds = [
-            m.readiness_detail(self.elapsed, self.readiness.stable_window_s)
+            m.readiness_detail(
+                self.elapsed,
+                self.readiness.stable_window_s,
+                auto_ordered=self.discharge_planner.has_auto_order(m.bed_id),
+            )
             for m in self.monitors
         ]
         return {

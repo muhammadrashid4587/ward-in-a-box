@@ -83,6 +83,10 @@ python3 -m ward.cli scenarios/discharge.json --seed 42
 # with a fever
 python3 -m ward.cli scenarios/discharge-ready.json --seed 42
 
+# Auto discharge orders: beds flagged ready get a discharge order
+# raised for them at once, and discharge an hour later by default
+python3 -m ward.cli scenarios/discharge-auto-order.json --seed 42
+
 # Reproducible run
 python3 -m ward.cli scenarios/example.json --seed 42
 ```
@@ -641,10 +645,11 @@ patient stays in the bed, still monitored and still emitting
 vitals, until a slot frees up, and the delay is recorded — on the
 order, in the per-bed turnover totals, and in the ward totals.
 Every snapshot carries a `"discharge"` object with the orders
-(bed, ordered, expected, and actual times, status, and delay),
-how many were planned, discharged, delayed, and cancelled, and
-the total and mean delay, plus the cleaning capacity, how many
-beds are cleaning, and how many are awaiting a slot. The same
+(bed, ordered, expected, and actual times, status, delay, and
+where the order came from — `"source"`: `"manual"`, `"scheduled"`,
+or `"auto"`), how many were planned, discharged, delayed, and
+cancelled, and the total and mean delay, plus the cleaning capacity,
+how many beds are cleaning, and how many are awaiting a slot. The same
 summary is served by `GET /discharge` and carried in every
 WebSocket frame, and the run summary (`--summary`) reports the
 discharge totals. See `scenarios/discharge.json` for a runnable
@@ -688,6 +693,27 @@ grace window) never flags ready, and bed 3 (febrile, alarms
 coming and going) flags ready at 40 s after 6 s of quiet vitals —
 3 ready, 1 not.
 
+With `"auto_order": true` in the `discharge_readiness` block the
+ward acts on the flag: the first tick a bed is flagged ready, it
+raises a discharge-planning order for that bed (marked
+`"source": "auto"` in the discharge summary, counted as
+`auto_planned`), so the patient is discharged `lead_time_s`
+later through the normal planning flow — including the cleaning
+backlog, so a backed-up roster delays an auto discharge like
+any other. One order per stay: a bed with a live order already
+in flight (planned or delayed, manual, scheduled, or auto) gets
+no second one, and a new patient admitted to the bed later gets
+a fresh order of their own. The per-bed readiness detail carries
+`"auto_ordered"` while such an order is live, and the run
+summary reports `auto_planned` alongside the discharge totals.
+Off by default, so wards that do not ask for it behave exactly
+as before. See `scenarios/discharge-auto-order.json` for a
+runnable example: over a seeded 40-tick run with a 5-second
+window and a 5-second lead time, beds 0 and 3 are quiet from
+admission and auto-discharge at 10 s, bed 1's dose lands at 30 s
+and it auto-discharges at 35 s, and bed 2 (missed insulin) never
+flags ready and gets no order — 3 auto orders, 3 discharges.
+
 ## Recording a run
 
 `--record FILE` writes every tick to a JSONL file: a header line with
@@ -711,7 +737,7 @@ endpoints returned 503 while it lasted, the ticks did not stop.
 make test
 ```
 
-180 tests: vitals stay inside plausible ranges, dropout actually stops a
+189 tests: vitals stay inside plausible ranges, dropout actually stops a
 monitor's stream, an alarm storm produces alarms, stale readings freeze,
 a partition blocks the snapshot endpoint, the HTTP endpoints serve valid
 JSON, the stream serves JSON lines, scenario files validate, alarm
@@ -840,6 +866,19 @@ window, readiness in snapshots, the `GET /discharge-readiness`
 endpoint (503 while partitioned), and WebSocket frames, the run
 summary carrying readiness totals, and the `discharge-ready.json`
 scenario flagging 3 of 4 beds ready over a seeded run.
+Auto-discharge-order tests cover an order raised the tick a bed
+is first flagged ready (with its source, ordered, and expected
+times, and the bed discharging when the lead time elapses), no
+order when the feature is off (the default), no second order
+when readiness returns after an alarm storm while the first
+order is still in flight, no auto order when a scheduled order
+already covers the bed, a fresh auto order for a new patient
+admitted to the same bed later, validation of the `auto_order`
+flag and the order `source`, the auto order and its count in
+snapshots, the `GET /discharge` endpoint (503 while
+partitioned), and the run summary, and the
+`discharge-auto-order.json` scenario raising 3 auto orders and
+discharging 3 beds over a seeded run.
 
 ## Roadmap
 
@@ -897,3 +936,9 @@ scenario flagging 3 of 4 beds ready over a seeded run.
   orders are complete, in every reading, the snapshot, a
   `GET /discharge-readiness` endpoint, WebSocket frames, and the
   run summary) — done in v0.19.0
+- Discharge-readiness-driven auto orders (when `auto_order` is on,
+  the first tick a bed is flagged discharge-ready the ward raises
+  a discharge-planning order for it, marked `"source": "auto"`,
+  one per stay and never a duplicate while a live order covers
+  the bed, in the discharge summary, the per-bed readiness
+  detail, and the run summary) — done in v0.20.0

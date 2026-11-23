@@ -177,10 +177,13 @@ def summarize(path):
         ),
         # Discharge totals from the last tick: planned discharges,
         # how many landed, how many were delayed waiting for a
-        # cleaning slot, and the total delay.
+        # cleaning slot, and the total delay — and how many of the
+        # planned orders the ward raised automatically when a bed
+        # was flagged discharge-ready.
         "discharge": (
             {
                 "planned": last_discharge["planned"],
+                "auto_planned": last_discharge.get("auto_planned", 0),
                 "discharged": last_discharge["discharged"],
                 "delayed": last_discharge["delayed"],
                 "cancelled": last_discharge["cancelled"],

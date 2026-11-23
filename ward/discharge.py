@@ -83,14 +83,22 @@ class DischargePlanner:
         # up, still waiting), or "cancelled" (patient already gone).
         self.orders = []
 
-    def place_order(self, bed, ordered_at, lead_time_s=None):
+    def place_order(self, bed, ordered_at, lead_time_s=None, source="manual"):
         """Place a discharge order for ``bed`` at ``ordered_at``.
 
         The discharge is expected at ``ordered_at + lead_time_s``
-        (the planner default when omitted). Returns the order.
+        (the planner default when omitted). ``source`` says where
+        the order came from: ``"manual"`` (placed live), ``"scheduled"``
+        (from the scenario), or ``"auto"`` (raised by the ward when
+        the bed was flagged discharge-ready). Returns the order.
         """
         if not isinstance(bed, int) or isinstance(bed, bool) or bed < 0:
             raise ValueError("bed must be an int >= 0, got %r" % (bed,))
+        if source not in ("manual", "scheduled", "auto"):
+            raise ValueError(
+                "source must be 'manual', 'scheduled', or 'auto', got %r"
+                % (source,)
+            )
         lead = self.lead_time_s if lead_time_s is None else lead_time_s
         if (
             not isinstance(lead, (int, float))
@@ -105,9 +113,37 @@ class DischargePlanner:
             "status": "planned",
             "actual_t": None,
             "delay_s": None,
+            "source": source,
         }
         self.orders.append(order)
         return order
+
+    def has_live_order(self, bed):
+        """True when ``bed`` already has a discharge order in flight:
+        one scheduled but not yet placed, or one placed and still
+        planned or delayed. A discharged or cancelled order does not
+        count, so a new patient admitted to the bed later can get a
+        fresh order of their own."""
+        if any(
+            o["bed"] == bed
+            for o in self.scheduled_orders[self._next_scheduled :]
+        ):
+            return True
+        return any(
+            o["bed"] == bed and o["status"] in ("planned", "delayed")
+            for o in self.orders
+        )
+
+    def has_auto_order(self, bed):
+        """True when ``bed`` has a live auto-raised order: one the
+        ward placed when the bed was flagged discharge-ready and
+        that has not discharged or been cancelled yet."""
+        return any(
+            o["bed"] == bed
+            and o.get("source") == "auto"
+            and o["status"] in ("planned", "delayed")
+            for o in self.orders
+        )
 
     def tick(self, now, ward):
         """Place due scheduled orders and execute due ones.
@@ -125,7 +161,8 @@ class DischargePlanner:
                 break
             self._next_scheduled += 1
             self.place_order(
-                order["bed"], order["at"], order["lead_time_s"]
+                order["bed"], order["at"], order["lead_time_s"],
+                source="scheduled",
             )
         for order in self.orders:
             if order["status"] != "planned" or order["expected_t"] > now:
@@ -167,6 +204,9 @@ class DischargePlanner:
             "lead_time_s": self.lead_time_s,
             "orders": [dict(o) for o in self.orders],
             "planned": len(self.orders),
+            "auto_planned": sum(
+                1 for o in self.orders if o.get("source") == "auto"
+            ),
             "discharged": len(discharged),
             "delayed": len(delayed),
             "cancelled": sum(

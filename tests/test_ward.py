@@ -2621,6 +2621,215 @@ class TestDischargeReadiness(unittest.TestCase):
             os.unlink(path)
 
 
+class TestAutoDischargeOrders(unittest.TestCase):
+    def _ward(self, beds=1, cleaning_s=10.0, **kw):
+        return Ward(
+            beds=beds, profiles=["stable"] * beds,
+            cleaning_s=cleaning_s, seed=42, **kw
+        )
+
+    def test_auto_order_raised_when_bed_becomes_ready(self):
+        ward = self._ward(
+            discharge_readiness={"stable_window_s": 5, "auto_order": True},
+            discharge_planning={"lead_time_s": 5},
+        )
+        for _ in range(4):
+            snap = ward.tick()
+        self.assertEqual(ward.discharge_summary()["planned"], 0)
+        snap = ward.tick()  # t=5: ready, so an order is raised.
+        self.assertTrue(snap["beds"][0]["discharge_ready"])
+        summary = ward.discharge_summary()
+        self.assertEqual(summary["planned"], 1)
+        self.assertEqual(summary["auto_planned"], 1)
+        order = summary["orders"][0]
+        self.assertEqual(order["bed"], 0)
+        self.assertEqual(order["source"], "auto")
+        self.assertEqual(order["ordered_t"], 5.0)
+        self.assertEqual(order["expected_t"], 10.0)
+        self.assertEqual(order["status"], "planned")
+        self.assertEqual(snap["discharge"]["orders"][0]["source"], "auto")
+        self.assertTrue(
+            snap["discharge_readiness"]["beds"][0]["auto_ordered"]
+        )
+        for _ in range(5):
+            snap = ward.tick()  # t=10: the order fires, bed cleans.
+        self.assertEqual(snap["beds"][0]["state"], "cleaning")
+        self.assertEqual(ward.discharge_summary()["discharged"], 1)
+
+    def test_auto_order_off_by_default(self):
+        ward = self._ward(
+            discharge_readiness={"stable_window_s": 5},
+            discharge_planning={"lead_time_s": 5},
+        )
+        for _ in range(10):
+            snap = ward.tick()
+        self.assertTrue(snap["beds"][0]["discharge_ready"])
+        summary = ward.discharge_summary()
+        self.assertEqual(summary["planned"], 0)
+        self.assertEqual(summary["auto_planned"], 0)
+        self.assertFalse(
+            ward.readiness_summary()["beds"][0]["auto_ordered"]
+        )
+
+    def test_auto_order_not_raised_twice_after_readiness_returns(self):
+        ward = self._ward(
+            discharge_readiness={"stable_window_s": 5, "auto_order": True},
+            chaos=[ChaosEvent("alarm_storm", 10, 5, bed=0)],
+        )
+        for _ in range(5):
+            ward.tick()
+        # Ready at t=5: one auto order, expected an hour out.
+        self.assertEqual(ward.discharge_summary()["planned"], 1)
+        for _ in range(15):
+            snap = ward.tick()
+        # The storm (t=10..15) took readiness away; it is back by
+        # t=20, but the live order is still in flight, so no second
+        # order is raised.
+        self.assertTrue(snap["beds"][0]["discharge_ready"])
+        summary = ward.discharge_summary()
+        self.assertEqual(summary["planned"], 1)
+        self.assertEqual(summary["auto_planned"], 1)
+        self.assertEqual(summary["orders"][0]["ordered_t"], 5.0)
+
+    def test_auto_order_skipped_when_order_already_exists(self):
+        ward = self._ward(
+            discharge_readiness={"stable_window_s": 5, "auto_order": True},
+            discharge_planning={
+                "lead_time_s": 3600,
+                "orders": [{"bed": 0, "at": 0}],
+            },
+        )
+        for _ in range(10):
+            snap = ward.tick()
+        self.assertTrue(snap["beds"][0]["discharge_ready"])
+        summary = ward.discharge_summary()
+        self.assertEqual(summary["planned"], 1)
+        self.assertEqual(summary["auto_planned"], 0)
+        self.assertEqual(summary["orders"][0]["source"], "scheduled")
+
+    def test_new_patient_gets_fresh_auto_order(self):
+        ward = self._ward(
+            discharge_readiness={"stable_window_s": 5, "auto_order": True},
+            discharge_planning={"lead_time_s": 5},
+        )
+        for _ in range(10):
+            ward.tick()  # t=10: first patient discharged, bed cleans.
+        self.assertEqual(ward.discharge_summary()["discharged"], 1)
+        for _ in range(10):
+            ward.tick()  # t=20: cleaning done, bed available.
+        self.assertEqual(
+            ward.turnover_summary()["beds"][0]["state"], "available"
+        )
+        ward.admit(0)
+        for _ in range(5):
+            ward.tick()  # t=25: the new patient is ready.
+        summary = ward.discharge_summary()
+        self.assertEqual(summary["planned"], 2)
+        self.assertEqual(summary["auto_planned"], 2)
+        self.assertEqual(
+            [o["ordered_t"] for o in summary["orders"]], [5.0, 25.0]
+        )
+        self.assertTrue(
+            all(o["source"] == "auto" for o in summary["orders"])
+        )
+
+    def test_auto_order_validation(self):
+        with self.assertRaises(ValueError):
+            DischargeReadiness(stable_window_s=5, auto_order="yes")
+        with self.assertRaises(ValueError):
+            DischargeReadiness(stable_window_s=5, auto_order=1)
+        with self.assertRaises(ValueError):
+            DischargePlanner().place_order(0, 0.0, source="surprise")
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(
+                {"beds": 1, "discharge_readiness": {"auto_order": "yes"}},
+                f,
+            )
+            path = f.name
+        try:
+            with self.assertRaises(ValueError):
+                load_scenario(path)
+        finally:
+            os.unlink(path)
+
+    def test_auto_order_in_snapshot_and_endpoint(self):
+        ward = self._ward(
+            discharge_readiness={"stable_window_s": 5, "auto_order": True},
+            discharge_planning={"lead_time_s": 5},
+        )
+        for _ in range(5):
+            ward.tick()
+        snap = ward.snapshot()
+        self.assertEqual(snap["discharge"]["auto_planned"], 1)
+        self.assertEqual(snap["discharge"]["orders"][0]["source"], "auto")
+        server, port = serve_in_thread(ward)
+        try:
+            status, body = get(port, "/discharge")
+            self.assertEqual(status, 200)
+            data = json.loads(body)
+            self.assertEqual(data["auto_planned"], 1)
+            self.assertEqual(data["orders"][0]["source"], "auto")
+            ward.partitioned = True
+            status, _ = get(port, "/discharge")
+            self.assertEqual(status, 503)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_scenario_discharge_auto_order(self):
+        cfg = load_scenario(
+            os.path.join(HERE, "..", "scenarios", "discharge-auto-order.json")
+        )
+        self.assertTrue(cfg["discharge_readiness"].auto_order)
+        ward = build_ward(cfg, seed=42)
+        for _ in range(40):
+            ward.tick()
+        summary = ward.discharge_summary()
+        self.assertEqual(summary["planned"], 3)
+        self.assertEqual(summary["auto_planned"], 3)
+        self.assertEqual(summary["discharged"], 3)
+        self.assertEqual(summary["delayed"], 0)
+        self.assertEqual(summary["cancelled"], 0)
+        orders = summary["orders"]
+        # Beds 0 and 3 are quiet from admission: ready at 5 s, gone
+        # at 10 s. Bed 1's dose lands at 30 s: ready then, gone at
+        # 35 s. Bed 2's insulin missed, so it never flags ready and
+        # never gets an order.
+        self.assertEqual(
+            [
+                (o["bed"], o["ordered_t"], o["expected_t"], o["status"],
+                 o["source"])
+                for o in orders
+            ],
+            [
+                (0, 5.0, 10.0, "discharged", "auto"),
+                (3, 5.0, 10.0, "discharged", "auto"),
+                (1, 30.0, 35.0, "discharged", "auto"),
+            ],
+        )
+
+    def test_recorder_summary_carries_auto_orders(self):
+        cfg = load_scenario(
+            os.path.join(HERE, "..", "scenarios", "discharge-auto-order.json")
+        )
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".jsonl", delete=False
+        ) as f:
+            path = f.name
+        try:
+            with Recorder(path, cfg["beds"], cfg["rate_hz"], seed=42) as rec:
+                ward = build_ward(cfg, seed=42, recorder=rec)
+                for _ in range(40):
+                    ward.tick()
+            summary = summarize(path)
+            self.assertEqual(summary["discharge"]["planned"], 3)
+            self.assertEqual(summary["discharge"]["auto_planned"], 3)
+            self.assertEqual(summary["discharge"]["discharged"], 3)
+            self.assertEqual(summary["discharge"]["total_delay_s"], 0.0)
+        finally:
+            os.unlink(path)
+
+
 class TestPoissonArrivals(unittest.TestCase):
     def test_flat_rate_generates_near_expected_count(self):
         # 600 one-second ticks at 3600/hr is one arrival per tick on

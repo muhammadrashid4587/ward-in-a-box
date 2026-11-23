@@ -15,6 +15,15 @@ carries in this simulator. A planned discharge order does not block
 readiness — a patient whose discharge is already ordered is exactly
 the patient this flag is for. The flag is advisory only: this is a
 test tool, not a clinical judgement.
+
+With ``auto_order`` on, the ward acts on the flag: the first tick a
+bed is discharge-ready, the ward raises a discharge-planning order
+for that bed (source ``"auto"``), so the patient is discharged
+``lead_time_s`` later through the normal planning flow. One order
+per stay — a bed with a live order already in flight gets no
+second one, and a new patient admitted to the bed later gets a
+fresh order of their own. Off by default, so wards that do not
+ask for it behave exactly as before.
 """
 
 # Default stability window: five minutes of quiet vitals.
@@ -25,10 +34,12 @@ class DischargeReadiness:
     """Discharge-readiness configuration.
 
     ``stable_window_s`` is how long a patient's vitals must have
-    been alarm-free before they count as stable (> 0).
+    been alarm-free before they count as stable (> 0). ``auto_order``
+    raises a discharge-planning order the first tick a bed is
+    flagged ready (off by default).
     """
 
-    def __init__(self, stable_window_s=DEFAULT_STABLE_WINDOW_S):
+    def __init__(self, stable_window_s=DEFAULT_STABLE_WINDOW_S, auto_order=False):
         if (
             not isinstance(stable_window_s, (int, float))
             or isinstance(stable_window_s, bool)
@@ -37,4 +48,9 @@ class DischargeReadiness:
             raise ValueError(
                 "stable_window_s must be > 0, got %r" % (stable_window_s,)
             )
+        if not isinstance(auto_order, bool):
+            raise ValueError(
+                "auto_order must be a bool, got %r" % (auto_order,)
+            )
         self.stable_window_s = float(stable_window_s)
+        self.auto_order = auto_order

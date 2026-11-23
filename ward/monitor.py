@@ -293,8 +293,12 @@ class Monitor:
             and self.meds.orders_complete()
         )
 
-    def readiness_detail(self, now, stable_window_s):
-        """Per-patient discharge-readiness state as plain JSON data."""
+    def readiness_detail(self, now, stable_window_s, auto_ordered=False):
+        """Per-patient discharge-readiness state as plain JSON data.
+
+        ``auto_ordered`` is True when the ward has raised an
+        automatic discharge-planning order for this bed's current
+        stay (one that is still planned or delayed)."""
         return {
             "bed": self.bed_id,
             "ready": self.discharge_ready(now, stable_window_s),
@@ -302,6 +306,7 @@ class Monitor:
             "stable_s": self.stable_s(now) if self.admitted else 0.0,
             "stable_window_s": float(stable_window_s),
             "orders_complete": self.meds.orders_complete(),
+            "auto_ordered": bool(auto_ordered),
         }
 
     def alarm_rate(self, now, window_s=60.0):
