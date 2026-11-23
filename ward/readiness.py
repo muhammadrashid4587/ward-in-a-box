@@ -24,6 +24,13 @@ per stay — a bed with a live order already in flight gets no
 second one, and a new patient admitted to the bed later gets a
 fresh order of their own. Off by default, so wards that do not
 ask for it behave exactly as before.
+
+``auto_order_lead_time_s`` overrides the lead time for those auto
+orders only: a ward that discharges a stable patient an hour after
+rounds can still send a ready patient home in minutes, without
+changing the default lead time for scheduled or manual orders.
+When it is not set, auto orders use the planner's default lead
+time, exactly as before.
 """
 
 # Default stability window: five minutes of quiet vitals.
@@ -36,10 +43,17 @@ class DischargeReadiness:
     ``stable_window_s`` is how long a patient's vitals must have
     been alarm-free before they count as stable (> 0). ``auto_order``
     raises a discharge-planning order the first tick a bed is
-    flagged ready (off by default).
+    flagged ready (off by default). ``auto_order_lead_time_s``
+    overrides the lead time for those auto orders only (the
+    planner's default when unset); it must be > 0 when set.
     """
 
-    def __init__(self, stable_window_s=DEFAULT_STABLE_WINDOW_S, auto_order=False):
+    def __init__(
+        self,
+        stable_window_s=DEFAULT_STABLE_WINDOW_S,
+        auto_order=False,
+        auto_order_lead_time_s=None,
+    ):
         if (
             not isinstance(stable_window_s, (int, float))
             or isinstance(stable_window_s, bool)
@@ -52,5 +66,19 @@ class DischargeReadiness:
             raise ValueError(
                 "auto_order must be a bool, got %r" % (auto_order,)
             )
+        if auto_order_lead_time_s is not None and (
+            not isinstance(auto_order_lead_time_s, (int, float))
+            or isinstance(auto_order_lead_time_s, bool)
+            or auto_order_lead_time_s <= 0
+        ):
+            raise ValueError(
+                "auto_order_lead_time_s must be > 0, got %r"
+                % (auto_order_lead_time_s,)
+            )
         self.stable_window_s = float(stable_window_s)
         self.auto_order = auto_order
+        self.auto_order_lead_time_s = (
+            None
+            if auto_order_lead_time_s is None
+            else float(auto_order_lead_time_s)
+        )

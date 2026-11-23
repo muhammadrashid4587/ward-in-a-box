@@ -2830,6 +2830,176 @@ class TestAutoDischargeOrders(unittest.TestCase):
             os.unlink(path)
 
 
+class TestAutoOrderLeadTime(unittest.TestCase):
+    def _ward(self, beds=1, cleaning_s=10.0, **kw):
+        return Ward(
+            beds=beds, profiles=["stable"] * beds,
+            cleaning_s=cleaning_s, seed=42, **kw
+        )
+
+    def test_override_shortens_auto_order_lead_time(self):
+        # The planner default is 5 s, but the auto-order override
+        # is 2 s: the order is expected 2 s after it is raised, and
+        # the patient leaves then, not 5 s later.
+        ward = self._ward(
+            discharge_readiness={
+                "stable_window_s": 5,
+                "auto_order": True,
+                "auto_order_lead_time_s": 2,
+            },
+            discharge_planning={"lead_time_s": 5},
+        )
+        for _ in range(5):
+            snap = ward.tick()  # t=5: ready, auto order raised.
+        order = ward.discharge_summary()["orders"][0]
+        self.assertEqual(order["source"], "auto")
+        self.assertEqual(order["ordered_t"], 5.0)
+        self.assertEqual(order["expected_t"], 7.0)
+        self.assertEqual(
+            snap["discharge_readiness"]["auto_order_lead_time_s"], 2.0
+        )
+        ward.tick()  # t=6: still in bed, the order has not fired.
+        self.assertEqual(ward.discharge_summary()["discharged"], 0)
+        snap = ward.tick()  # t=7: the override fires, bed cleans.
+        self.assertEqual(snap["beds"][0]["state"], "cleaning")
+        self.assertEqual(ward.discharge_summary()["discharged"], 1)
+
+    def test_override_does_not_touch_manual_or_scheduled_orders(self):
+        # A scheduled order still uses the planner's default (or
+        # its own per-order lead time); only auto orders take the
+        # override.
+        ward = self._ward(
+            discharge_readiness={
+                "stable_window_s": 5,
+                "auto_order": True,
+                "auto_order_lead_time_s": 2,
+            },
+            discharge_planning={
+                "lead_time_s": 5,
+                "orders": [{"bed": 0, "at": 0}],
+            },
+        )
+        for _ in range(5):
+            ward.tick()
+        summary = ward.discharge_summary()
+        self.assertEqual(summary["planned"], 1)
+        self.assertEqual(summary["auto_planned"], 0)
+        order = summary["orders"][0]
+        self.assertEqual(order["source"], "scheduled")
+        self.assertEqual(order["expected_t"], 5.0)
+
+    def test_no_override_uses_planner_default(self):
+        ward = self._ward(
+            discharge_readiness={"stable_window_s": 5, "auto_order": True},
+            discharge_planning={"lead_time_s": 5},
+        )
+        for _ in range(5):
+            ward.tick()
+        order = ward.discharge_summary()["orders"][0]
+        self.assertEqual(order["expected_t"], 10.0)
+        self.assertIsNone(
+            ward.readiness_summary()["auto_order_lead_time_s"]
+        )
+
+    def test_override_validation(self):
+        for bad in (0, -1, True, "2"):
+            with self.assertRaises(ValueError):
+                DischargeReadiness(
+                    stable_window_s=5,
+                    auto_order=True,
+                    auto_order_lead_time_s=bad,
+                )
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(
+                {
+                    "beds": 1,
+                    "discharge_readiness": {
+                        "auto_order": True,
+                        "auto_order_lead_time_s": 0,
+                    },
+                },
+                f,
+            )
+            path = f.name
+        try:
+            with self.assertRaises(ValueError):
+                load_scenario(path)
+        finally:
+            os.unlink(path)
+
+    def test_scenario_discharge_auto_order_lead_time(self):
+        cfg = load_scenario(
+            os.path.join(
+                HERE, "..", "scenarios",
+                "discharge-auto-order-lead-time.json",
+            )
+        )
+        self.assertTrue(cfg["discharge_readiness"].auto_order)
+        self.assertEqual(
+            cfg["discharge_readiness"].auto_order_lead_time_s, 2.0
+        )
+        self.assertEqual(cfg["discharge_planning"].lead_time_s, 5.0)
+        ward = build_ward(cfg, seed=42)
+        for _ in range(40):
+            ward.tick()
+        summary = ward.discharge_summary()
+        self.assertEqual(summary["planned"], 3)
+        self.assertEqual(summary["auto_planned"], 3)
+        self.assertEqual(summary["discharged"], 3)
+        # Beds 0 and 3 are quiet from admission: ready at 5 s, gone
+        # at 7 s on the 2 s override, not at 10 s on the planner's
+        # 5 s default. Bed 1's dose lands at 30 s: ready then, gone
+        # at 32 s. Bed 2's insulin missed, so it never flags ready
+        # and never gets an order.
+        self.assertEqual(
+            [
+                (o["bed"], o["ordered_t"], o["expected_t"], o["status"],
+                 o["source"])
+                for o in summary["orders"]
+            ],
+            [
+                (0, 5.0, 7.0, "discharged", "auto"),
+                (3, 5.0, 7.0, "discharged", "auto"),
+                (1, 30.0, 32.0, "discharged", "auto"),
+            ],
+        )
+        # The paperwork timing follows the override too: ready to
+        # discharge is the 2 s lead time, not the planner default.
+        self.assertEqual(
+            summary["timing"]["mean_ready_to_discharge_s"], 2.0
+        )
+        self.assertEqual(
+            summary["timing"]["max_ready_to_discharge_s"], 2.0
+        )
+
+    def test_recorder_summary_carries_override(self):
+        cfg = load_scenario(
+            os.path.join(
+                HERE, "..", "scenarios",
+                "discharge-auto-order-lead-time.json",
+            )
+        )
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".jsonl", delete=False
+        ) as f:
+            path = f.name
+        try:
+            with Recorder(path, cfg["beds"], cfg["rate_hz"], seed=42) as rec:
+                ward = build_ward(cfg, seed=42, recorder=rec)
+                for _ in range(40):
+                    ward.tick()
+            summary = summarize(path)
+            self.assertEqual(
+                summary["discharge_readiness"]["auto_order_lead_time_s"],
+                2.0,
+            )
+            self.assertEqual(summary["discharge"]["planned"], 3)
+            self.assertEqual(summary["discharge"]["auto_planned"], 3)
+            self.assertEqual(summary["discharge"]["discharged"], 3)
+        finally:
+            os.unlink(path)
+
+
 class TestDischargeTiming(unittest.TestCase):
     def _ward(self, beds=1, cleaning_s=10.0, **kw):
         return Ward(

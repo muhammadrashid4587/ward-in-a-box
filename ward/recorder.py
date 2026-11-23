@@ -206,13 +206,17 @@ def summarize(path):
         ),
         # Discharge-readiness totals from the last tick: how many
         # occupied beds are flagged ready, how many are not, and the
-        # stability window in force.
+        # stability window in force — plus the auto-order lead-time
+        # override, when one is set.
         "discharge_readiness": (
             {
                 "ready": last_readiness["ready"],
                 "not_ready": last_readiness["not_ready"],
                 "occupied": last_readiness["occupied"],
                 "stable_window_s": last_readiness["stable_window_s"],
+                "auto_order_lead_time_s": last_readiness.get(
+                    "auto_order_lead_time_s"
+                ),
             }
             if last_readiness is not None
             else None

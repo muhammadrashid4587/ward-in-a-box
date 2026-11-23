@@ -232,7 +232,10 @@ class Ward:
                     and not self.discharge_planner.has_live_order(m.bed_id)
                 ):
                     self.discharge_planner.place_order(
-                        m.bed_id, self.elapsed, source="auto"
+                        m.bed_id,
+                        self.elapsed,
+                        lead_time_s=self.readiness.auto_order_lead_time_s,
+                        source="auto",
                     )
         snap = {"t": self.elapsed, "beds": readings, "staffing": self.staffing.summary(self.elapsed, occupied), "turnover": self.turnover_summary(), "meds": self.meds_summary(), "triage": self.triage_summary(), "arrivals": self.arrivals_summary(), "discharge": self.discharge_summary(), "discharge_readiness": self.readiness_summary()}
         with self._lock:
@@ -345,6 +348,8 @@ class Ward:
         return {
             "t": self.elapsed,
             "stable_window_s": self.readiness.stable_window_s,
+            "auto_order": self.readiness.auto_order,
+            "auto_order_lead_time_s": self.readiness.auto_order_lead_time_s,
             "beds": beds,
             "occupied": sum(1 for b in beds if b["admitted"]),
             "ready": sum(1 for b in beds if b["ready"]),

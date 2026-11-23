@@ -87,6 +87,10 @@ python3 -m ward.cli scenarios/discharge-ready.json --seed 42
 # raised for them at once, and discharge an hour later by default
 python3 -m ward.cli scenarios/discharge-auto-order.json --seed 42
 
+# Auto discharge orders with a 2 s lead-time override: the same
+# beds discharge 2 s after flagging ready, not 5 s after
+python3 -m ward.cli scenarios/discharge-auto-order-lead-time.json --seed 42
+
 # Reproducible run
 python3 -m ward.cli scenarios/example.json --seed 42
 ```
@@ -739,6 +743,41 @@ flags ready and every patient leaves 5 s after flagging, so the
 timing reports 3 measured orders, a mean ready-to-order time of
 0.0 s, and a mean and max ready-to-discharge time of 5.0 s.
 
+## Per-auto-order lead-time override
+
+Auto orders normally use the planner's default lead time, but a
+ward that sends a ready patient home quickly can override it for
+auto orders only, with `auto_order_lead_time_s` in the
+`discharge_readiness` block:
+
+```json
+{
+  "discharge_planning": {"lead_time_s": 3600},
+  "discharge_readiness": {
+    "auto_order": true,
+    "auto_order_lead_time_s": 600,
+    "stable_window_s": 300
+  }
+}
+```
+
+The override applies only to orders the ward raises itself when a
+bed is flagged discharge-ready. Scheduled orders still use the
+planner's default (or their own per-order `lead_time_s`), and
+manual orders placed live with `place_order` take whatever lead
+time they are given. The discharge summary's orders already carry
+each order's `expected_t`, so the override is visible there; the
+readiness summary carries the override in force
+(`auto_order_lead_time_s`, null when unset) in every snapshot,
+WebSocket frame, `GET /discharge-readiness`, and the run summary
+(`--summary`). See `scenarios/discharge-auto-order-lead-time.json`
+for a runnable example: over a seeded 40-tick run with a 5-second
+window, a 5-second planner default, and a 2-second override, beds
+0 and 3 are quiet from admission and auto-discharge at 7 s, bed
+1's dose lands at 30 s and it auto-discharges at 32 s, and bed 2
+(missed insulin) never flags ready and gets no order — 3 auto
+orders, 3 discharges, a mean ready-to-discharge time of 2.0 s.
+
 ## Recording a run
 
 `--record FILE` writes every tick to a JSONL file: a header line with
@@ -762,7 +801,7 @@ endpoints returned 503 while it lasted, the ticks did not stop.
 make test
 ```
 
-195 tests: vitals stay inside plausible ranges, dropout actually stops a
+201 tests: vitals stay inside plausible ranges, dropout actually stops a
 monitor's stream, an alarm storm produces alarms, stale readings freeze,
 a partition blocks the snapshot endpoint, the HTTP endpoints serve valid
 JSON, the stream serves JSON lines, scenario files validate, alarm
@@ -913,7 +952,15 @@ flagged ready having no timing, the timing aggregates in the
 snapshot and the run summary, and the
 `discharge-auto-order.json` scenario reporting 3 measured orders
 with a mean ready-to-order time of 0.0 s and a mean and max
-ready-to-discharge time of 5.0 s.
+ready-to-discharge time of 5.0 s. Per-auto-order lead-time tests
+cover an override shortening an auto order's lead time while the
+planner default still governs scheduled orders, no override
+falling back to the planner default, validation of the override
+value and of a bad scenario value, the override in the readiness
+summary and the run summary, and the
+`discharge-auto-order-lead-time.json` scenario raising 3 auto
+orders and discharging 3 beds with a mean ready-to-discharge time
+of 2.0 s.
 
 ## Roadmap
 
@@ -983,3 +1030,9 @@ ready-to-discharge time of 5.0 s.
   aggregates over the measured orders, in the discharge summary,
   every snapshot, WebSocket frame, `GET /discharge`, and the run
   summary) — done in v0.21.0
+- Per-auto-order lead-time override (`auto_order_lead_time_s`
+  on the discharge-readiness config, honoured only by the
+  auto-order path while scheduled and manual orders keep the
+  planner default, surfaced in the readiness summary, every
+  snapshot, WebSocket frame, `GET /discharge-readiness`, and the
+  run summary) — done in v0.22.0
