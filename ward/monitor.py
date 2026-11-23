@@ -31,10 +31,11 @@ class Monitor:
     seconds); the monitor clears each one when its time passes.
     """
 
-    def __init__(self, bed_id, profile="stable", rng=None, acuity=3, meds=None):
+    def __init__(self, bed_id, profile="stable", rng=None, acuity=3, meds=None, on_oxygen=False):
         self.bed_id = bed_id
         self.profile = profile
         self.acuity = validate_acuity(acuity)
+        self.on_oxygen = self._validate_on_oxygen(on_oxygen)
         self.meds = MedSchedule(bed_id, meds)
         self.rng = rng if rng is not None else random.Random()
         self.signs = initial_signs(profile, self.rng, self.acuity)
@@ -82,6 +83,14 @@ class Monitor:
         self._escalation = None
         self.escalation_history = []
         self.escalations_raised = 0
+
+    @staticmethod
+    def _validate_on_oxygen(on_oxygen):
+        if not isinstance(on_oxygen, bool):
+            raise ValueError(
+                "on_oxygen must be a bool, got %r" % (on_oxygen,)
+            )
+        return on_oxygen
 
     def state(self, now):
         """Bed state at elapsed time ``now``.
@@ -154,12 +163,14 @@ class Monitor:
         self.turnovers += 1
         self.total_cleaning_s = round(self.total_cleaning_s + cleaning_s, 3)
 
-    def admit(self, now, profile=None, acuity=None):
+    def admit(self, now, profile=None, acuity=None, on_oxygen=None):
         """Admit a new patient to an available bed.
 
         Raises ValueError if the bed is occupied or still cleaning.
         A new admission starts with fresh vitals, so the previous
-        patient's readings and alarms do not carry over.
+        patient's readings and alarms do not carry over. The new
+        patient is not on oxygen unless ``on_oxygen`` says so —
+        the previous patient's oxygen flag never carries over.
         """
         state = self.state(now)
         if state == "occupied":
@@ -172,6 +183,9 @@ class Monitor:
             self.profile = profile
         if acuity is not None:
             self.acuity = validate_acuity(acuity)
+        self.on_oxygen = self._validate_on_oxygen(
+            False if on_oxygen is None else on_oxygen
+        )
         self.signs = initial_signs(self.profile, self.rng, self.acuity)
         self.seq = 0
         self.last_reading = None
@@ -238,6 +252,7 @@ class Monitor:
             "t": round(now, 3),
             "profile": self.profile,
             "acuity": self.acuity,
+            "on_oxygen": self.on_oxygen,
             "stale": False,
             **self.signs,
         }
@@ -251,7 +266,7 @@ class Monitor:
         # adds or removes an alarm, so alarm counts and readiness
         # are exactly as before — it only records how sick the
         # patient looks on the NEWS2 scale.
-        reading["news2"] = score_signs(self.signs)
+        reading["news2"] = score_signs(self.signs, self.on_oxygen)
         self._track_escalation(reading["news2"], now)
         self._record_alarm_transitions(reading["alarms"], now)
         self.last_reading = reading
@@ -349,6 +364,7 @@ class Monitor:
         return {
             "bed": self.bed_id,
             "admitted": self.admitted,
+            "on_oxygen": self.on_oxygen,
             "news2": news2,
             "escalated": self._escalation is not None,
             "escalations_raised": self.escalations_raised,

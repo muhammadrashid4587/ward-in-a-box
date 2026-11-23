@@ -1,0 +1,1 @@
+{"beds":4,"patients":[{"bed":0,"on_oxygen":true,"profile":"stable"},{"bed":1,"on_oxygen":true,"profile":"hypoxic"},{"bed":2,"profile":"hypoxic"},{"bed":3,"profile":"stable"}],"rate_hz":1.0}

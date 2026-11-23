@@ -28,7 +28,7 @@ from ward.server import make_handler
 from ward.staffing import Staffing
 from ward.timeline import Timeline, TimelinePhase
 from ward.triage import TriageQueue
-from ward.news2 import score_signs
+from ward.news2 import score_signs, score_spo2
 from ward.vitals import PROFILES, effective_ranges, validate_acuity
 from ward.ward import Ward
 from ward.websocket import accept_key, encode_frame, read_frame
@@ -3733,6 +3733,162 @@ class TestNEWS2(unittest.TestCase):
             self.assertEqual(ew["escalations_raised"], 3)
         finally:
             os.unlink(path)
+
+
+class TestOxygen(unittest.TestCase):
+    def _signs(self, **over):
+        signs = {
+            "heart_rate": 70,
+            "spo2": 98,
+            "systolic": 120,
+            "diastolic": 80,
+            "temperature": 37.0,
+            "resp_rate": 16,
+        }
+        signs.update(over)
+        return signs
+
+    def test_spo2_scale2_boundaries(self):
+        # Scale 2 (on oxygen): <=83: 3, 84-85: 2, 86-87: 1, 88-92: 0,
+        # 93-96: 2, >=97: 3. The target band is 88-92: above it is a
+        # warning, not a reassurance.
+        for spo2, want in (
+            (83, 3), (84, 2), (85, 2), (86, 1), (87, 1),
+            (88, 0), (92, 0), (93, 2), (96, 2), (97, 3),
+        ):
+            self.assertEqual(score_spo2(spo2, on_oxygen=True), want, spo2)
+        # Scale 1 is unchanged: the same readings score differently.
+        for spo2, want in ((91, 3), (94, 1), (96, 0), (97, 0)):
+            self.assertEqual(score_spo2(spo2), want, spo2)
+            self.assertEqual(score_spo2(spo2, on_oxygen=False), want, spo2)
+
+    def test_score_signs_reports_spo2_scale(self):
+        # SpO2 95 scores 1 on Scale 1 and 2 on Scale 2; 89 scores
+        # 3 on Scale 1 and 0 on Scale 2 — the scale flips the
+        # judgement, so the score says which table it used.
+        on_air = score_signs(self._signs(spo2=95))
+        self.assertEqual(on_air["components"]["spo2"], 1)
+        self.assertEqual(on_air["spo2_scale"], 1)
+        on_o2 = score_signs(self._signs(spo2=95), on_oxygen=True)
+        self.assertEqual(on_o2["components"]["spo2"], 2)
+        self.assertEqual(on_o2["spo2_scale"], 2)
+        self.assertEqual(
+            score_signs(self._signs(spo2=89))["components"]["spo2"], 3
+        )
+        self.assertEqual(
+            score_signs(self._signs(spo2=89), on_oxygen=True)["components"]["spo2"],
+            0,
+        )
+        # Everything else in the score is identical across scales.
+        self.assertEqual(
+            {k: v for k, v in on_air["components"].items() if k != "spo2"},
+            {k: v for k, v in on_o2["components"].items() if k != "spo2"},
+        )
+
+    def test_reading_carries_on_oxygen_and_scale(self):
+        ward = Ward(
+            beds=2,
+            profiles=["hypoxic", "hypoxic"],
+            oxygen=[True, False],
+            seed=42,
+        )
+        snap = ward.tick()
+        on_o2, off_o2 = snap["beds"]
+        self.assertTrue(on_o2["on_oxygen"])
+        self.assertEqual(on_o2["news2"]["spo2_scale"], 2)
+        self.assertFalse(off_o2["on_oxygen"])
+        self.assertEqual(off_o2["news2"]["spo2_scale"], 1)
+        detail = ward.monitors[0].news2_detail(ward.elapsed)
+        self.assertTrue(detail["on_oxygen"])
+        summary = ward.early_warning_summary()
+        self.assertEqual(summary["on_oxygen"], 1)
+
+    def test_oxygen_is_scoring_only(self):
+        # Oxygen therapy changes the score, never the vitals or the
+        # alarms: two wards with the same seed and profiles emit
+        # identical signs and alarm lists, oxygen flag aside.
+        plain = Ward(beds=2, profiles=["stable", "hypoxic"], seed=42)
+        oxygenated = Ward(
+            beds=2,
+            profiles=["stable", "hypoxic"],
+            oxygen=[True, True],
+            seed=42,
+        )
+        for _ in range(40):
+            a = plain.tick()
+            b = oxygenated.tick()
+            for ra, rb in zip(a["beds"], b["beds"]):
+                for key in (
+                    "heart_rate", "spo2", "systolic", "diastolic",
+                    "temperature", "resp_rate",
+                ):
+                    self.assertEqual(ra[key], rb[key], key)
+                self.assertEqual(ra["alarms"], rb["alarms"])
+
+    def test_admit_resets_oxygen(self):
+        ward = Ward(beds=1, profiles=["stable"], oxygen=[True], seed=42)
+        ward.tick()
+        self.assertTrue(ward.monitors[0].on_oxygen)
+        ward.discharge(0)
+        for _ in range(31):
+            ward.tick()
+        ward.admit(0)
+        self.assertFalse(ward.monitors[0].on_oxygen)
+        ward.discharge(0)
+        for _ in range(31):
+            ward.tick()
+        ward.admit(0, on_oxygen=True)
+        self.assertTrue(ward.monitors[0].on_oxygen)
+        self.assertTrue(ward.tick()["beds"][0]["on_oxygen"])
+
+    def test_oxygen_validation(self):
+        with self.assertRaises(ValueError):
+            Monitor(0, on_oxygen="yes")
+        with self.assertRaises(ValueError):
+            Ward(beds=1, oxygen=["yes"])
+        with self.assertRaises(ValueError):
+            Ward(beds=1, oxygen=[1])
+        cfg = load_scenario(
+            os.path.join(HERE, "..", "scenarios", "oxygen.json")
+        )
+        cfg["profiles"] = ["stable"]
+        cfg["oxygen"] = [1]
+        with self.assertRaises(ValueError):
+            build_ward(cfg, seed=42)
+
+    def test_scenario_oxygen(self):
+        cfg = load_scenario(
+            os.path.join(HERE, "..", "scenarios", "oxygen.json")
+        )
+        ward = build_ward(cfg, seed=42)
+        snap = ward.tick()
+        # t=1: bed 0 stable on oxygen at SpO2 95.12 scores 2 on
+        # Scale 2 (93-96 on oxygen) and stays low; bed 1 hypoxic
+        # on oxygen at 88.08 is inside the 88-92 target band and
+        # scores 0 on SpO2; bed 2 hypoxic off oxygen at 88.7
+        # scores 3 on Scale 1 and is medium; bed 3 stable scores 0.
+        self.assertEqual(snap["beds"][0]["news2"]["components"]["spo2"], 2)
+        self.assertEqual(snap["beds"][0]["news2"]["risk"], "low")
+        self.assertEqual(snap["beds"][1]["news2"]["components"]["spo2"], 0)
+        self.assertEqual(snap["beds"][1]["news2"]["score"], 4)
+        self.assertEqual(snap["beds"][2]["news2"]["components"]["spo2"], 3)
+        self.assertEqual(snap["beds"][2]["news2"]["risk"], "medium")
+        self.assertEqual(snap["beds"][3]["news2"]["score"], 0)
+        for _ in range(39):
+            snap = ward.tick()
+        # Over 40 ticks the patient on oxygen drifts above the
+        # target band and escalates twice, the hypoxic patient on
+        # oxygen never escalates, and the hypoxic patient off
+        # oxygen stays escalated from t=1.
+        summary = ward.early_warning_summary()
+        self.assertEqual(summary["on_oxygen"], 2)
+        self.assertEqual(summary["medium_risk"], 2)
+        self.assertEqual(summary["low_risk"], 2)
+        self.assertEqual(summary["escalated"], 2)
+        self.assertEqual(summary["escalations_raised"], 3)
+        self.assertEqual(summary["beds"][0]["escalations_raised"], 2)
+        self.assertEqual(summary["beds"][1]["escalations_raised"], 0)
+        self.assertEqual(summary["beds"][2]["escalations_raised"], 1)
 
 
 if __name__ == "__main__":

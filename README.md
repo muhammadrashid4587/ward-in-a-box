@@ -96,6 +96,11 @@ python3 -m ward.cli scenarios/discharge-auto-order-lead-time.json --seed 42
 # 10 s pushes the febrile patient to high risk
 python3 -m ward.cli scenarios/news2.json --seed 42
 
+# Oxygen therapy: a stable patient on oxygen scores on NEWS2
+# Scale 2, a hypoxic patient on oxygen sits inside the 88-92
+# target band, and the same hypoxic patient off oxygen is medium
+python3 -m ward.cli scenarios/oxygen.json --seed 42
+
 # Reproducible run
 python3 -m ward.cli scenarios/example.json --seed 42
 ```
@@ -795,26 +800,28 @@ tick's vitals:
 
 ```json
 {"news2": {"score": 6, "risk": "medium", "red_score": true,
+ "spo2_scale": 1,
  "components": {"resp_rate": 2, "spo2": 3, "systolic": 0,
  "heart_rate": 1, "temperature": 0},
  "response": "urgent review by ward team (hourly monitoring)"}}
 ```
 
 Each of the five scored parameters contributes 0 to 3 points on
-the standard NEWS2 bands (respiratory rate, SpO2 on Scale 1,
-systolic blood pressure, heart rate, temperature). The aggregate
-drives the risk: 0-4 low, 5-6 medium, 7 or more high — and any
-single parameter scoring 3 is a red score, which makes the risk
-medium even when the aggregate is low. The response is NEWS2's
-own: routine monitoring at low risk, urgent review by the ward
-team at medium, urgent review by the critical care team at high.
+the standard NEWS2 bands (respiratory rate, SpO2, systolic blood
+pressure, heart rate, temperature). SpO2 is scored on Scale 1 for
+patients not on oxygen and on Scale 2 for patients on oxygen (see
+Oxygen therapy below). The aggregate drives the risk: 0-4 low, 5-6
+medium, 7 or more high — and any single parameter scoring 3 is a
+red score, which makes the risk medium even when the aggregate is
+low. The response is NEWS2's own: routine monitoring at low risk,
+urgent review by the ward team at medium, urgent review by the
+critical care team at high.
 
-Two honest limitations. Consciousness (ACVPU) is not scored: the
-simulator generates no consciousness state, so a ward score is a
-partial NEWS2, missing one of its six parameters. And SpO2 uses
-Scale 1 only, because the ward has no oxygen-therapy state for
-Scale 2 to apply to. The score is advisory only — a test signal
-for health software, not a clinical judgement.
+One honest limitation remains. Consciousness (ACVPU) is not scored:
+the simulator generates no consciousness state, so a ward score is a
+partial NEWS2, missing one of its six parameters. The score is
+advisory only — a test signal for health software, not a clinical
+judgement.
 
 A patient whose risk leaves low opens a deterioration episode:
 it records when it raised, the worst score it reached, and the
@@ -836,6 +843,50 @@ low, and the febrile bed deteriorates on its own (a medium
 episode at 5-9 s) and then goes high under the alarm storm at
 10 s, peaking at 11 and clearing at 40 s — 3 episodes raised in
 total.
+
+## Oxygen therapy and NEWS2 Scale 2
+
+A patient can be on supplemental oxygen, set per patient in the
+scenario:
+
+```json
+{"bed": 1, "profile": "hypoxic", "on_oxygen": true}
+```
+
+The flag is scoring only: it does not change the vitals the
+monitor generates, so two wards with the same seed emit identical
+signs and alarms whether or not a patient is on oxygen — only the
+score differs. What changes is which SpO2 table NEWS2 uses. Scale 1
+applies off oxygen (92-93 scores 2, 94-95 scores 1, 96 or above
+scores 0); Scale 2 applies on oxygen, where the target band is
+88-92, so 93-96 scores 2 and 97 or above scores 3 — the same SpO2
+that is fine on air is a warning on oxygen, because a patient on
+oxygen is expected to sit in the target band. Below the band the
+tables agree in shape but not in edge: 88-92 scores 0 on Scale 2
+and 3 on Scale 1, so a hypoxic patient at 89 is medium risk off
+oxygen and low risk on it.
+
+Every reading carries the flag (`"on_oxygen"`) and every score
+carries which table was used (`"spo2_scale": 1` or `2`), so a
+client can tell why two patients with the same SpO2 scored
+differently. The early-warning summary carries the per-bed flag
+and a ward count of patients on oxygen (`"on_oxygen"`). A new
+admission starts off oxygen unless the admission says otherwise —
+the previous patient's flag never carries over to the next patient
+in the bed, and a triage admission is off oxygen by default.
+
+One honest limitation: oxygen therapy is a flag, not a treatment
+model. A real patient on oxygen would have their SpO2 lifted by
+it; here the vitals keep whatever the profile produces, so a
+hypoxic patient on oxygen can sit below the target band and a
+stable one above it. The score is still NEWS2's own for the SpO2
+the monitor shows — it just does not model the therapy working.
+See `scenarios/oxygen.json` for a runnable example: over a seeded
+40-tick run the stable patient on oxygen drifts above the target
+band and escalates twice, the hypoxic patient on oxygen sits
+inside 88-92 and never escalates, and the same hypoxic patient
+off oxygen stays escalated from 1 s — 3 episodes raised in total,
+2 patients on oxygen.
 
 ## Recording a run
 
@@ -860,7 +911,7 @@ endpoints returned 503 while it lasted, the ticks did not stop.
 make test
 ```
 
-212 tests: vitals stay inside plausible ranges, dropout actually stops a
+219 tests: vitals stay inside plausible ranges, dropout actually stops a
 monitor's stream, an alarm storm produces alarms, stale readings freeze,
 a partition blocks the snapshot endpoint, the HTTP endpoints serve valid
 JSON, the stream serves JSON lines, scenario files validate, alarm
@@ -1031,7 +1082,16 @@ snapshots, the `GET /news2` endpoint (503 while partitioned), and
 WebSocket frames, the run summary carrying the early-warning
 totals, and the `news2.json` scenario raising 3 episodes over a
 seeded run (a medium one on the hypoxic bed, a medium and a high
-one on the febrile bed, the high one peaking at 11).
+one on the febrile bed, the high one peaking at 11). Oxygen
+tests cover the Scale 2 band boundaries and Scale 1 staying
+unchanged, the score reporting which SpO2 table it used, the
+reading and early-warning summary carrying the oxygen flag and
+count, oxygen changing the score and never the vitals or the
+alarms (identical signs and alarm lists with and without it over
+a seeded 40-tick run), a new admission resetting the flag (and
+an admission explicitly on oxygen keeping it), validation of a
+bad flag, and the `oxygen.json` scenario raising 3 episodes over
+a seeded run with 2 patients on oxygen.
 
 ## Roadmap
 
@@ -1114,3 +1174,9 @@ one on the febrile bed, the high one peaking at 11).
   `GET /news2` endpoint, and the run summary; consciousness not
   scored and SpO2 on Scale 1 only, documented as limitations;
   the score never touches the alarm list) — done in v0.23.0
+- Oxygen therapy and NEWS2 Scale 2 (a per-patient `on_oxygen`
+  flag in the scenario, SpO2 scored on Scale 2 when on oxygen
+  and Scale 1 when not, the scale named in every score, the flag
+  in every reading and the early-warning summary, a new admission
+  starting off oxygen; oxygen is scoring only and does not
+  change the vitals, documented as a limitation) — done in v0.24.0

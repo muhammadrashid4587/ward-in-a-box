@@ -27,6 +27,7 @@ def load_scenario(path):
     rate = data.get("rate_hz", 1.0)
     profiles = []
     acuities = []
+    oxygen = []
     meds = []
     for i, p in enumerate(data.get("patients", [])):
         profile = p.get("profile", "stable") if isinstance(p, dict) else p
@@ -39,6 +40,12 @@ def load_scenario(path):
         except ValueError:
             raise ValueError("patient %d: acuity must be an int in 1..4, got %r" % (i, acuity))
         acuities.append(acuity)
+        on_oxygen = p.get("on_oxygen", False) if isinstance(p, dict) else False
+        if not isinstance(on_oxygen, bool):
+            raise ValueError(
+                "patient %d: on_oxygen must be a bool, got %r" % (i, on_oxygen)
+            )
+        oxygen.append(on_oxygen)
         bed_meds = p.get("meds", []) if isinstance(p, dict) else []
         if not isinstance(bed_meds, list):
             raise ValueError("patient %d: meds must be a list" % i)
@@ -133,6 +140,7 @@ def load_scenario(path):
         "rate_hz": rate,
         "profiles": profiles,
         "acuities": acuities,
+        "oxygen": oxygen,
         "meds": meds,
         "chaos": chaos,
         "timeline": timeline,
@@ -153,6 +161,7 @@ def build_ward(cfg, seed=None, recorder=None):
         rate_hz=cfg["rate_hz"],
         profiles=cfg["profiles"],
         acuities=cfg.get("acuities"),
+        oxygen=cfg.get("oxygen"),
         meds=cfg.get("meds"),
         chaos=cfg["chaos"],
         seed=seed,

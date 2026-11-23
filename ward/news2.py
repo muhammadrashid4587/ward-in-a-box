@@ -14,8 +14,12 @@ Two parameters are not modelled here, and the score says so:
   it is left out entirely rather than guessed. A real NEWS2 always
   includes it; a score from this ward is therefore a partial score
   and must never be treated as a clinical assessment.
-- SpO2 uses Scale 1 (patients not on supplemental oxygen). The ward
-  has no oxygen-therapy state, so Scale 2 does not apply.
+- SpO2 is scored on Scale 1 for patients not on supplemental oxygen
+  and on Scale 2 for patients on oxygen (see ``score_spo2``). The
+  flag is per patient, set in the scenario; oxygen therapy is a
+  scoring flag only — it does not change the vitals the monitor
+  generates, so a patient on oxygen keeps whatever SpO2 their
+  profile produces.
 
 The score is advisory only: this is a test tool for health
 software, not medical software. It exists so a client can be tested
@@ -47,8 +51,27 @@ def score_resp_rate(rr):
     return 3
 
 
-def score_spo2(spo2):
-    """NEWS2 points for SpO2, Scale 1 (no supplemental oxygen)."""
+def score_spo2(spo2, on_oxygen=False):
+    """NEWS2 points for SpO2.
+
+    Scale 1 when the patient is not on supplemental oxygen, Scale 2
+    when they are. Scale 2 is NEWS2's oxygen-target table: a patient
+    on oxygen is expected to sit at 88-92, so 93-96 scores 2 and 97
+    or above scores 3 — the same SpO2 that is fine on air is a
+    warning on oxygen.
+    """
+    if on_oxygen:
+        if spo2 <= 83:
+            return 3
+        if spo2 <= 85:
+            return 2
+        if spo2 <= 87:
+            return 1
+        if spo2 <= 92:
+            return 0
+        if spo2 <= 96:
+            return 2
+        return 3
     if spo2 <= 91:
         return 3
     if spo2 <= 93:
@@ -99,18 +122,20 @@ def score_temperature(temp):
     return 2
 
 
-def score_signs(signs):
+def score_signs(signs, on_oxygen=False):
     """Score a set of vitals.
 
     Returns ``{"score": total, "risk": "low"|"medium"|"high",
-    "red_score": bool, "components": {parameter: points, ...},
+    "red_score": bool, "spo2_scale": 1|2,
+    "components": {parameter: points, ...},
     "response": str}``. ``red_score`` is True when any single
     parameter scores 3 — that alone makes the risk medium, even
-    when the aggregate is low.
+    when the aggregate is low. ``spo2_scale`` says which SpO2
+    table was used: 2 when the patient is on oxygen, 1 otherwise.
     """
     components = {
         "resp_rate": score_resp_rate(signs["resp_rate"]),
-        "spo2": score_spo2(signs["spo2"]),
+        "spo2": score_spo2(signs["spo2"], on_oxygen),
         "systolic": score_systolic(signs["systolic"]),
         "heart_rate": score_heart_rate(signs["heart_rate"]),
         "temperature": score_temperature(signs["temperature"]),
@@ -127,6 +152,7 @@ def score_signs(signs):
         "score": total,
         "risk": risk,
         "red_score": red,
+        "spo2_scale": 2 if on_oxygen else 1,
         "components": components,
         "response": RESPONSE[risk],
     }

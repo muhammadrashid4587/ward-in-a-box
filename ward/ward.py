@@ -28,7 +28,7 @@ class Ward:
     snapshot to a JSONL file.
     """
 
-    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None, cleaning_s=30.0, meds=None, triage=None, discharge_planning=None, cleaning_capacity=None, discharge_readiness=None):
+    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None, cleaning_s=30.0, meds=None, triage=None, discharge_planning=None, cleaning_capacity=None, discharge_readiness=None, oxygen=None):
         if not 1 <= beds <= 64:
             raise ValueError("beds must be 1..64")
         if rate_hz <= 0:
@@ -119,7 +119,8 @@ class Ward:
             profile = profiles[i] if i < len(profiles) else DEFAULT_PROFILES[i % len(DEFAULT_PROFILES)]
             acuity = acuities[i] if i < len(acuities) else 3
             bed_meds = meds[i] if meds is not None and i < len(meds) else None
-            monitor = Monitor(i, profile, rng=self.rng, acuity=acuity, meds=bed_meds)
+            on_oxygen = oxygen[i] if oxygen is not None and i < len(oxygen) else False
+            monitor = Monitor(i, profile, rng=self.rng, acuity=acuity, meds=bed_meds, on_oxygen=on_oxygen)
             # With a timeline, beds start unadmitted and come online as
             # the timeline admits them; without one, all beds start open.
             if timeline is not None:
@@ -365,6 +366,7 @@ class Ward:
         return {
             "t": self.elapsed,
             "beds": beds,
+            "on_oxygen": sum(1 for b in beds if b["on_oxygen"]),
             "high_risk": sum(
                 1 for b in scored if b["news2"]["risk"] == "high"
             ),
@@ -390,12 +392,12 @@ class Ward:
         )
         return summary
 
-    def admit(self, bed_id, profile=None, acuity=None):
+    def admit(self, bed_id, profile=None, acuity=None, on_oxygen=None):
         """Admit a new patient to an available bed.
 
         Raises ValueError if the bed is occupied or still cleaning.
         """
-        self._monitor(bed_id).admit(self.elapsed, profile=profile, acuity=acuity)
+        self._monitor(bed_id).admit(self.elapsed, profile=profile, acuity=acuity, on_oxygen=on_oxygen)
 
     def _monitor(self, bed_id):
         if not 0 <= bed_id < self.beds:
