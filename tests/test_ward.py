@@ -28,7 +28,13 @@ from ward.server import make_handler
 from ward.staffing import Staffing
 from ward.timeline import Timeline, TimelinePhase
 from ward.triage import TriageQueue
-from ward.news2 import score_consciousness, score_signs, score_spo2, validate_consciousness
+from ward.news2 import (
+    score_consciousness,
+    score_signs,
+    score_spo2,
+    validate_consciousness,
+    validate_consciousness_dynamics,
+)
 from ward.vitals import PROFILES, effective_ranges, validate_acuity
 from ward.ward import Ward
 from ward.websocket import accept_key, encode_frame, read_frame
@@ -4139,6 +4145,370 @@ class TestACVPU(unittest.TestCase):
                     msg["beds"][0]["news2"]["components"]["consciousness"],
                     3,
                 )
+            finally:
+                ws.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+class TestConsciousnessDynamics(unittest.TestCase):
+    def test_dynamics_validation(self):
+        # Off, defaults, and partial overrides.
+        self.assertIsNone(validate_consciousness_dynamics(None))
+        self.assertEqual(
+            validate_consciousness_dynamics(True),
+            {"deteriorate_after_s": 5.0, "recover_after_s": 10.0},
+        )
+        self.assertEqual(
+            validate_consciousness_dynamics({"deteriorate_after_s": 3}),
+            {"deteriorate_after_s": 3.0, "recover_after_s": 10.0},
+        )
+        self.assertEqual(
+            validate_consciousness_dynamics(
+                {"deteriorate_after_s": 2, "recover_after_s": 4}
+            ),
+            {"deteriorate_after_s": 2.0, "recover_after_s": 4.0},
+        )
+        for bad in (
+            "fast",
+            5,
+            0,
+            False,
+            {"deteriorate_after_s": 0},
+            {"deteriorate_after_s": -1},
+            {"recover_after_s": "soon"},
+            {"recover_after_s": True},
+            {"recover_after_s": None},
+            {"deteriorate_after_s": 3, "wake_up_after_s": 1},
+        ):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                validate_consciousness_dynamics(bad)
+        with self.assertRaises(ValueError):
+            Monitor(0, consciousness_dynamics={"deteriorate_after_s": 0})
+        with self.assertRaises(ValueError):
+            Ward(
+                beds=1,
+                consciousness_dynamics=[{"recover_after_s": "soon"}],
+            )
+        cfg = load_scenario(
+            os.path.join(HERE, "..", "scenarios", "news2-acvpu-dynamics.json")
+        )
+        cfg["consciousness_dynamics"] = [
+            {"deteriorate_after_s": -1},
+            None,
+            None,
+            None,
+        ]
+        with self.assertRaises(ValueError):
+            build_ward(cfg, seed=42)
+
+    def test_recovery_steps_up_on_a_clock(self):
+        # A stable patient's vitals-only risk is always low, so a
+        # patient responding only to pain climbs back one level
+        # every 2 s: pain at t=1, voice at t=2, confusion at t=4,
+        # Alert at t=6 — and the episode closes when they get there.
+        ward = Ward(
+            beds=1,
+            profiles=["stable"],
+            consciousness=["pain"],
+            consciousness_dynamics=[
+                {"deteriorate_after_s": 2, "recover_after_s": 2}
+            ],
+            seed=42,
+        )
+        levels = [ward.tick()["beds"][0]["consciousness"] for _ in range(7)]
+        self.assertEqual(
+            levels,
+            ["pain", "voice", "voice", "confusion", "confusion",
+             "alert", "alert"],
+        )
+        detail = ward.early_warning_summary()["beds"][0]
+        self.assertEqual(
+            detail["consciousness_history"],
+            [
+                {"from": "pain", "to": "voice", "t": 2.0},
+                {"from": "voice", "to": "confusion", "t": 4.0},
+                {"from": "confusion", "to": "alert", "t": 6.0},
+            ],
+        )
+        self.assertEqual(detail["consciousness_changes"], 3)
+        self.assertFalse(detail["escalated"])
+        self.assertEqual(detail["episodes"][0]["cleared_t"], 6.0)
+        # The score follows the level: Alert again at t=6, so the
+        # consciousness component is 0 and the risk is low.
+        snap = ward.tick()
+        self.assertEqual(
+            snap["beds"][0]["news2"]["components"]["consciousness"], 0
+        )
+        self.assertEqual(snap["beds"][0]["news2"]["risk"], "low")
+
+    def test_deterioration_steps_down_while_vitals_stay_bad(self):
+        # A hypoxic patient's vitals-only risk sits at medium, so
+        # they slide one ACVPU level worse every 2 s until there is
+        # nowhere worse to go — and then stay Unresponsive.
+        ward = Ward(
+            beds=1,
+            profiles=["hypoxic"],
+            consciousness_dynamics=[
+                {"deteriorate_after_s": 2, "recover_after_s": 2}
+            ],
+            seed=42,
+        )
+        for _ in range(20):
+            snap = ward.tick()
+        self.assertEqual(snap["beds"][0]["consciousness"], "unresponsive")
+        self.assertEqual(
+            snap["beds"][0]["news2"]["components"]["consciousness"], 3
+        )
+        self.assertEqual(snap["beds"][0]["news2"]["risk"], "high")
+        detail = ward.early_warning_summary()["beds"][0]
+        history = detail["consciousness_history"]
+        self.assertEqual(len(history), 4)
+        self.assertEqual(
+            [(h["from"], h["to"]) for h in history],
+            [
+                ("alert", "confusion"),
+                ("confusion", "voice"),
+                ("voice", "pain"),
+                ("pain", "unresponsive"),
+            ],
+        )
+        self.assertEqual(
+            ward.early_warning_summary()["consciousness_changes"], 4
+        )
+        self.assertEqual(ward.early_warning_summary()["not_alert"], 1)
+
+    def test_dynamics_never_change_the_vitals(self):
+        # Dynamics are deterministic and RNG-free: two wards with
+        # the same seed emit identical vitals and alarms whether
+        # dynamics are on or off — only the consciousness level and
+        # the score differ.
+        plain = Ward(beds=2, profiles=["stable", "hypoxic"], seed=42)
+        dynamic = Ward(
+            beds=2,
+            profiles=["stable", "hypoxic"],
+            consciousness_dynamics=[
+                {"deteriorate_after_s": 2, "recover_after_s": 2},
+                {"deteriorate_after_s": 2, "recover_after_s": 2},
+            ],
+            seed=42,
+        )
+        for _ in range(40):
+            a = plain.tick()
+            b = dynamic.tick()
+            for ra, rb in zip(a["beds"], b["beds"]):
+                for key in (
+                    "heart_rate", "spo2", "systolic", "diastolic",
+                    "temperature", "resp_rate",
+                ):
+                    self.assertEqual(ra[key], rb[key], key)
+                self.assertEqual(ra["alarms"], rb["alarms"])
+        # ...while the dynamics ward's hypoxic bed did deteriorate.
+        self.assertEqual(
+            b["beds"][1]["consciousness"], "unresponsive"
+        )
+        self.assertEqual(
+            a["beds"][1]["consciousness"], "alert"
+        )
+
+    def test_dynamics_off_by_default(self):
+        # No dynamics configured: a hypoxic patient stays Alert for
+        # a whole run, exactly as before.
+        ward = Ward(beds=1, profiles=["hypoxic"], seed=42)
+        for _ in range(40):
+            snap = ward.tick()
+        self.assertEqual(snap["beds"][0]["consciousness"], "alert")
+        self.assertEqual(
+            ward.early_warning_summary()["consciousness_changes"], 0
+        )
+        # Dynamics configured with thresholds longer than the run
+        # also never move the level.
+        slow = Ward(
+            beds=1,
+            profiles=["hypoxic"],
+            consciousness_dynamics=[
+                {"deteriorate_after_s": 3600, "recover_after_s": 3600}
+            ],
+            seed=42,
+        )
+        for _ in range(40):
+            snap = slow.tick()
+        self.assertEqual(snap["beds"][0]["consciousness"], "alert")
+
+    def test_admit_resets_consciousness_history(self):
+        ward = Ward(
+            beds=1,
+            profiles=["hypoxic"],
+            consciousness_dynamics=[
+                {"deteriorate_after_s": 2, "recover_after_s": 2}
+            ],
+            seed=42,
+        )
+        for _ in range(20):
+            ward.tick()
+        self.assertEqual(
+            ward.monitors[0].consciousness, "unresponsive"
+        )
+        self.assertEqual(len(ward.monitors[0].consciousness_history), 4)
+        ward.discharge(0)
+        for _ in range(31):
+            ward.tick()
+        ward.admit(0)
+        self.assertEqual(ward.monitors[0].consciousness, "alert")
+        self.assertEqual(ward.monitors[0].consciousness_history, [])
+        # The dynamics config is the bed's scenario setting, so it
+        # still applies to the new patient.
+        for _ in range(20):
+            ward.tick()
+        self.assertEqual(
+            ward.monitors[0].consciousness, "unresponsive"
+        )
+
+    def test_scenario_news2_acvpu_dynamics(self):
+        cfg = load_scenario(
+            os.path.join(
+                HERE, "..", "scenarios", "news2-acvpu-dynamics.json"
+            )
+        )
+        ward = build_ward(cfg, seed=42)
+        snap = ward.tick()
+        # t=1: bed 0 stable and Alert scores 0; bed 1 hypoxic and
+        # Alert is already high on vitals alone; bed 2 febrile and
+        # responding to voice is medium; bed 3 stable and confused
+        # is medium on the consciousness red score alone.
+        self.assertEqual(snap["beds"][0]["news2"]["score"], 0)
+        self.assertEqual(snap["beds"][1]["news2"]["score"], 7)
+        self.assertEqual(snap["beds"][1]["news2"]["risk"], "high")
+        self.assertEqual(snap["beds"][2]["news2"]["score"], 6)
+        self.assertEqual(snap["beds"][2]["news2"]["risk"], "medium")
+        self.assertEqual(snap["beds"][3]["news2"]["score"], 3)
+        self.assertEqual(snap["beds"][3]["news2"]["risk"], "medium")
+        for _ in range(39):
+            snap = ward.tick()
+        summary = ward.early_warning_summary()
+        # Bed 1 slid Alert -> confusion -> voice -> pain ->
+        # unresponsive at 3 s intervals and stayed high; bed 2
+        # recovered voice -> confusion -> Alert and its first
+        # episode closed at 6 s; bed 3 recovered confusion -> Alert
+        # at 3 s. Only bed 1 is not Alert at the end.
+        self.assertEqual(summary["consciousness_changes"], 7)
+        self.assertEqual(summary["not_alert"], 1)
+        self.assertEqual(summary["high_risk"], 1)
+        self.assertEqual(summary["medium_risk"], 1)
+        self.assertEqual(summary["low_risk"], 2)
+        self.assertEqual(summary["escalated"], 2)
+        self.assertEqual(summary["escalations_raised"], 5)
+        bed1 = summary["beds"][1]
+        self.assertEqual(bed1["consciousness"], "unresponsive")
+        self.assertEqual(
+            [h["t"] for h in bed1["consciousness_history"]],
+            [3.0, 6.0, 9.0, 12.0],
+        )
+        self.assertEqual(bed1["episodes"][0]["peak_score"], 9)
+        self.assertIsNone(bed1["episodes"][0]["cleared_t"])
+        bed2 = summary["beds"][2]
+        self.assertEqual(bed2["consciousness"], "alert")
+        self.assertEqual(
+            [h["t"] for h in bed2["consciousness_history"]],
+            [3.0, 6.0],
+        )
+        self.assertEqual(bed2["episodes"][0]["cleared_t"], 6.0)
+        self.assertEqual(bed2["episodes"][0]["peak_score"], 6)
+        bed3 = summary["beds"][3]
+        self.assertEqual(bed3["consciousness"], "alert")
+        self.assertEqual(
+            bed3["consciousness_history"],
+            [{"from": "confusion", "to": "alert", "t": 3.0}],
+        )
+        self.assertEqual(bed3["episodes"][0]["cleared_t"], 3.0)
+
+    def test_recorder_summary_carries_consciousness_changes(self):
+        cfg = load_scenario(
+            os.path.join(
+                HERE, "..", "scenarios", "news2-acvpu-dynamics.json"
+            )
+        )
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".jsonl", delete=False
+        ) as f:
+            path = f.name
+        try:
+            with Recorder(path, cfg["beds"], cfg["rate_hz"], seed=42) as rec:
+                ward = build_ward(cfg, seed=42, recorder=rec)
+                for _ in range(40):
+                    ward.tick()
+            summary = summarize(path)
+            ew = summary["early_warning"]
+            self.assertEqual(ew["consciousness_changes"], 7)
+            self.assertEqual(ew["not_alert"], 1)
+            self.assertEqual(ew["escalations_raised"], 5)
+        finally:
+            os.unlink(path)
+
+    def test_news2_endpoint_and_ws_frame_carry_changing_consciousness(self):
+        cfg = load_scenario(
+            os.path.join(
+                HERE, "..", "scenarios", "news2-acvpu-dynamics.json"
+            )
+        )
+        ward = build_ward(cfg, seed=42)
+        for _ in range(40):
+            ward.tick()
+        server, port = serve_in_thread(ward)
+        try:
+            status, body = get(port, "/news2")
+            self.assertEqual(status, 200)
+            data = json.loads(body)
+            self.assertEqual(data["consciousness_changes"], 7)
+            self.assertEqual(data["not_alert"], 1)
+            self.assertEqual(
+                data["beds"][1]["consciousness"], "unresponsive"
+            )
+            self.assertEqual(
+                data["beds"][1]["consciousness_changes"], 4
+            )
+            self.assertEqual(
+                data["beds"][3]["consciousness_history"],
+                [{"from": "confusion", "to": "alert", "t": 3.0}],
+            )
+            ward.partitioned = True
+            status, _ = get(port, "/news2")
+            self.assertEqual(status, 503)
+            ward.partitioned = False
+        finally:
+            server.shutdown()
+            server.server_close()
+        ward2 = Ward(
+            beds=1,
+            profiles=["hypoxic"],
+            consciousness_dynamics=[
+                {"deteriorate_after_s": 0.2, "recover_after_s": 0.2}
+            ],
+            rate_hz=20.0,
+            seed=42,
+        )
+        server, port = serve_in_thread(ward2)
+        try:
+            ws = WsClient(port)
+            try:
+                seen_unresponsive = False
+                for _ in range(200):
+                    msg = json.loads(ws.read_until_opcode(1))
+                    if msg["beds"][0]["consciousness"] == "unresponsive":
+                        seen_unresponsive = True
+                        self.assertEqual(
+                            msg["early_warning"]["consciousness_changes"],
+                            4,
+                        )
+                        self.assertEqual(
+                            msg["beds"][0]["news2"]["components"][
+                                "consciousness"
+                            ],
+                            3,
+                        )
+                        break
+                self.assertTrue(seen_unresponsive)
             finally:
                 ws.close()
         finally:

@@ -241,6 +241,9 @@ def summarize(path):
                     "escalations_raised"
                 ],
                 "not_alert": last_early_warning.get("not_alert", 0),
+                "consciousness_changes": last_early_warning.get(
+                    "consciousness_changes", 0
+                ),
             }
             if last_early_warning is not None
             else None

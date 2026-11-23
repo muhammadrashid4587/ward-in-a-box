@@ -824,13 +824,11 @@ low. The response is NEWS2's own: routine monitoring at low risk,
 urgent review by the ward team at medium, urgent review by the
 critical care team at high.
 
-One honest limitation remains. Consciousness is set per patient in
-the scenario and does not change over a run: a patient who starts
-confused stays confused, so a non-Alert patient stays escalated
-until they are discharged. No consciousness dynamics are modelled —
-a patient whose level of responsiveness changes mid-run is outside
-what this ward simulates, and the score says so rather than
-inventing a change. The score is
+Consciousness can change over a run when a patient has
+`consciousness_dynamics` set (see Consciousness below): the level
+steps one ACVPU level at a time, driven by how long the patient's
+vitals-only NEWS2 risk holds, and every change is recorded with
+its time in the early-warning summary. The score is
 advisory only — a test signal for health software, not a clinical
 judgement.
 
@@ -928,19 +926,68 @@ says otherwise — the previous patient's level never carries over
 to the next patient in the bed, and a triage admission is Alert
 by default.
 
-One honest limitation: consciousness is a fixed state, not a
-vital. It does not change over a run — the monitor generates no
-consciousness dynamics, so a confused patient stays confused
-and stays escalated until discharge. The score is still NEWS2's
-own for the level the scenario sets; it just does not model a
-patient waking up or deteriorating in responsiveness. See
-`scenarios/news2-acvpu.json` for a runnable example: over a
-seeded 40-tick run the Alert stable bed scores 0 and never
-escalates, the stable bed responding only to voice sits at
-medium on the consciousness red score and stays escalated from
+See `scenarios/news2-acvpu.json` for a runnable example of fixed
+levels: over a seeded 40-tick run the Alert stable bed scores 0
+and never escalates, the stable bed responding only to voice sits
+at medium on the consciousness red score and stays escalated from
 1 s, the confused hypoxic bed is high from 1 s peaking at 9,
 and the unresponsive febrile bed is high from 1 s peaking at 9
 — 3 episodes raised in total, 3 patients not Alert.
+
+## Consciousness dynamics (ACVPU changing over a run)
+
+By default the level is fixed, as above. A patient with
+`consciousness_dynamics` in the scenario changes over time,
+driven by their own vitals:
+
+```json
+{"bed": 1, "profile": "hypoxic",
+ "consciousness_dynamics": {"deteriorate_after_s": 3, "recover_after_s": 3}}
+```
+
+The rule is a clock on the vitals-only NEWS2 risk — the score
+with consciousness held at Alert, so the level itself cannot
+drive the decision (a non-Alert patient is medium risk on the
+consciousness red score alone, so judging by the total risk
+would make recovery impossible). While the vitals risk is medium
+or high the deterioration clock runs; while it is low the
+recovery clock runs; a clock reaching its threshold steps the
+level one ACVPU level in that direction and restarts, so a
+patient slides from Alert toward Unresponsive one level at a
+time while their vitals stay bad and climbs back one level at a
+time as they recover, never jumping straight from Alert to
+Unresponsive. `true` in place of the object means the defaults
+(`deteriorate_after_s` 5, `recover_after_s` 10). The thresholds
+must be numbers above 0; anything else is a scenario error.
+
+Every change is recorded with its time (`"consciousness_history"`
+per bed, `{"from", "to", "t"}`) and counted in the early-warning
+summary (`"consciousness_changes"`, ward total and per bed), so a
+client can see a patient who deteriorated and came back, not just
+where they are now — and because the change is scored in the same
+tick it happens, a dropping level raises the score, opens or
+extends a deterioration episode, and shows up in the snapshot,
+`GET /news2`, and every WebSocket frame at once. The dynamics are
+deterministic and use no randomness, so a seeded run reproduces
+the same changes, and enabling them never changes the vitals or
+alarms a monitor generates. A new admission resets the level to
+Alert and clears the history; the dynamics config is the bed's
+scenario setting and still applies to the next patient.
+
+One honest limitation: the model is a clock on the vitals, not a
+cause. It does not distinguish why responsiveness changed — a
+hypoxic slide, a sedative, a stroke all look the same one-step
+clock — and the thresholds are a test-load choice, not a clinical
+one. The score is still NEWS2's own for the level the monitor
+shows; it just does not model the medicine behind the change.
+See `scenarios/news2-acvpu-dynamics.json` for a runnable example:
+over a seeded 40-tick run the Alert stable bed never changes, the
+hypoxic bed slides Alert to Unresponsive at 3 s intervals (4
+changes, high from 1 s peaking at 9), the febrile bed responding
+only to voice recovers to Alert by 6 s and its first episode
+closes there, and the confused stable bed recovers to Alert at
+3 s — 7 changes and 5 episodes raised in total, 1 patient not
+Alert at the end.
 
 ## Recording a run
 
@@ -1156,6 +1203,22 @@ lists with and without it over a seeded 40-tick run), a new
 admission resetting to Alert (and an admission explicitly
 non-Alert keeping it), and the `news2-acvpu.json` scenario raising
 3 episodes over a seeded run with 3 patients not Alert.
+Consciousness-dynamics tests cover validation of the dynamics
+config (including the `true` shorthand and bad thresholds), a
+recovering patient stepping up one level on a clock (pain to
+voice to confusion to Alert at 2 s intervals, episode closing
+when they reach Alert), a deteriorating patient stepping down
+one level at a time to Unresponsive and staying there, dynamics
+never changing the vitals or alarms (identical signs and alarm
+lists with and without them over a seeded 40-tick run), dynamics
+off by default and with thresholds longer than the run, a new
+admission clearing the consciousness history while the bed's
+dynamics config still applies, and the
+`news2-acvpu-dynamics.json` scenario raising 5 episodes and
+recording 7 consciousness changes over a seeded run (the hypoxic
+bed sliding to Unresponsive, two patients recovering to Alert),
+with the changes carried by the `GET /news2` endpoint and
+WebSocket frames.
 
 ## Roadmap
 
@@ -1251,3 +1314,13 @@ non-Alert keeping it), and the `news2-acvpu.json` scenario raising
   not-Alert count, a new admission starting Alert; consciousness
   is a fixed state that does not change over a run, documented as
   a limitation) — done in v0.25.0
+- Consciousness dynamics (a per-patient `consciousness_dynamics`
+  config — `deteriorate_after_s` / `recover_after_s`, or `true`
+  for the defaults — stepping the ACVPU level one level at a time
+  on a clock driven by the vitals-only NEWS2 risk, down while the
+  vitals risk is medium or high and up while it is low, every
+  change recorded with its time in the early-warning summary and
+  scored in the same tick it happens, in every snapshot, WebSocket
+  frame, a `GET /news2` endpoint, and the run summary; off by
+  default, deterministic and never changing the vitals or alarms)
+  — done in v0.26.0

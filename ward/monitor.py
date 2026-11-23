@@ -4,7 +4,12 @@ import random
 from collections import deque
 
 from .meds import MedSchedule
-from .news2 import score_signs, validate_consciousness
+from .news2 import (
+    ACVPU_LEVELS,
+    score_signs,
+    validate_consciousness,
+    validate_consciousness_dynamics,
+)
 from .vitals import alarms_for, initial_signs, step, validate_acuity
 
 # Where an alarm storm drags each vital. All of them trip an alarm.
@@ -31,12 +36,23 @@ class Monitor:
     seconds); the monitor clears each one when its time passes.
     """
 
-    def __init__(self, bed_id, profile="stable", rng=None, acuity=3, meds=None, on_oxygen=False, consciousness="alert"):
+    def __init__(self, bed_id, profile="stable", rng=None, acuity=3, meds=None, on_oxygen=False, consciousness="alert", consciousness_dynamics=None):
         self.bed_id = bed_id
         self.profile = profile
         self.acuity = validate_acuity(acuity)
         self.on_oxygen = self._validate_on_oxygen(on_oxygen)
         self.consciousness = validate_consciousness(consciousness)
+        self.consciousness_dynamics = validate_consciousness_dynamics(
+            consciousness_dynamics
+        )
+        # Every consciousness change this stay, as
+        # {"from": level, "to": level, "t": seconds}; empty while
+        # dynamics are off or the level has never moved.
+        self.consciousness_history = []
+        # Consecutive seconds the vitals-only risk has held in one
+        # direction; each resets when the risk flips.
+        self._deteriorating_s = 0.0
+        self._recovering_s = 0.0
         self.meds = MedSchedule(bed_id, meds)
         self.rng = rng if rng is not None else random.Random()
         self.signs = initial_signs(profile, self.rng, self.acuity)
@@ -192,6 +208,12 @@ class Monitor:
         self.consciousness = validate_consciousness(
             "alert" if consciousness is None else consciousness
         )
+        # A new patient starts with no consciousness history and
+        # both clocks at zero; the dynamics config itself is the
+        # bed's scenario setting and stays across admissions.
+        self.consciousness_history = []
+        self._deteriorating_s = 0.0
+        self._recovering_s = 0.0
         self.signs = initial_signs(self.profile, self.rng, self.acuity)
         self.seq = 0
         self.last_reading = None
@@ -251,6 +273,11 @@ class Monitor:
             self.alarm_until = None
             self.signs = step(self.signs, self.profile, self.rng, dt, self.acuity)
 
+        # Consciousness moves before the reading is built, so this
+        # tick's reading, score, and snapshot already carry the new
+        # level — a change is visible in the same tick it happens.
+        self._step_consciousness(now, dt)
+
         self.seq += 1
         reading = {
             "bed": self.bed_id,
@@ -280,6 +307,59 @@ class Monitor:
         self._record_alarm_transitions(reading["alarms"], now)
         self.last_reading = reading
         return reading
+
+    def _step_consciousness(self, now, dt):
+        """Move the ACVPU level one step, if it is due.
+
+        The driver is the vitals-only NEWS2 risk — the score with
+        consciousness held at Alert — because the level itself
+        scores 3 whenever it is not Alert: judging by the total
+        risk would make recovery impossible, since a non-Alert
+        patient is medium risk on the consciousness red score
+        alone. While the vitals risk is medium or high the
+        deterioration clock runs and the recovery clock resets;
+        while it is low the recovery clock runs and the
+        deterioration clock resets. A clock reaching its threshold
+        steps the level one ACVPU level in that direction and
+        restarts at zero, so a patient slides down one level at a
+        time while their vitals stay bad and climbs back one level
+        at a time as they recover — never jumping straight from
+        Alert to Unresponsive. Deterministic and RNG-free, so
+        enabling dynamics never changes the vitals a monitor
+        generates: a seeded run with dynamics on emits the same
+        signs and alarms as the same run with them off.
+        """
+        dyn = self.consciousness_dynamics
+        if dyn is None:
+            return
+        vitals_risk = score_signs(self.signs, self.on_oxygen, "alert")["risk"]
+        idx = ACVPU_LEVELS.index(self.consciousness)
+        if vitals_risk in ("medium", "high"):
+            self._recovering_s = 0.0
+            if idx >= len(ACVPU_LEVELS) - 1:
+                self._deteriorating_s = 0.0
+                return
+            self._deteriorating_s = round(self._deteriorating_s + dt, 3)
+            if self._deteriorating_s >= dyn["deteriorate_after_s"]:
+                self._record_consciousness_change(idx + 1, now)
+                self._deteriorating_s = 0.0
+        else:
+            self._deteriorating_s = 0.0
+            if idx <= 0:
+                self._recovering_s = 0.0
+                return
+            self._recovering_s = round(self._recovering_s + dt, 3)
+            if self._recovering_s >= dyn["recover_after_s"]:
+                self._record_consciousness_change(idx - 1, now)
+                self._recovering_s = 0.0
+
+    def _record_consciousness_change(self, new_idx, now):
+        """Record one ACVPU step, with its time."""
+        old = self.consciousness
+        self.consciousness = ACVPU_LEVELS[new_idx]
+        self.consciousness_history.append(
+            {"from": old, "to": self.consciousness, "t": round(now, 3)}
+        )
 
     def _record_alarm_transitions(self, alarms, now):
         """Record raised/cleared events when alarms cross a band edge.
@@ -375,6 +455,10 @@ class Monitor:
             "admitted": self.admitted,
             "on_oxygen": self.on_oxygen,
             "consciousness": self.consciousness,
+            "consciousness_history": [
+                dict(e) for e in self.consciousness_history
+            ],
+            "consciousness_changes": len(self.consciousness_history),
             "news2": news2,
             "escalated": self._escalation is not None,
             "escalations_raised": self.escalations_raised,

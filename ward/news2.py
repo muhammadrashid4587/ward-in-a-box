@@ -11,12 +11,19 @@ an urgent review by the critical care team.
 Consciousness is the sixth parameter, scored on the ACVPU scale:
 Alert scores 0, anything else — Confusion, responding to Voice,
 responding to Pain, or Unresponsive — scores 3. It is the only
-parameter that is not a vital: it is set per patient in the scenario
-and does not change over a run, so a patient who starts confused
-stays confused. That is a deliberate honesty limit, not an oversight:
-the simulator generates no consciousness dynamics, so it records a
-fixed state rather than inventing one — a patient whose consciousness
-changes mid-run is outside what this ward models.
+parameter that is not a vital: it is set per patient in the scenario,
+and by default it does not change over a run. With
+``consciousness_dynamics`` enabled for a patient, it does: the level
+steps one ACVPU level at a time — down after the patient's
+vitals-only NEWS2 risk (the score with consciousness held at Alert,
+so the level itself cannot drive the decision) stays medium or high
+for ``deteriorate_after_s`` seconds, up after it stays low for
+``recover_after_s`` seconds. A deteriorating patient slides from
+Alert toward Unresponsive while their vitals stay bad and climbs
+back as they recover; a patient whose vitals never leave low risk
+never changes. Every change is recorded with its time, so the
+escalation (who deteriorated, when, how far) is recorded rather
+than just the raw vitals.
 
 SpO2 is scored on Scale 1 for patients not on supplemental oxygen
 and on Scale 2 for patients on oxygen (see ``score_spo2``). The
@@ -140,6 +147,57 @@ def validate_consciousness(level):
             % (", ".join(ACVPU_LEVELS), level)
         )
     return level
+
+
+# Consciousness dynamics, per patient: how long the vitals-only
+# NEWS2 risk must hold before the ACVPU level steps one level.
+# ``deteriorate_after_s`` is consecutive seconds at medium or high
+# vitals risk before stepping one level worse; ``recover_after_s``
+# is consecutive seconds at low vitals risk before stepping one
+# level better. The clock is deterministic — no randomness — so a
+# seeded run reproduces the same changes, and enabling dynamics
+# never changes the vitals a monitor generates.
+DEFAULT_CONSCIOUSNESS_DYNAMICS = {
+    "deteriorate_after_s": 5.0,
+    "recover_after_s": 10.0,
+}
+
+
+def validate_consciousness_dynamics(value):
+    """Normalize a consciousness-dynamics config.
+
+    None means off (the level never changes); True means the
+    defaults; a dict may set either threshold. Returns the
+    normalized dict, or None when dynamics are off.
+    """
+    if value is None:
+        return None
+    if value is True:
+        return dict(DEFAULT_CONSCIOUSNESS_DYNAMICS)
+    if not isinstance(value, dict):
+        raise ValueError(
+            "consciousness_dynamics must be a dict or true, got %r"
+            % (value,)
+        )
+    unknown = sorted(set(value) - set(DEFAULT_CONSCIOUSNESS_DYNAMICS))
+    if unknown:
+        raise ValueError(
+            "consciousness_dynamics has unknown keys: %s"
+            % ", ".join(unknown)
+        )
+    out = dict(DEFAULT_CONSCIOUSNESS_DYNAMICS)
+    for key, threshold in value.items():
+        if (
+            isinstance(threshold, bool)
+            or not isinstance(threshold, (int, float))
+            or threshold <= 0
+        ):
+            raise ValueError(
+                "consciousness_dynamics %s must be a number > 0, got %r"
+                % (key, threshold)
+            )
+        out[key] = float(threshold)
+    return out
 
 
 def score_consciousness(level):
