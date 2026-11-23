@@ -195,6 +195,14 @@ class MedSchedule:
                     self.missed += 1
                     self.missed_active.add(pending["med"])
 
+    def orders_complete(self):
+        """True when no medication order is outstanding: no dose
+        still waiting to be given, and no missed dose that has not
+        been followed by a given one. A missed or stockout-skipped
+        dose keeps the orders incomplete until that medication's
+        next dose is given."""
+        return not self._pending and not self.missed_active
+
     def summary(self, now):
         """Per-bed medication state and dose counts as plain JSON data."""
         return {

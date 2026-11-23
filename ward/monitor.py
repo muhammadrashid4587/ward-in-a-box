@@ -68,6 +68,11 @@ class Monitor:
         # Alarms raised by the most recent tick; the ward reads this to
         # hand them to the staffing model for acknowledgement.
         self.raised_this_tick = []
+        # Discharge readiness: vitals count as stable from
+        # ``_stable_since`` — the last time the patient's alarms
+        # cleared, or admission when they never alarmed. None while
+        # an alarm is active.
+        self._stable_since = 0.0
 
     def state(self, now):
         """Bed state at elapsed time ``now``.
@@ -162,6 +167,7 @@ class Monitor:
         self.last_reading = None
         self.cleaning_until = None
         self.admitted = True
+        self._stable_since = round(now, 3)
         self.meds.reset()
 
     def meds_tick(self, now, load_factor, stockout_meds=()):
@@ -247,6 +253,10 @@ class Monitor:
         current = set(alarms)
         raised = sorted(current - self._active_alarms)
         self.raised_this_tick = raised
+        if raised:
+            # Vitals stopped being stable: the clock restarts when
+            # the alarms clear.
+            self._stable_since = None
         for name in raised:
             self.alarm_history.append(
                 {"alarm": name, "raised_t": now, "cleared_t": None}
@@ -257,7 +267,42 @@ class Monitor:
                 if event["alarm"] == name and event["cleared_t"] is None:
                     event["cleared_t"] = now
                     break
+        if self._active_alarms and not current:
+            # The last active alarm just cleared: vitals are stable
+            # again from now. (No-op when nothing was active — the
+            # clock keeps running from admission or the last clear.)
+            self._stable_since = now
         self._active_alarms = current
+
+    def stable_s(self, now):
+        """Seconds the patient's vitals have been alarm-free: since
+        the last alarm cleared, or since admission when they never
+        alarmed; 0 while an alarm is active."""
+        if self._stable_since is None:
+            return 0.0
+        return round(now - self._stable_since, 3)
+
+    def discharge_ready(self, now, stable_window_s):
+        """True when the patient is discharge-ready: admitted, vitals
+        stable for at least ``stable_window_s`` seconds, and all
+        medication orders complete."""
+        if not self.admitted:
+            return False
+        return (
+            self.stable_s(now) >= stable_window_s
+            and self.meds.orders_complete()
+        )
+
+    def readiness_detail(self, now, stable_window_s):
+        """Per-patient discharge-readiness state as plain JSON data."""
+        return {
+            "bed": self.bed_id,
+            "ready": self.discharge_ready(now, stable_window_s),
+            "admitted": self.admitted,
+            "stable_s": self.stable_s(now) if self.admitted else 0.0,
+            "stable_window_s": float(stable_window_s),
+            "orders_complete": self.meds.orders_complete(),
+        }
 
     def alarm_rate(self, now, window_s=60.0):
         """Alarms raised per minute over the trailing ``window_s`` seconds."""

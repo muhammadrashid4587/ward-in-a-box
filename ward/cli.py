@@ -6,6 +6,7 @@ import sys
 
 from .chaos import ChaosEvent
 from .discharge import DischargePlanner
+from .readiness import DischargeReadiness
 from .recorder import Recorder, iter_ticks, summarize
 from .server import serve
 from .staffing import Staffing
@@ -117,6 +118,16 @@ def load_scenario(path):
             discharge_planning = DischargePlanner(**data["discharge_planning"])
         except (TypeError, ValueError) as e:
             raise ValueError("discharge_planning: %s" % e)
+    discharge_readiness = None
+    if "discharge_readiness" in data:
+        if not isinstance(data["discharge_readiness"], dict):
+            raise ValueError("discharge_readiness must be an object")
+        try:
+            discharge_readiness = DischargeReadiness(
+                **data["discharge_readiness"]
+            )
+        except (TypeError, ValueError) as e:
+            raise ValueError("discharge_readiness: %s" % e)
     return {
         "beds": beds,
         "rate_hz": rate,
@@ -129,6 +140,7 @@ def load_scenario(path):
         "cleaning_s": float(cleaning_s),
         "cleaning_capacity": cleaning_capacity,
         "discharge_planning": discharge_planning,
+        "discharge_readiness": discharge_readiness,
         "triage": triage,
         "host": data.get("host", "127.0.0.1"),
         "port": data.get("port", 8080),
@@ -149,6 +161,7 @@ def build_ward(cfg, seed=None, recorder=None):
         cleaning_s=cfg.get("cleaning_s", 30.0),
         cleaning_capacity=cfg.get("cleaning_capacity"),
         discharge_planning=cfg.get("discharge_planning"),
+        discharge_readiness=cfg.get("discharge_readiness"),
         triage=cfg.get("triage"),
         recorder=recorder,
     )

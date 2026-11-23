@@ -22,6 +22,7 @@ from ward.chaos import ChaosEvent
 from ward.cli import build_ward, load_scenario, main
 from ward.discharge import DischargePlanner
 from ward.monitor import Monitor
+from ward.readiness import DischargeReadiness
 from ward.recorder import Recorder, iter_ticks, summarize
 from ward.server import make_handler
 from ward.staffing import Staffing
@@ -2420,6 +2421,202 @@ class TestDischargePlanning(unittest.TestCase):
             self.assertEqual(summary["discharge"]["delayed"], 2)
             self.assertEqual(summary["discharge"]["total_delay_s"], 18.0)
             self.assertEqual(summary["discharge"]["mean_delay_s"], 9.0)
+        finally:
+            os.unlink(path)
+
+
+class TestDischargeReadiness(unittest.TestCase):
+    def test_stable_patient_becomes_ready_once_window_elapses(self):
+        ward = Ward(
+            beds=1, profiles=["stable"],
+            discharge_readiness={"stable_window_s": 5}, seed=42,
+        )
+        for _ in range(4):
+            snap = ward.tick()
+        self.assertFalse(snap["beds"][0]["discharge_ready"])
+        snap = ward.tick()
+        self.assertTrue(snap["beds"][0]["discharge_ready"])
+        summary = ward.readiness_summary()
+        self.assertEqual(summary["ready"], 1)
+        self.assertEqual(summary["not_ready"], 0)
+        self.assertEqual(summary["stable_window_s"], 5.0)
+        self.assertEqual(summary["beds"][0]["stable_s"], 5.0)
+        self.assertTrue(summary["beds"][0]["orders_complete"])
+
+    def test_alarming_patient_is_never_ready(self):
+        # Febrile patients run hot enough to trip the fever alarm
+        # most ticks; with a 300 s window they never stay clear.
+        ward = Ward(
+            beds=1, profiles=["febrile"],
+            discharge_readiness={"stable_window_s": 300}, seed=42,
+        )
+        for _ in range(40):
+            snap = ward.tick()
+        self.assertFalse(snap["beds"][0]["discharge_ready"])
+        self.assertEqual(ward.readiness_summary()["ready"], 0)
+
+    def test_pending_dose_blocks_readiness_until_given(self):
+        ward = Ward(
+            beds=1, profiles=["stable"],
+            meds=[[{"name": "metoprolol", "every_s": 3600,
+                    "first_at": 0, "grace_s": 600}]],
+            discharge_readiness={"stable_window_s": 5}, seed=42,
+        )
+        for _ in range(29):
+            snap = ward.tick()
+        # The dose due at t=0 is still waiting to be given (30 s
+        # with a full roster), so the orders are incomplete.
+        self.assertFalse(snap["beds"][0]["discharge_ready"])
+        self.assertFalse(
+            ward.readiness_summary()["beds"][0]["orders_complete"]
+        )
+        snap = ward.tick()  # t=30: dose given, orders complete.
+        self.assertTrue(snap["beds"][0]["discharge_ready"])
+
+    def test_missed_dose_blocks_readiness_until_next_dose(self):
+        # A 1 s grace window means the dose due at t=0 misses at
+        # once (administration would take 30 s); the orders stay
+        # incomplete until the next dose, 3600 s later.
+        ward = Ward(
+            beds=1, profiles=["stable"],
+            meds=[[{"name": "insulin", "every_s": 3600,
+                    "first_at": 0, "grace_s": 1}]],
+            discharge_readiness={"stable_window_s": 5}, seed=42,
+        )
+        for _ in range(40):
+            snap = ward.tick()
+        self.assertFalse(snap["beds"][0]["discharge_ready"])
+        detail = ward.readiness_summary()["beds"][0]
+        self.assertFalse(detail["orders_complete"])
+        self.assertEqual(detail["stable_s"], 0.0)
+
+    def test_alarm_storm_resets_the_stability_clock(self):
+        ward = Ward(
+            beds=1, profiles=["stable"],
+            discharge_readiness={"stable_window_s": 5},
+            chaos=[ChaosEvent("alarm_storm", 10, 5, bed=0)],
+            seed=42,
+        )
+        for _ in range(10):
+            snap = ward.tick()
+        self.assertTrue(snap["beds"][0]["discharge_ready"])
+        for _ in range(5):
+            snap = ward.tick()  # t=11..15: storm drags vitals out.
+        self.assertFalse(snap["beds"][0]["discharge_ready"])
+        # The storm ends at t=15 and the alarms clear at once; the
+        # patient is ready again once 5 s of quiet vitals have passed.
+        for _ in range(4):
+            snap = ward.tick()
+        self.assertFalse(snap["beds"][0]["discharge_ready"])
+        snap = ward.tick()
+        self.assertTrue(snap["beds"][0]["discharge_ready"])
+
+    def test_unadmitted_bed_is_not_ready(self):
+        ward = Ward(
+            beds=2, profiles=["stable", "stable"],
+            timeline=Timeline([TimelinePhase(0, 1, ramp_s=0)]),
+            discharge_readiness={"stable_window_s": 5}, seed=42,
+        )
+        for _ in range(10):
+            snap = ward.tick()
+        detail = ward.readiness_summary()["beds"]
+        self.assertTrue(detail[0]["ready"])
+        self.assertFalse(detail[1]["ready"])
+        self.assertFalse(detail[1]["admitted"])
+
+    def test_readiness_validation(self):
+        for bad in (0, -5, "300", None, True):
+            with self.assertRaises(ValueError):
+                DischargeReadiness(stable_window_s=bad)
+        with self.assertRaises(TypeError):
+            DischargeReadiness(stable_window_s=5, bogus=1)
+        with self.assertRaises(ValueError):
+            Ward(beds=1, discharge_readiness="5")
+
+    def test_readiness_in_snapshot_endpoint_and_ws_frame(self):
+        ward = Ward(
+            beds=1, profiles=["stable"],
+            discharge_readiness={"stable_window_s": 5}, seed=42,
+        )
+        for _ in range(10):
+            ward.tick()
+        snap = ward.snapshot()
+        self.assertTrue(snap["beds"][0]["discharge_ready"])
+        self.assertEqual(snap["discharge_readiness"]["ready"], 1)
+        server, port = serve_in_thread(ward)
+        try:
+            status, body = get(port, "/discharge-readiness")
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body)["ready"], 1)
+            ward.partitioned = True
+            status, _ = get(port, "/discharge-readiness")
+            self.assertEqual(status, 503)
+            ward.partitioned = False
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_ws_frame_carries_readiness(self):
+        ward = Ward(
+            beds=1,
+            profiles=["stable"],
+            rate_hz=20.0,
+            discharge_readiness={"stable_window_s": 5},
+            seed=42,
+        )
+        server, port = serve_in_thread(ward)
+        try:
+            ws = WsClient(port)
+            try:
+                msg = json.loads(ws.read_until_opcode(1))
+                self.assertIn("discharge_readiness", msg)
+                self.assertEqual(msg["discharge_readiness"]["ready"], 0)
+            finally:
+                ws.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_scenario_discharge_ready(self):
+        cfg = load_scenario(
+            os.path.join(HERE, "..", "scenarios", "discharge-ready.json")
+        )
+        self.assertEqual(cfg["discharge_readiness"].stable_window_s, 5.0)
+        ward = build_ward(cfg, seed=42)
+        for _ in range(40):
+            snap = ward.tick()
+        flags = [b["discharge_ready"] for b in snap["beds"]]
+        # Bed 0 stable with no orders: ready from t=5. Bed 1's dose
+        # lands at t=30: ready from then. Bed 2's insulin missed at
+        # t=1 (1 s grace): orders incomplete, never ready. Bed 3's
+        # fever comes and goes; at t=40 it has been quiet for 6 s.
+        self.assertEqual(flags, [True, True, False, True])
+        summary = ward.readiness_summary()
+        self.assertEqual(summary["ready"], 3)
+        self.assertEqual(summary["not_ready"], 1)
+
+    def test_recorder_summary_carries_discharge_readiness(self):
+        cfg = load_scenario(
+            os.path.join(HERE, "..", "scenarios", "discharge-ready.json")
+        )
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".jsonl", delete=False
+        ) as f:
+            path = f.name
+        try:
+            with Recorder(path, cfg["beds"], cfg["rate_hz"], seed=42) as rec:
+                ward = build_ward(cfg, seed=42, recorder=rec)
+                for _ in range(40):
+                    ward.tick()
+            summary = summarize(path)
+            self.assertEqual(summary["discharge_readiness"]["ready"], 3)
+            self.assertEqual(
+                summary["discharge_readiness"]["not_ready"], 1
+            )
+            self.assertEqual(summary["discharge_readiness"]["occupied"], 4)
+            self.assertEqual(
+                summary["discharge_readiness"]["stable_window_s"], 5.0
+            )
         finally:
             os.unlink(path)
 

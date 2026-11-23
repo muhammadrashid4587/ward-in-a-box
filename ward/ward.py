@@ -7,6 +7,7 @@ import time
 from .chaos import ChaosEngine
 from .discharge import DischargePlanner
 from .monitor import Monitor
+from .readiness import DischargeReadiness
 from .staffing import Staffing
 from .timeline import Timeline
 from .triage import TriageQueue
@@ -27,7 +28,7 @@ class Ward:
     snapshot to a JSONL file.
     """
 
-    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None, cleaning_s=30.0, meds=None, triage=None, discharge_planning=None, cleaning_capacity=None):
+    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None, cleaning_s=30.0, meds=None, triage=None, discharge_planning=None, cleaning_capacity=None, discharge_readiness=None):
         if not 1 <= beds <= 64:
             raise ValueError("beds must be 1..64")
         if rate_hz <= 0:
@@ -44,6 +45,17 @@ class Ward:
                 % (cleaning_capacity,)
             )
         self.cleaning_capacity = cleaning_capacity
+        if discharge_readiness is None:
+            self.readiness = DischargeReadiness()
+        elif isinstance(discharge_readiness, DischargeReadiness):
+            self.readiness = discharge_readiness
+        elif isinstance(discharge_readiness, dict):
+            self.readiness = DischargeReadiness(**discharge_readiness)
+        else:
+            raise ValueError(
+                "discharge_readiness must be a DischargeReadiness or a dict, got %r"
+                % (discharge_readiness,)
+            )
         if discharge_planning is None:
             self.discharge_planner = DischargePlanner()
         elif isinstance(discharge_planning, DischargePlanner):
@@ -181,13 +193,16 @@ class Ward:
                 readings.append(entry)
             else:
                 r["online"] = True
+                r["discharge_ready"] = m.discharge_ready(
+                    self.elapsed, self.readiness.stable_window_s
+                )
                 readings.append(r)
                 online.append(m.bed_id)
         self.staffing.tick(self.elapsed, occupied, online)
         for m in self.monitors:
             for alarm in m.raised_this_tick:
                 self.staffing.alarm_raised(m.bed_id, alarm, self.elapsed, occupied)
-        snap = {"t": self.elapsed, "beds": readings, "staffing": self.staffing.summary(self.elapsed, occupied), "turnover": self.turnover_summary(), "meds": self.meds_summary(), "triage": self.triage_summary(), "arrivals": self.arrivals_summary(), "discharge": self.discharge_summary()}
+        snap = {"t": self.elapsed, "beds": readings, "staffing": self.staffing.summary(self.elapsed, occupied), "turnover": self.turnover_summary(), "meds": self.meds_summary(), "triage": self.triage_summary(), "arrivals": self.arrivals_summary(), "discharge": self.discharge_summary(), "discharge_readiness": self.readiness_summary()}
         with self._lock:
             self.latest = snap
         if self.recorder is not None:
@@ -284,6 +299,23 @@ class Ward:
                 break
             m.begin_cleaning(self.elapsed, self.cleaning_s)
             self.discharge_planner.complete(m.bed_id, self.elapsed)
+
+    def readiness_summary(self):
+        """Per-patient discharge-readiness flags and ward totals."""
+        beds = [
+            m.readiness_detail(self.elapsed, self.readiness.stable_window_s)
+            for m in self.monitors
+        ]
+        return {
+            "t": self.elapsed,
+            "stable_window_s": self.readiness.stable_window_s,
+            "beds": beds,
+            "occupied": sum(1 for b in beds if b["admitted"]),
+            "ready": sum(1 for b in beds if b["ready"]),
+            "not_ready": sum(
+                1 for b in beds if b["admitted"] and not b["ready"]
+            ),
+        }
 
     def discharge_summary(self):
         """Planned discharges, cleaning capacity, and queued beds."""

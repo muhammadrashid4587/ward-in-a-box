@@ -80,7 +80,9 @@ def summarize(path):
     alarm episodes — and discharge
     totals from the last tick: planned discharges, how many landed,
     how many were delayed by a backed-up cleaning roster, and the
-    total delay. Returns ``None`` fields for a recording with no ticks.
+    total delay — and discharge-readiness totals from the last tick:
+    how many occupied beds are flagged ready and how many are not.
+    Returns ``None`` fields for a recording with no ticks.
     """
     header = None
     ticks = 0
@@ -92,6 +94,7 @@ def summarize(path):
     active = {}
     last_triage = None
     last_discharge = None
+    last_readiness = None
     with open(path) as f:
         for line in f:
             line = line.strip()
@@ -112,6 +115,8 @@ def summarize(path):
                 last_triage = obj["triage"]
             if isinstance(obj.get("discharge"), dict):
                 last_discharge = obj["discharge"]
+            if isinstance(obj.get("discharge_readiness"), dict):
+                last_readiness = obj["discharge_readiness"]
             for bed in obj["beds"]:
                 b = bed["bed"]
                 if not bed.get("online", True):
@@ -183,6 +188,19 @@ def summarize(path):
                 "mean_delay_s": last_discharge["mean_delay_s"],
             }
             if last_discharge is not None
+            else None
+        ),
+        # Discharge-readiness totals from the last tick: how many
+        # occupied beds are flagged ready, how many are not, and the
+        # stability window in force.
+        "discharge_readiness": (
+            {
+                "ready": last_readiness["ready"],
+                "not_ready": last_readiness["not_ready"],
+                "occupied": last_readiness["occupied"],
+                "stable_window_s": last_readiness["stable_window_s"],
+            }
+            if last_readiness is not None
             else None
         ),
     }

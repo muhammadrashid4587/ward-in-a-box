@@ -78,6 +78,11 @@ python3 -m ward.cli scenarios/boarding-full.json --seed 42
 # discharges wait for a slot and land 10 s and 8 s late
 python3 -m ward.cli scenarios/discharge.json --seed 42
 
+# Discharge readiness: one patient ready from 5 s, one once its
+# dose lands at 30 s, one never (missed insulin), one in and out
+# with a fever
+python3 -m ward.cli scenarios/discharge-ready.json --seed 42
+
 # Reproducible run
 python3 -m ward.cli scenarios/example.json --seed 42
 ```
@@ -115,6 +120,8 @@ python3 -m ward.cli scenarios/example.json --seed 42
   and actual discharge times, delays when cleaning was backed up,
   and the cleaning capacity and how many beds are cleaning or
   awaiting a slot, as JSON (503 while partitioned)
+- `GET /discharge-readiness` — per-patient discharge-readiness
+  flags (see below), as JSON (503 while partitioned)
 
 A reading looks like:
 
@@ -143,8 +150,9 @@ streams one JSON text frame per tick at the ward rate:
 Each frame carries the same snapshot as `/snapshot` plus the alarm
 summary from `/alarms`, the staffing summary from `/staffing`, the
 medication summary from `/meds`, the triage summary from
-`/triage`, the live arrivals view from `/arrivals`, and the
-discharge summary from `/discharge`, so a client gets bed occupancy, vitals, alarms, staffing,
+`/triage`, the live arrivals view from `/arrivals`, the
+discharge summary from `/discharge`, and the discharge-readiness
+summary from `/discharge-readiness`, so a client gets bed occupancy, vitals, alarms, staffing,
 medication, and the intake queue in one message. Ping frames are answered with pong, close frames
 are echoed and the connection is then closed; text frames from the
 client are accepted and ignored — the ward pushes ticks, it takes no
@@ -644,6 +652,42 @@ example: over a seeded 40-tick run with one cleaning slot, all
 three planned discharges land, two of them late — bed 1 by 10 s
 and bed 2 by 8 s, 18 s of delay in total.
 
+## Discharge readiness
+
+A patient is flagged discharge-ready when their vitals have been
+stable for a configurable window and all their orders are
+complete. Stable means no alarm raised in the window, measured from
+the last time their alarms cleared (or from admission, if they
+never alarmed) — an alarm storm restarts the clock. Orders means
+medication orders: no dose still waiting to be given, and no missed
+dose that has not been followed by a given one; a patient with no
+medications has nothing outstanding. A planned discharge order does
+not block readiness — a patient whose discharge is already ordered
+is exactly the patient this flag is for. The flag is advisory only:
+this is a test tool, not a clinical judgement.
+
+```json
+{
+  "beds": 4,
+  "discharge_readiness": {"stable_window_s": 300}
+}
+```
+
+The window is 300 seconds by default. Every reading carries a
+`"discharge_ready"` flag, every snapshot carries a
+`"discharge_readiness"` object with the per-patient flags (ready,
+admitted, seconds stable, the window in force, orders complete)
+and ward totals, served on its own by `GET /discharge-readiness`
+and carried in every WebSocket frame, and the run summary
+(`--summary`) reports the same totals from the last tick. See
+`scenarios/discharge-ready.json` for a runnable example: over a
+seeded 40-tick run with a 5-second window, bed 0 (stable, no
+orders) flags ready from 5 s, bed 1 (one metoprolol dose, given
+at 30 s) from 30 s, bed 2 (insulin missed at 1 s on a 1-second
+grace window) never flags ready, and bed 3 (febrile, alarms
+coming and going) flags ready at 40 s after 6 s of quiet vitals —
+3 ready, 1 not.
+
 ## Recording a run
 
 `--record FILE` writes every tick to a JSONL file: a header line with
@@ -667,7 +711,7 @@ endpoints returned 503 while it lasted, the ticks did not stop.
 make test
 ```
 
-169 tests: vitals stay inside plausible ranges, dropout actually stops a
+180 tests: vitals stay inside plausible ranges, dropout actually stops a
 monitor's stream, an alarm storm produces alarms, stale readings freeze,
 a partition blocks the snapshot endpoint, the HTTP endpoints serve valid
 JSON, the stream serves JSON lines, scenario files validate, alarm
@@ -786,6 +830,16 @@ snapshots, the `GET /discharge` endpoint (503 while partitioned),
 and WebSocket frames, the run summary carrying discharge totals,
 and the `discharge.json` scenario landing all three discharges
 with 18 s of total delay (10 s and 8 s) over a seeded run.
+Discharge-readiness tests cover a stable patient flagging ready
+once the window elapses, an alarming patient never flagging ready,
+a pending dose blocking readiness until it is given, a missed dose
+blocking readiness until the next dose, an alarm storm resetting
+the stability clock and readiness returning after a quiet window,
+an unadmitted bed not flagging ready, validation of the stability
+window, readiness in snapshots, the `GET /discharge-readiness`
+endpoint (503 while partitioned), and WebSocket frames, the run
+summary carrying readiness totals, and the `discharge-ready.json`
+scenario flagging 3 of 4 beds ready over a seeded run.
 
 ## Roadmap
 
@@ -838,3 +892,8 @@ with 18 s of total delay (10 s and 8 s) over a seeded run.
   active episode, it clears when a boarded patient is admitted, in
   the triage summary, the live arrivals view, and the run summary)
   — done in v0.18.0
+- Discharge readiness (a patient flags discharge-ready when vitals
+  have been stable for a configurable window and all medication
+  orders are complete, in every reading, the snapshot, a
+  `GET /discharge-readiness` endpoint, WebSocket frames, and the
+  run summary) — done in v0.19.0
