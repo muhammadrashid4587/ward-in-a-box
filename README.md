@@ -69,6 +69,11 @@ python3 -m ward.cli scenarios/arrivals.json --seed 42
 # diverted; the boarded patient takes the first freed bed
 python3 -m ward.cli scenarios/boarding.json --seed 42
 
+# Boarding-full alarm: boarding fills, two arrivals divert while it
+# is full (one alarm episode, two diversions), the alarm clears when
+# the boarded patient takes the bed freed at 15 s
+python3 -m ward.cli scenarios/boarding-full.json --seed 42
+
 # Discharge planning: three orders, one cleaning slot — two
 # discharges wait for a slot and land 10 s and 8 s late
 python3 -m ward.cli scenarios/discharge.json --seed 42
@@ -98,11 +103,13 @@ python3 -m ward.cli scenarios/example.json --seed 42
   (503 while partitioned)
 - `GET /triage` — the ED intake queue: waiting patients in priority
   order with acuity and wait so far, waiting counts per acuity,
-  admitted/diverted totals, and mean/max wait, as JSON
+  admitted/diverted totals, mean/max wait, and boarding-full alarm
+  episodes, as JSON
   (503 while partitioned)
 - `GET /arrivals` — the live arrivals view: current arrival rate,
   arrivals in the last hour of ward time, arrivals per ward clock
-  hour so far, and diversion status, as JSON
+  hour so far, diversion status, and whether a boarding-full alarm
+  is active, as JSON
   (503 while partitioned)
 - `GET /discharge` — planned discharges: orders with their expected
   and actual discharge times, delays when cleaning was backed up,
@@ -504,7 +511,8 @@ own by `GET /arrivals` and included in every WebSocket frame:
  "arrivals_total": 178, "arrivals_by_hour": {"8": 178},
  "waiting_total": 3, "capacity": 8, "boarding_total": 0,
  "boarding_capacity": 0, "boarded": 0, "admitted": 2, "diverted": 0,
- "diverted_last_hour": 0, "diverting": false}
+ "diverted_last_hour": 0, "diverting": false,
+ "boarding_full_alarm": false, "boarding_full_alarms_raised": 0}
 ```
 
 `arrival_rate_per_hour` is the walk-in rate at the current ward
@@ -558,6 +566,32 @@ Boarded patients get no vitals, no medication schedules, and no
 bedside monitor until they are admitted to a bed — the model only
 tracks that they are waiting, how long, and whether they raised a
 wait-time alarm.
+
+## Boarding-full alarm
+
+When boarding is full and a new arrival is diverted because both
+the intake queue and boarding are full, a boarding-full alarm
+raises: the ED is turning patients away for lack of anywhere to
+put them. One alarm episode covers one continuous full period —
+it raises at the first diversion while boarding is full, further
+diversions during the episode count against it instead of raising
+a second alarm, and it clears when a boarded patient is admitted
+to a bed and a boarding spot frees up. A diversion with boarding
+off (`boarding_capacity` 0) raises nothing: with no boarding to
+fill, it is a plain diversion, not a boarding failure.
+
+The triage summary carries the episodes (`boarding_full_alarms_raised`,
+`boarding_full_alarm_active`, `boarding_full_alarm_history` with
+`raised_t`, `cleared_t`, and how many patients were diverted during
+each episode, and the `boarding_full_diverted` total), the live
+arrivals view carries whether one is active
+(`boarding_full_alarm`) and how many have raised, and the run
+summary (`--summary`) reports the same totals from the last tick.
+See `scenarios/boarding-full.json` for a runnable example: over a
+seeded 20-tick run boarding fills at 1 s, two arrivals divert at
+2 s and 3 s inside a single episode, the boarded patient takes the
+bed freed at 15 s and the alarm clears, and the queued patient
+takes the bed freed at 18 s.
 
 ## Discharge planning
 
@@ -633,7 +667,7 @@ endpoints returned 503 while it lasted, the ticks did not stop.
 make test
 ```
 
-160 tests: vitals stay inside plausible ranges, dropout actually stops a
+169 tests: vitals stay inside plausible ranges, dropout actually stops a
 monitor's stream, an alarm storm produces alarms, stale readings freeze,
 a partition blocks the snapshot endpoint, the HTTP endpoints serve valid
 JSON, the stream serves JSON lines, scenario files validate, alarm
@@ -732,7 +766,15 @@ capacity, the live arrivals view carrying boarding counts and
 `diverting` only when queue and boarding are both full, boarding
 in snapshots and the `GET /arrivals` endpoint, and the
 `boarding.json` scenario admitting the boarded patient at 15 s
-and the queued patient at 18 s. Discharge planning tests cover a
+and the queued patient at 18 s. Boarding-full alarm tests cover an
+alarm raising on the first diversion while boarding is full, further
+diversions counting against the active episode instead of raising a
+second alarm, the alarm clearing when the boarded patient is
+admitted, a second episode raising after boarding refills, no alarm
+when boarding is off, the alarm in snapshots and the `GET /arrivals`
+and `GET /triage` endpoints, the run summary carrying the alarm
+totals, and the `boarding-full.json` scenario raising one episode
+at 2 s with two diversions and clearing it at 15 s. Discharge planning tests cover a
 planned discharge firing at its expected time, a discharge
 delayed when the cleaning roster is full (the patient stays in
 the bed, still monitored, until a slot frees up), an order
@@ -791,3 +833,8 @@ with 18 s of total delay (10 s and 8 s) over a seeded run.
   in the bed, delays recorded per order and in the ward totals, a
   `cleaning_capacity` cap, in every snapshot, WebSocket frame, a
   `GET /discharge` endpoint, and the run summary) — done in v0.17.0
+- Boarding-full alarm (an episode raises on the first diversion
+  while ED boarding is full, further diversions count against the
+  active episode, it clears when a boarded patient is admitted, in
+  the triage summary, the live arrivals view, and the run summary)
+  — done in v0.18.0

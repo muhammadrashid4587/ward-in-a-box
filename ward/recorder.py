@@ -76,7 +76,8 @@ def summarize(path):
     raise/clear transitions), plus intake totals from the last tick —
     patients admitted and diverted, walk-ins generated, and the
     arrival rate at that hour, with arrivals per ward clock hour so
-    the run's load shape over the day is visible — and discharge
+    the run's load shape over the day is visible, and boarding-full
+    alarm episodes — and discharge
     totals from the last tick: planned discharges, how many landed,
     how many were delayed by a backed-up cleaning roster, and the
     total delay. Returns ``None`` fields for a recording with no ticks.
@@ -140,7 +141,10 @@ def summarize(path):
         # queue admitted and diverted, how many walk-ins the Poisson
         # process generated, and the arrival rate at that hour —
         # plus arrivals per ward clock hour and the configured
-        # hourly rates, so the run's load shape is visible.
+        # hourly rates, so the run's load shape is visible — and
+        # boarding-full alarm episodes: how many raised, how many
+        # diversions happened during them, and whether one is still
+        # active at the end of the run.
         "triage": (
             {
                 "admitted": last_triage["admitted"],
@@ -152,6 +156,15 @@ def summarize(path):
                 "arrivals_by_hour": last_triage.get("arrivals_by_hour", {}),
                 "arrival_hourly_rates": last_triage.get(
                     "arrival_hourly_rates"
+                ),
+                "boarding_full_alarms_raised": last_triage.get(
+                    "boarding_full_alarms_raised", 0
+                ),
+                "boarding_full_alarm_active": last_triage.get(
+                    "boarding_full_alarm_active", False
+                ),
+                "boarding_full_diverted": last_triage.get(
+                    "boarding_full_diverted", 0
                 ),
             }
             if last_triage is not None

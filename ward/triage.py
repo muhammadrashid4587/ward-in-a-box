@@ -19,6 +19,15 @@ hospital, so when a bed frees up they take it before a patient still
 waiting in the intake queue; within each group the usual triage
 priority applies. Boarded patients raise the same wait-time alarms
 as queued ones, and their waits are tracked separately.
+
+Boarding-full alarm: when boarding is full and a new arrival is
+diverted because both the queue and boarding are full, a
+boarding-full alarm raises — one episode per continuous full period.
+Further diversions while the alarm is active count against the
+episode instead of raising a new one, and the alarm clears when a
+boarded patient is admitted to a bed and a boarding spot frees up.
+Boarding off means no alarm: a diversion with no boarding capacity
+is a plain diversion, not a boarding failure.
 """
 
 from .arrivals import ArrivalModel
@@ -131,6 +140,14 @@ class TriageQueue:
         # admitted (or None while the patient still waits).
         self.wait_alarm_history = []
         self.wait_alarms_raised = 0
+        # Boarding-full alarm episodes: {"raised_t", "cleared_t",
+        # "diverted"} — raised when a patient is diverted while
+        # boarding is full, cleared when a boarded patient is
+        # admitted and a boarding spot frees up; "diverted" counts
+        # every diversion during the episode, including the one that
+        # raised it. "cleared_t" is None while the episode is active.
+        self.boarding_full_alarm_history = []
+        self.boarding_full_alarms_raised = 0
 
     @staticmethod
     def _validate_thresholds(wait_thresholds):
@@ -206,6 +223,7 @@ class TriageQueue:
                 return True
             self.diverted += 1
             self._diverted_times.append(now)
+            self._boarding_full_diverted(now)
             return False
         self.waiting.append(
             {
@@ -216,6 +234,51 @@ class TriageQueue:
             }
         )
         return True
+
+    def _boarding_full_alarm(self):
+        """The active boarding-full alarm episode, or None.
+
+        An episode is active from the first diversion while boarding
+        is full until a boarded patient is admitted and a boarding
+        spot frees up; its "cleared_t" is None while it is active.
+        """
+        if self.boarding_full_alarm_history:
+            last = self.boarding_full_alarm_history[-1]
+            if last["cleared_t"] is None:
+                return last
+        return None
+
+    def _boarding_full_diverted(self, now):
+        """Record a diversion that happened while boarding is full.
+
+        Raises a boarding-full alarm episode when none is active;
+        when one is active the diversion counts against it instead
+        of raising a second alarm. Boarding off (capacity 0) means
+        no alarm: the diversion is a plain diversion.
+        """
+        if self.boarding_capacity <= 0:
+            return
+        if len(self.boarding) < self.boarding_capacity:
+            return
+        active = self._boarding_full_alarm()
+        if active is not None:
+            active["diverted"] += 1
+            return
+        self.boarding_full_alarm_history.append(
+            {"raised_t": now, "cleared_t": None, "diverted": 1}
+        )
+        self.boarding_full_alarms_raised += 1
+
+    def _clear_boarding_full_alarm(self, now):
+        """Clear the active boarding-full alarm, if any.
+
+        Called when a boarded patient is admitted: a boarding spot
+        has freed up, so the ED is no longer turning patients away
+        for lack of boarding room.
+        """
+        active = self._boarding_full_alarm()
+        if active is not None:
+            active["cleared_t"] = round(now, 3)
 
     def process_arrivals(self, now, hour=None):
         """Move scheduled arrivals due at ``now`` into the queue.
@@ -335,6 +398,9 @@ class TriageQueue:
                 break
             if from_boarding:
                 self.boarding.remove(patient)
+                # A boarding spot just freed up: a boarding-full
+                # alarm episode, if one is active, clears now.
+                self._clear_boarding_full_alarm(now)
             else:
                 self.waiting.remove(patient)
             if patient["wait_alarm_t"] is not None:
@@ -396,6 +462,10 @@ class TriageQueue:
             "diverted_last_hour": len(diverted_recent),
             "diverting": len(self.waiting) >= self.capacity
             and len(self.boarding) >= self.boarding_capacity,
+            # Boarding-full alarm: active while an episode raised by
+            # a diversion with boarding full has not yet cleared.
+            "boarding_full_alarm": self._boarding_full_alarm() is not None,
+            "boarding_full_alarms_raised": self.boarding_full_alarms_raised,
         }
 
     def summary(self, now):
@@ -450,6 +520,19 @@ class TriageQueue:
                 if p["wait_alarm_t"] is not None
             ),
             "wait_alarm_history": [dict(e) for e in self.wait_alarm_history],
+            # Boarding-full alarm: episodes raised when a patient was
+            # diverted while boarding was full, each with how many
+            # diversions happened during it and when it cleared.
+            "boarding_full_alarms_raised": self.boarding_full_alarms_raised,
+            "boarding_full_alarm_active": (
+                self._boarding_full_alarm() is not None
+            ),
+            "boarding_full_alarm_history": [
+                dict(e) for e in self.boarding_full_alarm_history
+            ],
+            "boarding_full_diverted": sum(
+                e["diverted"] for e in self.boarding_full_alarm_history
+            ),
             "arrival_rate_per_hour": self._current_rate,
             "arrivals_generated": (
                 self.poisson.generated if self.poisson is not None else 0
