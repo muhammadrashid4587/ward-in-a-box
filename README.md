@@ -92,6 +92,10 @@ python3 -m ward.cli scenarios/example.json --seed 42
   order with acuity and wait so far, waiting counts per acuity,
   admitted/diverted totals, and mean/max wait, as JSON
   (503 while partitioned)
+- `GET /arrivals` — the live arrivals view: current arrival rate,
+  arrivals in the last hour of ward time, arrivals per ward clock
+  hour so far, and diversion status, as JSON
+  (503 while partitioned)
 
 A reading looks like:
 
@@ -119,8 +123,8 @@ streams one JSON text frame per tick at the ward rate:
 
 Each frame carries the same snapshot as `/snapshot` plus the alarm
 summary from `/alarms`, the staffing summary from `/staffing`, the
-medication summary from `/meds`, and the triage summary from
-`/triage`, so a client gets bed occupancy, vitals, alarms, staffing,
+medication summary from `/meds`, the triage summary from
+`/triage`, and the live arrivals view from `/arrivals`, so a client gets bed occupancy, vitals, alarms, staffing,
 medication, and the intake queue in one message. Ping frames are answered with pong, close frames
 are echoed and the connection is then closed; text frames from the
 client are accepted and ignored — the ward pushes ticks, it takes no
@@ -475,6 +479,32 @@ per-hour arrivals alongside the configured hourly rates. See
 seeded 60-tick run at 180/hr, 3 walk-ins arrive, 2 take the beds
 freed by the discharges at 5 s and 8 s, and 1 is still waiting.
 
+## Live arrivals view
+
+The triage summary already carries the arrival rate and the
+per-hour counts, but a dashboard wants the live picture in one
+place. Every snapshot carries an `"arrivals"` object, served on its
+own by `GET /arrivals` and included in every WebSocket frame:
+
+```json
+{"t": 600.0, "arrival_rate_per_hour": 180.0, "arrivals_last_hour": 178,
+ "arrivals_total": 178, "arrivals_by_hour": {"8": 178},
+ "waiting_total": 3, "capacity": 8, "admitted": 2, "diverted": 0,
+ "diverted_last_hour": 0, "diverting": false}
+```
+
+`arrival_rate_per_hour` is the walk-in rate at the current ward
+clock hour (null with no Poisson model — scheduled arrivals still
+count). `arrivals_last_hour` counts arrivals in the trailing hour
+of ward time, `(now - 3600, now]`, so it slides forward as the ward
+runs; `arrivals_total` counts every patient who showed up, whether
+they joined the queue or were diverted. `diverting` is true while
+the queue is full and new arrivals are being turned away, with
+`diverted` and `diverted_last_hour` counting them. Over a seeded
+60-tick run of `scenarios/arrivals.json` the view reports 3
+arrivals in the last hour, all in hour 8, matching the triage
+summary.
+
 ## Recording a run
 
 `--record FILE` writes every tick to a JSONL file: a header line with
@@ -498,7 +528,7 @@ endpoints returned 503 while it lasted, the ticks did not stop.
 make test
 ```
 
-132 tests: vitals stay inside plausible ranges, dropout actually stops a
+137 tests: vitals stay inside plausible ranges, dropout actually stops a
 monitor's stream, an alarm storm produces alarms, stale readings freeze,
 a partition blocks the snapshot endpoint, the HTTP endpoints serve valid
 JSON, the stream serves JSON lines, scenario files validate, alarm
@@ -579,7 +609,15 @@ hours wrapping past midnight), a ward run spanning midnight
 seeing arrivals in both hour 23 and hour 0 with the per-hour
 counts adding up to the total, the `arrivals.json` scenario
 putting all 3 walk-ins in hour 8, and the run summary carrying
-the per-hour arrivals and the configured hourly rates.
+the per-hour arrivals and the configured hourly rates. Live
+arrivals view tests cover the view counting the current rate,
+per-hour arrivals, and diversion status (including a full queue
+still diverting), the trailing-hour window excluding an arrival
+exactly an hour old, the rate appearing once the Poisson model
+ticks, the view in snapshots and the `GET /arrivals` endpoint
+(503 while partitioned) with the count growing as the ward ticks,
+and WebSocket frames carrying the view with the count growing
+frame to frame.
 
 ## Roadmap
 
@@ -612,3 +650,8 @@ the per-hour arrivals and the configured hourly rates.
   hour in the triage summary, diverted arrivals included, with the
   per-hour counts and the configured hourly rates carried into the
   run summary) — done in v0.14.0
+- Live arrivals dashboard view (current arrival rate, arrivals in
+  the last hour of ward time, arrivals per ward clock hour so far,
+  and diversion status, in every snapshot, WebSocket frame, and a
+  `GET /arrivals` endpoint, updating as arrivals happen) — done in
+  v0.15.0

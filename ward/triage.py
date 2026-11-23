@@ -55,6 +55,11 @@ class TriageQueue:
         # showed up in that hour, whether they joined the queue or
         # were diverted — the ED load shape over the day.
         self.arrivals_by_hour = {}
+        # Arrival times (ward elapsed seconds) of every patient who
+        # showed up, and of the ones diverted — the live arrivals
+        # view counts the trailing hour from these.
+        self._arrival_times = []
+        self._diverted_times = []
         # Waiting patients, in arrival order: {"arrival_t", "acuity",
         # "profile", "wait_alarm_t"} — "wait_alarm_t" is the time the
         # wait-time alarm was raised, or None while under threshold.
@@ -150,15 +155,18 @@ class TriageQueue:
         acuity = validate_acuity(acuity)
         if profile not in PROFILES:
             raise ValueError("unknown profile: %r" % profile)
+        now = round(now, 3)
+        self._arrival_times.append(now)
         if hour is not None:
             h = int(hour) % 24
             self.arrivals_by_hour[h] = self.arrivals_by_hour.get(h, 0) + 1
         if len(self.waiting) >= self.capacity:
             self.diverted += 1
+            self._diverted_times.append(now)
             return False
         self.waiting.append(
             {
-                "arrival_t": round(now, 3),
+                "arrival_t": now,
                 "acuity": acuity,
                 "profile": profile,
                 "wait_alarm_t": None,
@@ -280,6 +288,40 @@ class TriageQueue:
             self.admitted += 1
             filled.append(bed_id)
         return filled
+
+    def arrivals_view(self, now):
+        """Live arrivals view for the dashboard.
+
+        The current walk-in rate, arrivals in the last hour of ward
+        time, arrivals per ward clock hour so far, and diversion
+        status — whether the queue is currently full and turning
+        patients away. ``arrivals_total`` counts every patient who
+        showed up (scheduled, walk-in, or added live), including
+        diverted ones; ``arrivals_by_hour`` only counts arrivals
+        given a ward clock hour. The last-hour window is
+        ``(now - 3600, now]``.
+        """
+        now = round(now, 3)
+        window_start = now - 3600.0
+        recent = [t for t in self._arrival_times if t > window_start]
+        diverted_recent = [
+            t for t in self._diverted_times if t > window_start
+        ]
+        return {
+            "t": now,
+            "arrival_rate_per_hour": self._current_rate,
+            "arrivals_last_hour": len(recent),
+            "arrivals_total": len(self._arrival_times),
+            "arrivals_by_hour": {
+                str(h): n for h, n in sorted(self.arrivals_by_hour.items())
+            },
+            "waiting_total": len(self.waiting),
+            "capacity": self.capacity,
+            "admitted": self.admitted,
+            "diverted": self.diverted,
+            "diverted_last_hour": len(diverted_recent),
+            "diverting": len(self.waiting) >= self.capacity,
+        }
 
     def summary(self, now):
         """Queue state and wait metrics as plain JSON data."""

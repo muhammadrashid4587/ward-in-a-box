@@ -149,7 +149,7 @@ class Ward:
         for m in self.monitors:
             for alarm in m.raised_this_tick:
                 self.staffing.alarm_raised(m.bed_id, alarm, self.elapsed, occupied)
-        snap = {"t": self.elapsed, "beds": readings, "staffing": self.staffing.summary(self.elapsed, occupied), "turnover": self.turnover_summary(), "meds": self.meds_summary(), "triage": self.triage_summary()}
+        snap = {"t": self.elapsed, "beds": readings, "staffing": self.staffing.summary(self.elapsed, occupied), "turnover": self.turnover_summary(), "meds": self.meds_summary(), "triage": self.triage_summary(), "arrivals": self.arrivals_summary()}
         with self._lock:
             self.latest = snap
         if self.recorder is not None:
@@ -225,6 +225,11 @@ class Ward:
     def triage_summary(self):
         """Current intake queue state and wait metrics."""
         return self.triage.summary(self.elapsed)
+
+    def arrivals_summary(self):
+        """Live arrivals view: rate, last-hour arrivals, per-hour
+        counts, and diversion status."""
+        return self.triage.arrivals_view(self.elapsed)
 
     def triage_arrive(self, acuity, profile="stable"):
         """Add a patient arriving now to the intake queue.

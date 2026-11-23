@@ -1955,6 +1955,124 @@ class TestPoissonArrivals(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def test_arrivals_view_counts_rate_by_hour_and_diversion(self):
+        queue = TriageQueue(capacity=2)
+        queue.arrive(0, 3, "stable", hour=8)
+        queue.arrive(10, 2, "hypoxic", hour=9)
+        queue.arrive(20, 4, "stable", hour=8)
+        view = queue.arrivals_view(20)
+        # No Poisson model, so there is no current rate.
+        self.assertIsNone(view["arrival_rate_per_hour"])
+        self.assertEqual(view["t"], 20)
+        self.assertEqual(view["arrivals_last_hour"], 3)
+        self.assertEqual(view["arrivals_total"], 3)
+        self.assertEqual(view["arrivals_by_hour"], {"8": 2, "9": 1})
+        self.assertEqual(view["waiting_total"], 2)
+        self.assertEqual(view["capacity"], 2)
+        self.assertEqual(view["admitted"], 0)
+        # The third arrival was diverted (capacity 2) — and the
+        # queue is still full, so the ward is still diverting.
+        self.assertEqual(view["diverted"], 1)
+        self.assertEqual(view["diverted_last_hour"], 1)
+        self.assertTrue(view["diverting"])
+
+    def test_arrivals_view_last_hour_window(self):
+        queue = TriageQueue(capacity=8)
+        queue.arrive(0, 3, "stable", hour=8)
+        queue.arrive(3700, 3, "stable", hour=9)
+        view = queue.arrivals_view(3700)
+        # The window is (now - 3600, now]: the arrival at t=0 is
+        # exactly an hour old, so it falls outside it.
+        self.assertEqual(view["arrivals_last_hour"], 1)
+        self.assertEqual(view["arrivals_total"], 2)
+        self.assertEqual(view["diverted_last_hour"], 0)
+        self.assertFalse(view["diverting"])
+
+    def test_arrivals_view_carries_current_poisson_rate(self):
+        queue = TriageQueue(poisson={"rate_per_hour": 120}, seed=42)
+        self.assertIsNone(queue.arrivals_view(0)["arrival_rate_per_hour"])
+        queue.process_poisson_arrivals(1, 1.0, 8)
+        self.assertEqual(
+            queue.arrivals_view(1)["arrival_rate_per_hour"], 120.0
+        )
+
+    def test_arrivals_in_snapshot_endpoint_and_updates_live(self):
+        ward = Ward(
+            beds=2,
+            seed=42,
+            triage={"poisson": {"rate_per_hour": 3600}},
+        )
+        for _ in range(10):
+            ward.tick()
+        first = ward.tick()["arrivals"]
+        self.assertEqual(first["arrival_rate_per_hour"], 3600.0)
+        self.assertEqual(
+            first["arrivals_last_hour"], first["arrivals_total"]
+        )
+        for _ in range(590):
+            ward.tick()
+        snap = ward.tick()
+        view = snap["arrivals"]
+        # A seeded 600-tick run at 3600/hr is ~600 arrivals, all
+        # inside the first ward hour, and the count grew as ticks
+        # happened rather than staying at the first snapshot's.
+        self.assertGreater(view["arrivals_last_hour"], first["arrivals_last_hour"])
+        self.assertEqual(view["arrivals_last_hour"], view["arrivals_total"])
+        self.assertGreater(view["arrivals_last_hour"], 500)
+        self.assertLess(view["arrivals_last_hour"], 700)
+        self.assertEqual(view["arrivals_by_hour"], {"8": view["arrivals_total"]})
+        server, port = serve_in_thread(ward)
+        try:
+            status, body = get(port, "/arrivals")
+            self.assertEqual(status, 200)
+            data = json.loads(body)
+            self.assertEqual(
+                data["arrivals_last_hour"], view["arrivals_last_hour"]
+            )
+            self.assertEqual(data["diverted"], view["diverted"])
+            self.assertEqual(data["diverting"], view["diverting"])
+            ward.partitioned = True
+            status, _ = get(port, "/arrivals")
+            self.assertEqual(status, 503)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_ws_frame_carries_arrivals_and_updates(self):
+        # A fast walk-in rate, so the arrivals view in successive
+        # frames grows visibly as the ward ticks.
+        ward = Ward(
+            beds=2,
+            rate_hz=20.0,
+            seed=42,
+            triage={"poisson": {"rate_per_hour": 360000}},
+        )
+        server, port = serve_in_thread(ward)
+        try:
+            ws = WsClient(port)
+            try:
+                first = json.loads(ws.read_until_opcode(1))
+                self.assertIn("arrivals", first)
+                self.assertEqual(
+                    first["arrivals"]["arrival_rate_per_hour"], 360000.0
+                )
+                later = first
+                for _ in range(10):
+                    later = json.loads(ws.read_until_opcode(1))
+                self.assertGreater(
+                    later["arrivals"]["arrivals_last_hour"],
+                    first["arrivals"]["arrivals_last_hour"],
+                )
+                self.assertEqual(
+                    later["arrivals"]["arrivals_last_hour"],
+                    later["arrivals"]["arrivals_total"],
+                )
+            finally:
+                ws.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()
