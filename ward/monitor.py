@@ -3,6 +3,7 @@
 import random
 from collections import deque
 
+from .meds import MedSchedule
 from .vitals import alarms_for, initial_signs, step, validate_acuity
 
 # Where an alarm storm drags each vital. All of them trip an alarm.
@@ -29,10 +30,11 @@ class Monitor:
     seconds); the monitor clears each one when its time passes.
     """
 
-    def __init__(self, bed_id, profile="stable", rng=None, acuity=3):
+    def __init__(self, bed_id, profile="stable", rng=None, acuity=3, meds=None):
         self.bed_id = bed_id
         self.profile = profile
         self.acuity = validate_acuity(acuity)
+        self.meds = MedSchedule(bed_id, meds)
         self.rng = rng if rng is not None else random.Random()
         self.signs = initial_signs(profile, self.rng, self.acuity)
         self.seq = 0
@@ -82,6 +84,7 @@ class Monitor:
         if not self.admitted:
             raise ValueError("bed %d is not occupied" % self.bed_id)
         self._record_alarm_transitions([], now)
+        self.meds.reset()
         self.admitted = False
         self.cleaning_until = round(now + cleaning_s, 3)
         self.turnovers += 1
@@ -110,6 +113,12 @@ class Monitor:
         self.last_reading = None
         self.cleaning_until = None
         self.admitted = True
+        self.meds.reset()
+
+    def meds_tick(self, now, load_factor):
+        """Advance the medication schedule (no-op while unadmitted)."""
+        if self.admitted:
+            self.meds.tick(now, load_factor)
 
     def turnover_summary(self, now):
         """Per-bed turnover state and totals as plain JSON data."""
@@ -164,6 +173,10 @@ class Monitor:
             **self.signs,
         }
         reading["alarms"] = alarms_for(self.signs)
+        if self.meds.missed_active:
+            # A missed dose raises an alarm until that medication's
+            # next dose is given.
+            reading["alarms"] = reading["alarms"] + ["missed_dose"]
         self._record_alarm_transitions(reading["alarms"], now)
         self.last_reading = reading
         return reading

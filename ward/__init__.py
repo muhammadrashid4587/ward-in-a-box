@@ -1,8 +1,9 @@
 """ward-in-a-box: a simulated hospital ward as a load/chaos generator."""
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 
 from .chaos import ChaosEngine, ChaosEvent
+from .meds import MedSchedule, interaction_warnings, validate_med
 from .monitor import Monitor
 from .recorder import Recorder, iter_ticks, summarize
 from .staffing import Staffing
@@ -13,6 +14,7 @@ from .ward import Ward
 __all__ = [
     "ChaosEngine",
     "ChaosEvent",
+    "MedSchedule",
     "Monitor",
     "PROFILES",
     "Recorder",
@@ -21,7 +23,9 @@ __all__ = [
     "TimelinePhase",
     "Ward",
     "alarms_for",
+    "interaction_warnings",
     "iter_ticks",
     "summarize",
+    "validate_med",
     "__version__",
 ]

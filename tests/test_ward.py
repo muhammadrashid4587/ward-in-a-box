@@ -1123,5 +1123,189 @@ class TestTurnover(unittest.TestCase):
             server.server_close()
 
 
+class TestMeds(unittest.TestCase):
+    def test_validate_med_rejects_bad_values(self):
+        from ward.meds import validate_med
+
+        for bad in (
+            {"name": "", "every_s": 3600},
+            {"name": "insulin"},
+            {"name": "insulin", "every_s": 0},
+            {"name": "insulin", "every_s": -60},
+            {"name": "insulin", "every_s": 3600, "first_at": -1},
+            {"name": "insulin", "every_s": 3600, "grace_s": 0},
+            "insulin",
+        ):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                validate_med(bad)
+        self.assertEqual(
+            validate_med({"name": "insulin", "every_s": 3600}),
+            {"name": "insulin", "every_s": 3600.0, "first_at": 0.0, "grace_s": 600.0},
+        )
+
+    def test_interaction_warnings(self):
+        from ward.meds import MedSchedule
+
+        sched = MedSchedule(0, [
+            {"name": "warfarin", "every_s": 7200},
+            {"name": "Aspirin", "every_s": 7200},
+        ])
+        self.assertEqual(
+            sched.warnings,
+            [{"meds": ["aspirin", "warfarin"], "warning": "bleeding risk"}],
+        )
+        plain = MedSchedule(1, [{"name": "metoprolol", "every_s": 3600}])
+        self.assertEqual(plain.warnings, [])
+
+    def test_dose_given_on_time_with_adequate_staffing(self):
+        ward = Ward(
+            beds=1,
+            meds=[[{"name": "metoprolol", "every_s": 3600, "first_at": 0}]],
+            seed=42,
+        )
+        for _ in range(40):
+            ward.tick()
+        summary = ward.meds_summary()
+        self.assertEqual(summary["total_given"], 1)
+        self.assertEqual(summary["total_late"], 0)
+        self.assertEqual(summary["total_missed"], 0)
+        self.assertEqual(summary["beds"][0]["history"][0]["status"], "given")
+        self.assertEqual(summary["beds"][0]["history"][0]["delay_s"], 30.0)
+
+    def test_dose_is_late_when_understaffed(self):
+        # 64 beds, one nurse: load factor 16, so a dose takes 480 s
+        # to administer — past the 300 s late mark but inside the
+        # 600 s grace window, so it is given, late.
+        ward = Ward(
+            beds=64,
+            staffing=Staffing(day={"nurse": 1, "doctor": 1, "tech": 0}),
+            meds=[[{"name": "metoprolol", "every_s": 3600}]] + [[] for _ in range(63)],
+            seed=42,
+        )
+        for _ in range(500):
+            ward.tick()
+        summary = ward.meds_summary()
+        self.assertEqual(summary["total_given"], 1)
+        self.assertEqual(summary["total_late"], 1)
+        self.assertEqual(summary["beds"][0]["history"][0]["delay_s"], 480.0)
+
+    def test_dose_missed_when_delay_exceeds_grace(self):
+        from ward.meds import MedSchedule
+
+        sched = MedSchedule(0, [
+            {"name": "insulin", "every_s": 3600, "first_at": 0, "grace_s": 60},
+        ])
+        sched.tick(0, 4.0)  # no nurse on shift: 120 s delay, grace 60 s
+        self.assertEqual(sched.missed, 0)
+        sched.tick(60, 4.0)
+        self.assertEqual(sched.missed, 1)
+        self.assertEqual(sched.missed_active, {"insulin"})
+        self.assertEqual(sched.history[0]["status"], "missed")
+        # Next dose, given on time, clears the missed-dose alarm.
+        sched.tick(3600, 1.0)
+        sched.tick(3630, 1.0)
+        self.assertEqual(sched.given, 1)
+        self.assertEqual(sched.missed_active, set())
+
+    def test_missed_dose_raises_an_alarm_in_the_reading(self):
+        ward = Ward(
+            beds=1,
+            staffing=Staffing(day={"nurse": 0, "doctor": 1, "tech": 0}),
+            meds=[[{"name": "insulin", "every_s": 3600, "first_at": 0, "grace_s": 60}]],
+            seed=42,
+        )
+        for _ in range(59):
+            ward.tick()
+        snap = ward.tick()  # t=60: grace expires, dose missed
+        self.assertIn("missed_dose", snap["beds"][0]["alarms"])
+        self.assertEqual(ward.meds_summary()["total_missed"], 1)
+        history = ward.monitors[0].alarm_history
+        self.assertTrue(any(e["alarm"] == "missed_dose" for e in history))
+
+    def test_snapshot_carries_meds(self):
+        ward = Ward(
+            beds=1,
+            meds=[[{"name": "metoprolol", "every_s": 3600}]],
+            seed=42,
+        )
+        snap = ward.tick()
+        self.assertIn("meds", snap)
+        self.assertEqual(snap["meds"]["beds"][0]["meds"], ["metoprolol"])
+
+    def test_meds_endpoint_serves_json_and_is_503_while_partitioned(self):
+        ward = Ward(
+            beds=2,
+            meds=[[{"name": "metoprolol", "every_s": 3600}], []],
+            seed=1,
+        )
+        ward.tick()
+        server, port = serve_in_thread(ward)
+        try:
+            status, body = get(port, "/meds")
+            self.assertEqual(status, 200)
+            data = json.loads(body)
+            self.assertEqual(data["beds"][0]["meds"], ["metoprolol"])
+            self.assertEqual(data["beds"][1]["meds"], [])
+            ward.partitioned = True
+            status, _ = get(port, "/meds")
+            self.assertEqual(status, 503)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_discharge_resets_meds(self):
+        ward = Ward(
+            beds=1,
+            cleaning_s=10.0,
+            meds=[[{"name": "metoprolol", "every_s": 3600}]],
+            seed=42,
+        )
+        for _ in range(40):
+            ward.tick()
+        self.assertEqual(ward.meds_summary()["total_given"], 1)
+        ward.discharge(0)
+        summary = ward.meds_summary()
+        self.assertEqual(summary["total_given"], 0)
+        self.assertEqual(summary["beds"][0]["history"], [])
+
+    def test_scenario_meds(self):
+        cfg = load_scenario(os.path.join(HERE, "..", "scenarios", "meds.json"))
+        ward = build_ward(cfg, seed=42)
+        snap = ward.tick()
+        self.assertEqual(
+            snap["meds"]["beds"][0]["warnings"],
+            [{"meds": ["aspirin", "warfarin"], "warning": "bleeding risk"}],
+        )
+        self.assertEqual(
+            snap["meds"]["beds"][3]["warnings"],
+            [{"meds": ["lisinopril", "spironolactone"], "warning": "hyperkalaemia risk"}],
+        )
+        # Day shift (18:00-19:00) is adequately staffed: the 0 s doses
+        # are given. After 19:00 one nurse covers 12 beds, so the
+        # time-critical insulin (60 s grace) is missed at night while
+        # the 600 s grace doses are still given, late or on time.
+        for _ in range(3699):
+            ward.tick()
+        summary = ward.meds_summary()
+        self.assertGreater(summary["total_given"], 0)
+        self.assertEqual(summary["total_missed"], 1)
+        self.assertEqual(summary["beds"][1]["doses"]["missed"], 1)
+
+    def test_scenario_rejects_bad_meds(self):
+        for patients in (
+            [{"meds": [{"name": "insulin", "every_s": 0}]}],
+            [{"meds": [{"name": "insulin", "every_s": 3600},
+                       {"name": "Insulin", "every_s": 1800}]}],
+        ):
+            with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+                json.dump({"beds": 1, "patients": patients}, f)
+                path = f.name
+            try:
+                with self.assertRaises(ValueError):
+                    load_scenario(path)
+            finally:
+                os.unlink(path)
+
+
 if __name__ == "__main__":
     unittest.main()

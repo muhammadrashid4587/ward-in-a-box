@@ -47,6 +47,9 @@ python3 -m ward.cli scenarios/staffing.json --seed 42
 # Bed turnover: beds 1 and 2 discharge, clean for 10s, then refill
 python3 -m ward.cli scenarios/turnover.json --seed 42
 
+# Medication: interaction warnings up front, insulin missed on thin nights
+python3 -m ward.cli scenarios/meds.json --seed 42
+
 # Reproducible run
 python3 -m ward.cli scenarios/example.json --seed 42
 ```
@@ -67,6 +70,9 @@ python3 -m ward.cli scenarios/example.json --seed 42
 - `GET /turnover` — per-bed turnover state (`occupied`, `cleaning`,
   `available`), turnovers and total cleaning time per bed, plus ward
   totals, as JSON (503 while partitioned)
+- `GET /meds` — per-bed medication schedules, interaction warnings,
+  and given/late/missed dose counts, plus ward totals, as JSON
+  (503 while partitioned)
 
 A reading looks like:
 
@@ -93,8 +99,9 @@ streams one JSON text frame per tick at the ward rate:
 ```
 
 Each frame carries the same snapshot as `/snapshot` plus the alarm
-summary from `/alarms` and the staffing summary from `/staffing`, so a
-client gets bed occupancy, vitals, alarms, and staffing in one message. Ping frames are answered with pong, close frames
+summary from `/alarms`, the staffing summary from `/staffing`, and the
+medication summary from `/meds`, so a client gets bed occupancy,
+vitals, alarms, staffing, and medication in one message. Ping frames are answered with pong, close frames
 are echoed and the connection is then closed; text frames from the
 client are accepted and ignored — the ward pushes ticks, it takes no
 input. While a partition is active the upgrade is refused with 503,
@@ -279,6 +286,43 @@ Offline beds in a snapshot also carry their state (`"cleaning"` or
 bed 1 discharges at 5 s and is refilled at 15 s, bed 2 discharges at
 8 s and is refilled at 18 s.
 
+## Medication administration
+
+Each patient can have scheduled medications, set per patient in the
+scenario:
+
+```json
+{"bed": 0, "profile": "stable",
+ "meds": [{"name": "metoprolol", "every_s": 3600,
+           "first_at": 0, "grace_s": 600}]}
+```
+
+A dose due at `t` is administered 30 seconds later with a full
+roster, slowed by the same staffing load factor that slows alarm
+acknowledgement — so a thin night shift delays medication too. A dose
+given more than 300 seconds after it was due counts as late; a dose
+whose administration would land past `due + grace_s` (600 seconds by
+default) is missed instead, and the miss raises a `missed_dose` alarm
+on the bed until that medication's next dose is given. A discharge
+clears the patient's medication state, and a new admission starts
+with a fresh schedule.
+
+Some medication pairs interact. A small table of known pairs
+(warfarin + aspirin, metoprolol + verapamil, insulin + metoprolol,
+lisinopril + spironolactone, digoxin + furosemide) produces warnings
+in the medication summary — warnings only, the doses still happen,
+because a simulator should surface the risk, not decide the
+prescription.
+
+Every snapshot carries a `"meds"` object with the per-bed schedules,
+warnings, given/late/missed counts, and ward totals. The same
+summary is served by `GET /meds`. See `scenarios/meds.json` for a
+runnable example: bed 0 is on warfarin and aspirin, bed 1 on
+time-critical insulin with a 60-second grace window, bed 3 on
+lisinopril and spironolactone. Over a seeded 7200-tick run the day
+shift gives every dose, the night shift (one nurse for twelve beds)
+misses the insulin dose, and 2 interaction warnings are raised.
+
 ## Recording a run
 
 `--record FILE` writes every tick to a JSONL file: a header line with
@@ -302,7 +346,7 @@ endpoints returned 503 while it lasted, the ticks did not stop.
 make test
 ```
 
-85 tests: vitals stay inside plausible ranges, dropout actually stops a
+96 tests: vitals stay inside plausible ranges, dropout actually stops a
 monitor's stream, an alarm storm produces alarms, stale readings freeze,
 a partition blocks the snapshot endpoint, the HTTP endpoints serve valid
 JSON, the stream serves JSON lines, scenario files validate, alarm
@@ -339,7 +383,16 @@ discharge/admit rejection on the wrong state, a timeline not pulling
 a bed out of cleaning and refilling it after, the `discharge` chaos
 event firing exactly once, the `/turnover` endpoint (503 while
 partitioned), and the `turnover.json` scenario discharging two beds
-and refilling both after cleaning.
+and refilling both after cleaning. Medication tests cover validation
+of schedule values and duplicate names, a dose given on time with an
+adequate roster, a dose going late when one nurse covers 64 beds
+(480.0 s delay), a dose missed when the delay exceeds its grace
+window and the missed-dose alarm clearing on the next given dose, a
+missed dose raising a `missed_dose` alarm in the bed's reading, the
+`/meds` endpoint (503 while partitioned), a discharge resetting the
+medication state, interaction warnings for warfarin + aspirin and
+lisinopril + spironolactone, and the `meds.json` scenario giving 7
+doses and missing 1 over a seeded run.
 
 ## Roadmap
 
@@ -349,3 +402,6 @@ and refilling both after cleaning.
   response times) — done in v0.7.0
 - Bed turnover (discharges and new admissions refilling beds) — done
   in v0.8.0
+- Medication administration (scheduled doses, staffing-driven late
+  and missed doses with missed-dose alarms, interaction warnings) —
+  done in v0.9.0

@@ -9,6 +9,7 @@ from .recorder import Recorder, iter_ticks, summarize
 from .server import serve
 from .staffing import Staffing
 from .timeline import Timeline, TimelinePhase
+from .meds import validate_med
 from .vitals import PROFILES, validate_acuity
 from .ward import Ward
 
@@ -23,6 +24,7 @@ def load_scenario(path):
     rate = data.get("rate_hz", 1.0)
     profiles = []
     acuities = []
+    meds = []
     for i, p in enumerate(data.get("patients", [])):
         profile = p.get("profile", "stable") if isinstance(p, dict) else p
         if profile not in PROFILES:
@@ -34,6 +36,16 @@ def load_scenario(path):
         except ValueError:
             raise ValueError("patient %d: acuity must be an int in 1..4, got %r" % (i, acuity))
         acuities.append(acuity)
+        bed_meds = p.get("meds", []) if isinstance(p, dict) else []
+        if not isinstance(bed_meds, list):
+            raise ValueError("patient %d: meds must be a list" % i)
+        try:
+            meds.append([validate_med(m) for m in bed_meds])
+        except ValueError as e:
+            raise ValueError("patient %d: %s" % (i, e))
+        names = [m["name"].lower() for m in meds[-1]]
+        if len(set(names)) != len(names):
+            raise ValueError("patient %d: duplicate medication names" % i)
     chaos = []
     for i, ev in enumerate(data.get("chaos", [])):
         if not isinstance(ev, dict):
@@ -81,6 +93,7 @@ def load_scenario(path):
         "rate_hz": rate,
         "profiles": profiles,
         "acuities": acuities,
+        "meds": meds,
         "chaos": chaos,
         "timeline": timeline,
         "staffing": staffing,
@@ -96,6 +109,7 @@ def build_ward(cfg, seed=None, recorder=None):
         rate_hz=cfg["rate_hz"],
         profiles=cfg["profiles"],
         acuities=cfg.get("acuities"),
+        meds=cfg.get("meds"),
         chaos=cfg["chaos"],
         seed=seed,
         timeline=cfg.get("timeline"),
@@ -144,6 +158,7 @@ def main(argv=None):
             "beds": args.beds,
             "rate_hz": args.rate_hz,
             "profiles": [],
+            "meds": [],
             "chaos": [],
             "timeline": None,
             "staffing": None,

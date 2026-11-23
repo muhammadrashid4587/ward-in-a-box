@@ -25,7 +25,7 @@ class Ward:
     snapshot to a JSONL file.
     """
 
-    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None, cleaning_s=30.0):
+    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None, cleaning_s=30.0, meds=None):
         if not 1 <= beds <= 64:
             raise ValueError("beds must be 1..64")
         if rate_hz <= 0:
@@ -62,7 +62,8 @@ class Ward:
         for i in range(beds):
             profile = profiles[i] if i < len(profiles) else DEFAULT_PROFILES[i % len(DEFAULT_PROFILES)]
             acuity = acuities[i] if i < len(acuities) else 3
-            monitor = Monitor(i, profile, rng=self.rng, acuity=acuity)
+            bed_meds = meds[i] if meds is not None and i < len(meds) else None
+            monitor = Monitor(i, profile, rng=self.rng, acuity=acuity, meds=bed_meds)
             # With a timeline, beds start unadmitted and come online as
             # the timeline admits them; without one, all beds start open.
             if timeline is not None:
@@ -98,7 +99,12 @@ class Ward:
                         m.admitted = True
         readings = []
         online = []
+        occupied = sum(1 for m in self.monitors if m.admitted)
+        load_factor = self.staffing.load_factor(occupied, self.elapsed)
         for m in self.monitors:
+            # Medication first, so a missed dose raises its alarm in
+            # this tick's reading rather than the next one.
+            m.meds_tick(self.elapsed, load_factor)
             r = m.tick(self.elapsed, dt)
             if r is None:
                 entry = {"bed": m.bed_id, "online": False, "t": self.elapsed}
@@ -110,12 +116,11 @@ class Ward:
                 r["online"] = True
                 readings.append(r)
                 online.append(m.bed_id)
-        occupied = sum(1 for m in self.monitors if m.admitted)
         self.staffing.tick(self.elapsed, occupied, online)
         for m in self.monitors:
             for alarm in m.raised_this_tick:
                 self.staffing.alarm_raised(m.bed_id, alarm, self.elapsed, occupied)
-        snap = {"t": self.elapsed, "beds": readings, "staffing": self.staffing.summary(self.elapsed, occupied), "turnover": self.turnover_summary()}
+        snap = {"t": self.elapsed, "beds": readings, "staffing": self.staffing.summary(self.elapsed, occupied), "turnover": self.turnover_summary(), "meds": self.meds_summary()}
         with self._lock:
             self.latest = snap
         if self.recorder is not None:
@@ -168,6 +173,18 @@ class Ward:
             "available": sum(1 for b in beds if b["state"] == "available"),
             "total_turnovers": sum(b["turnovers"] for b in beds),
             "total_cleaning_s": round(sum(b["total_cleaning_s"] for b in beds), 3),
+        }
+
+    def meds_summary(self):
+        """Per-bed medication state and ward dose totals."""
+        beds = [m.meds.summary(self.elapsed) for m in self.monitors]
+        return {
+            "t": self.elapsed,
+            "beds": beds,
+            "total_given": sum(b["doses"]["given"] for b in beds),
+            "total_late": sum(b["doses"]["late"] for b in beds),
+            "total_missed": sum(b["doses"]["missed"] for b in beds),
+            "total_warnings": sum(len(b["warnings"]) for b in beds),
         }
 
     def staffing_summary(self):
