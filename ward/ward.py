@@ -4,6 +4,7 @@ import random
 import threading
 import time
 
+from .alert_hooks import validate_trend_alert_hooks
 from .chaos import ChaosEngine
 from .discharge import DischargePlanner
 from .monitor import Monitor
@@ -33,7 +34,7 @@ class Ward:
     snapshot to a JSONL file.
     """
 
-    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None, cleaning_s=30.0, meds=None, triage=None, discharge_planning=None, cleaning_capacity=None, discharge_readiness=None, oxygen=None, consciousness=None, consciousness_dynamics=None, news2_trend=None):
+    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None, cleaning_s=30.0, meds=None, triage=None, discharge_planning=None, cleaning_capacity=None, discharge_readiness=None, oxygen=None, consciousness=None, consciousness_dynamics=None, news2_trend=None, trend_alert_hooks=None):
         if not 1 <= beds <= 64:
             raise ValueError("beds must be 1..64")
         if rate_hz <= 0:
@@ -62,6 +63,10 @@ class Ward:
                 % (discharge_readiness,)
             )
         self.news2_trend = validate_news2_trend(news2_trend)
+        # Trend-alert hooks: one shared object for the whole ward
+        # (a webhook URL and/or an in-process callback), invoked
+        # when a NEWS2 trend alert fires. Off by default.
+        self.trend_alert_hooks = validate_trend_alert_hooks(trend_alert_hooks)
         if discharge_planning is None:
             self.discharge_planner = DischargePlanner()
         elif isinstance(discharge_planning, DischargePlanner):
@@ -143,7 +148,7 @@ class Ward:
                 and i < len(consciousness_dynamics)
                 else None
             )
-            monitor = Monitor(i, profile, rng=self.rng, acuity=acuity, meds=bed_meds, on_oxygen=on_oxygen, consciousness=bed_consciousness, consciousness_dynamics=bed_dynamics, news2_trend=self.news2_trend)
+            monitor = Monitor(i, profile, rng=self.rng, acuity=acuity, meds=bed_meds, on_oxygen=on_oxygen, consciousness=bed_consciousness, consciousness_dynamics=bed_dynamics, news2_trend=self.news2_trend, trend_alert_hooks=self.trend_alert_hooks)
             # With a timeline, beds start unadmitted and come online as
             # the timeline admits them; without one, all beds start open.
             if timeline is not None:
@@ -391,6 +396,9 @@ class Ward:
         how many are still waiting for one, and the mean and
         longest time from an escalation raising to the response
         landing (null before the first response).
+        ``trend_alert_hooks`` carries the hook totals: whether any
+        hook is configured, how many hook deliveries were invoked,
+        and how many failed.
         """
         beds = [m.news2_detail(self.elapsed) for m in self.monitors]
         scored = [b for b in beds if b["news2"] is not None]
@@ -445,6 +453,7 @@ class Ward:
             "trend_alerts_raised": sum(
                 b["trend_alerts_raised"] for b in beds
             ),
+            "trend_alert_hooks": self.trend_alert_hooks.summary(),
         }
 
     def news2_history_summary(self, bed_id=None):

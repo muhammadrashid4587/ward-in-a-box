@@ -112,6 +112,11 @@ python3 -m ward.cli scenarios/news2-acvpu.json --seed 42
 # quiet — 3 trend alerts raised, 1 still open at the end
 python3 -m ward.cli scenarios/news2-trend.json --seed 42
 
+# NEWS2 trend alert hooks: the same ward, with each trend alert
+# also POSTed to a webhook (here a placeholder URL — point it at
+# your own endpoint; a dead endpoint is logged, never fatal)
+python3 -m ward.cli scenarios/news2-trend-hooks.json --seed 42
+
 # NEWS2 response timing: the hypoxic bed's escalation gets its
 # response 30 s after it raises, the febrile bed's brief medium
 # episode clears before anyone responds, and its high episode
@@ -1083,6 +1088,51 @@ alert under the alarm storm, from 5 at 1 s to 11, a rise of 6,
 clearing at 15 s when the storm ends — 3 trend alerts raised in
 total, 1 still open.
 
+## NEWS2 trend alert hooks
+
+A trend alert is only useful if something outside the ward hears
+about it. A scenario can configure hooks that fire when a trend
+alert raises:
+
+```json
+{"trend_alert_hooks": {"webhook_url": "http://127.0.0.1:18099/hooks"}}
+```
+
+Two channels, either or both:
+
+- **webhook** — the alert payload is POSTed as JSON to the URL:
+  the bed, the rule that fired, when it raised, the score the rise
+  started from and when, the peak score and rise so far. The POST
+  runs in a daemon thread, so a slow or dead endpoint never blocks
+  the ward tick — best effort, a failure is logged and counted,
+  never fatal.
+- **callback** — an in-process Python callable, called with the
+  alert payload in the tick that raises the alert (Python API only
+  — a scenario file cannot hold a callable). A callback that raises
+  is caught, logged, and counted as a failure; the tick still
+  completes.
+
+Hooks are off by default: a ward with none configured behaves
+exactly as before. A fired alert records whether the hook was
+invoked (`"hook_invoked"` on the alert, False with no hooks) and
+any synchronous error (`"hook_errors"`), so the alert carries the
+delivery in the early-warning summary (`GET /news2`), the history
+endpoint (`GET /news2/history`), every snapshot and WebSocket
+frame, and the run summary (`--summary`). The early-warning
+summary also carries the ward hook totals (`"trend_alert_hooks"`:
+whether any hook is configured, how many deliveries were invoked,
+how many failed).
+
+One honest limitation: a webhook delivery is best effort, not
+guaranteed. The ward records that the hook was invoked, not that
+the far end received it — a POST that times out or is refused is
+counted as failed in the totals, but the alert itself only says
+it was dispatched. See `scenarios/news2-trend-hooks.json` for a
+runnable example: over a seeded 40-tick run the same 3 trend
+alerts raise as in `news2-trend.json`, each one POSTed to the
+configured webhook, with 3 hook deliveries invoked and 0 failed
+against a stub server.
+
 ## NEWS2 response timing
 
 An escalation says a patient needs a response; the response
@@ -1151,7 +1201,7 @@ endpoints returned 503 while it lasted, the ticks did not stop.
 make test
 ```
 
-262 tests: vitals stay inside plausible ranges, dropout actually stops a
+271 tests: vitals stay inside plausible ranges, dropout actually stops a
 monitor's stream, an alarm storm produces alarms, stale readings freeze,
 a partition blocks the snapshot endpoint, the HTTP endpoints serve valid
 JSON, the stream serves JSON lines, scenario files validate, alarm
@@ -1377,7 +1427,17 @@ the response to 120 s and leaving it pending, a discharge before
 the response closing the episode unresponded, a response due on
 the very tick the risk returns to low still landing, and the
 `news2-response.json` scenario (2 responded, 1 unresponded, mean
-30.0 s) with the run summary carrying the response totals.
+30.0 s) with the run summary carrying the response totals. Trend-alert-hook
+tests cover validation of the hook config (including bad URLs, a
+non-callable callback, and bad timeouts), hooks off by default with the
+alert recording no invocation, a callback receiving the alert payload
+exactly once per alert, a callback that raises being caught with the
+tick completing and the failure counted, a webhook POST reaching a
+local stub server with the alert payload as JSON, a webhook to a dead
+port failing without stopping the ward and being counted, a slow
+webhook never blocking the tick, and the `news2-trend-hooks.json`
+scenario POSTing all 3 alerts to a stub server with the run summary
+carrying the hook totals.
 
 ## Roadmap
 
@@ -1515,3 +1575,13 @@ the very tick the risk returns to low still landing, and the
   the run summary; the response is a scheduled arrival, not a
   modelled intervention, and never touches the vital-sign alarm
   list) — done in v0.29.0
+- NEWS2 trend alert hooks (when a trend alert fires, a configured
+  webhook URL gets the alert payload POSTed to it in a daemon
+  thread — non-blocking, best effort, failures logged and counted,
+  never fatal — and/or an in-process Python callback is called in
+  the raising tick, with a raising callback caught and counted; each
+  fired alert records whether the hook was invoked, and the
+  early-warning summary, every snapshot, WebSocket frame,
+  `GET /news2` and `GET /news2/history`, and the run summary carry
+  the hook totals; off by default, configured per ward with
+  `trend_alert_hooks` in the scenario) — done in v0.30.0

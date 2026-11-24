@@ -1,7 +1,8 @@
 """ward-in-a-box: a simulated hospital ward as a load/chaos generator."""
 
-__version__ = "0.29.0"
+__version__ = "0.30.0"
 
+from .alert_hooks import TrendAlertHooks, validate_trend_alert_hooks
 from .arrivals import ArrivalModel
 from .chaos import ChaosEngine, ChaosEvent
 from .discharge import DischargePlanner
@@ -28,6 +29,7 @@ __all__ = [
     "Staffing",
     "Timeline",
     "TimelinePhase",
+    "TrendAlertHooks",
     "TriageQueue",
     "Ward",
     "alarms_for",
@@ -35,5 +37,6 @@ __all__ = [
     "iter_ticks",
     "summarize",
     "validate_med",
+    "validate_trend_alert_hooks",
     "__version__",
 ]

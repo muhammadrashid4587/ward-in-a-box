@@ -3,6 +3,7 @@
 import random
 from collections import deque
 
+from .alert_hooks import validate_trend_alert_hooks
 from .meds import MedSchedule
 from .news2 import (
     ACVPU_LEVELS,
@@ -44,7 +45,7 @@ class Monitor:
     seconds); the monitor clears each one when its time passes.
     """
 
-    def __init__(self, bed_id, profile="stable", rng=None, acuity=3, meds=None, on_oxygen=False, consciousness="alert", consciousness_dynamics=None, news2_trend=None):
+    def __init__(self, bed_id, profile="stable", rng=None, acuity=3, meds=None, on_oxygen=False, consciousness="alert", consciousness_dynamics=None, news2_trend=None, trend_alert_hooks=None):
         self.bed_id = bed_id
         self.profile = profile
         self.acuity = validate_acuity(acuity)
@@ -54,6 +55,12 @@ class Monitor:
             consciousness_dynamics
         )
         self.news2_trend = validate_news2_trend(news2_trend)
+        # Trend-alert hooks: the ward's configured webhook and/or
+        # in-process callback, invoked when a trend alert fires.
+        # Off by default — no hooks, no invocation, no behaviour
+        # change. Shared across the ward's monitors, so the ward
+        # totals count every delivery.
+        self.trend_alert_hooks = validate_trend_alert_hooks(trend_alert_hooks)
         # Every consciousness change this stay, as
         # {"from": level, "to": level, "t": seconds}; empty while
         # dynamics are off or the level has never moved.
@@ -531,7 +538,9 @@ class Monitor:
         records when it raised, the score the rise started from
         and when, the worst score it reached, and the biggest rise
         — so a client can see a patient who climbed fast and came
-        back, not just where they are now. It closes when the
+        back, not just where they are now — and whether the ward's
+        trend-alert hooks were invoked for it (``hook_invoked``,
+        False when no hook is configured). It closes when the
         score stops rising: the window slides forward and the
         rise out of it shrinks, or the recent ticks stop climbing.
         Like the score itself, it never touches the vital-sign
@@ -551,6 +560,23 @@ class Monitor:
                     "rule": trend["rule"],
                 }
                 self.trend_alerts_raised += 1
+                # A fired trend alert invokes the ward's hooks, if
+                # any are configured — a webhook POST (dispatched in
+                # a daemon thread, so it never blocks the tick) and/or
+                # an in-process callback — and the alert records
+                # whether the hook was invoked, so a snapshot, a
+                # recording, or the run summary can say whether the
+                # alert reached the outside world. A hook failure is
+                # logged and counted, never fatal to the tick.
+                result = self.trend_alert_hooks.fire(
+                    {
+                        "event": "trend_alert",
+                        "bed": self.bed_id,
+                        **self._trend_alert,
+                    }
+                )
+                self._trend_alert["hook_invoked"] = result["invoked"]
+                self._trend_alert["hook_errors"] = result["errors"]
             else:
                 if trend["current_score"] > self._trend_alert["peak_score"]:
                     self._trend_alert["peak_score"] = trend["current_score"]
@@ -588,7 +614,8 @@ class Monitor:
         is the current rate of change of the score (see
         :func:`ward.news2.trend_for`), and ``trend_alerts`` lists
         every trend alert this stay with raised/cleared times and
-        peak score and rise.
+        peak score and rise, and whether the ward's hooks were
+        invoked for it (``hook_invoked``).
         """
         reading = self.last_reading
         offline = (

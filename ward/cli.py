@@ -4,6 +4,7 @@ import argparse
 import json
 import sys
 
+from .alert_hooks import validate_trend_alert_hooks
 from .chaos import ChaosEvent
 from .discharge import DischargePlanner
 from .news2 import (
@@ -166,6 +167,16 @@ def load_scenario(path):
             news2_trend = validate_news2_trend(data["news2_trend"])
         except ValueError as e:
             raise ValueError("news2_trend: %s" % e)
+    trend_alert_hooks = None
+    if "trend_alert_hooks" in data:
+        if not isinstance(data["trend_alert_hooks"], dict):
+            raise ValueError("trend_alert_hooks must be an object")
+        try:
+            trend_alert_hooks = validate_trend_alert_hooks(
+                data["trend_alert_hooks"]
+            )
+        except ValueError as e:
+            raise ValueError("trend_alert_hooks: %s" % e)
     return {
         "beds": beds,
         "rate_hz": rate,
@@ -183,6 +194,7 @@ def load_scenario(path):
         "discharge_planning": discharge_planning,
         "discharge_readiness": discharge_readiness,
         "news2_trend": news2_trend,
+        "trend_alert_hooks": trend_alert_hooks,
         "triage": triage,
         "host": data.get("host", "127.0.0.1"),
         "port": data.get("port", 8080),
@@ -208,6 +220,7 @@ def build_ward(cfg, seed=None, recorder=None):
         discharge_planning=cfg.get("discharge_planning"),
         discharge_readiness=cfg.get("discharge_readiness"),
         news2_trend=cfg.get("news2_trend"),
+        trend_alert_hooks=cfg.get("trend_alert_hooks"),
         triage=cfg.get("triage"),
         recorder=recorder,
     )

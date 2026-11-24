@@ -14,10 +14,11 @@ import tempfile
 import threading
 import unittest
 from contextlib import redirect_stdout
-from http.server import ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from ward.alert_hooks import TrendAlertHooks, validate_trend_alert_hooks
 from ward.chaos import ChaosEvent
 from ward.cli import build_ward, load_scenario, main
 from ward.discharge import DischargePlanner
@@ -59,6 +60,39 @@ def get(port, path, timeout=3):
         return resp.status, resp.read()
     finally:
         conn.close()
+
+
+def capture_server():
+    """A stub HTTP server that records POST bodies.
+
+    Returns ``(server, port, received)``: ``received`` is a list of
+    ``(path, content_type, body_bytes)`` in arrival order. The
+    caller shuts the server down.
+    """
+    received = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            received.append(
+                (
+                    self.path,
+                    self.headers.get("Content-Type"),
+                    self.rfile.read(length),
+                )
+            )
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, server.server_address[1], received
 
 
 class TestVitals(unittest.TestCase):
@@ -5129,6 +5163,303 @@ class TestNEWS2Trend(unittest.TestCase):
             )
             self.assertEqual(
                 responses["max_time_to_respond_s"], 30.0
+            )
+        finally:
+            os.unlink(path)
+
+
+class TestTrendAlertHooks(unittest.TestCase):
+    def _storm_ward(self, hooks=None):
+        # Febrile bed under an alarm storm: the score jumps 7 to
+        # 11, so a trend alert opens on the jump rule at t=2.
+        return Ward(
+            beds=1,
+            profiles=["febrile"],
+            chaos=[ChaosEvent("alarm_storm", at=1, duration=10, bed=0)],
+            seed=3,
+            trend_alert_hooks=hooks,
+        )
+
+    def test_validate_trend_alert_hooks(self):
+        hooks = validate_trend_alert_hooks(None)
+        self.assertIsInstance(hooks, TrendAlertHooks)
+        self.assertFalse(hooks.configured)
+        self.assertIsNone(hooks.webhook_url)
+        self.assertIsNone(hooks.callback)
+        self.assertEqual(hooks.timeout_s, 5.0)
+        custom = validate_trend_alert_hooks(
+            {"webhook_url": "https://example.invalid/hooks", "timeout_s": 2}
+        )
+        self.assertTrue(custom.configured)
+        self.assertEqual(
+            custom.webhook_url, "https://example.invalid/hooks"
+        )
+        self.assertEqual(custom.timeout_s, 2.0)
+        seen = []
+        append = seen.append
+        cb = validate_trend_alert_hooks({"callback": append})
+        self.assertTrue(cb.configured)
+        self.assertIs(cb.callback, append)
+        same = TrendAlertHooks(webhook_url="http://127.0.0.1:9/hooks")
+        self.assertIs(validate_trend_alert_hooks(same), same)
+        with self.assertRaises(ValueError):
+            validate_trend_alert_hooks({"webhook_url": "ftp://x/hooks"})
+        with self.assertRaises(ValueError):
+            validate_trend_alert_hooks({"webhook_url": 42})
+        with self.assertRaises(ValueError):
+            validate_trend_alert_hooks({"callback": "not callable"})
+        with self.assertRaises(ValueError):
+            validate_trend_alert_hooks({"timeout_s": 0})
+        with self.assertRaises(ValueError):
+            validate_trend_alert_hooks({"timeout_s": "fast"})
+        with self.assertRaises(ValueError):
+            validate_trend_alert_hooks({"url": "http://x/hooks"})
+        with self.assertRaises(ValueError):
+            validate_trend_alert_hooks("http://x/hooks")
+
+    def test_hooks_off_by_default(self):
+        # No hooks configured: the alert still fires, and it
+        # records that no hook was invoked.
+        ward = self._storm_ward()
+        self.assertFalse(ward.trend_alert_hooks.configured)
+        ward.tick()
+        ward.tick()
+        m = ward.monitors[0]
+        self.assertIsNotNone(m._trend_alert)
+        alert = m._trend_alert
+        self.assertFalse(alert["hook_invoked"])
+        self.assertEqual(alert["hook_errors"], [])
+        summary = ward.early_warning_summary()["trend_alert_hooks"]
+        self.assertEqual(
+            summary, {"configured": False, "invoked": 0, "failed": 0}
+        )
+        self.assertEqual(
+            ward.snapshot()["early_warning"]["trend_alert_hooks"],
+            summary,
+        )
+
+    def test_callback_hook_invoked_on_trend_alert(self):
+        seen = []
+        ward = self._storm_ward({"callback": seen.append})
+        self.assertTrue(ward.trend_alert_hooks.configured)
+        ward.tick()
+        self.assertEqual(seen, [])
+        ward.tick()
+        self.assertEqual(len(seen), 1)
+        payload = seen[0]
+        self.assertEqual(payload["event"], "trend_alert")
+        self.assertEqual(payload["bed"], 0)
+        self.assertEqual(payload["rule"], "jump")
+        self.assertEqual(payload["raised_t"], 2.0)
+        self.assertEqual(payload["start_score"], 7)
+        self.assertEqual(payload["peak_score"], 10)
+        # The alert itself records the invocation.
+        alert = ward.monitors[0]._trend_alert
+        self.assertTrue(alert["hook_invoked"])
+        self.assertEqual(alert["hook_errors"], [])
+        # One invocation, no failure, in the ward totals.
+        summary = ward.early_warning_summary()["trend_alert_hooks"]
+        self.assertEqual(
+            summary, {"configured": True, "invoked": 1, "failed": 0}
+        )
+        # The alert fires once: later ticks while it stays open do
+        # not invoke the hook again.
+        for _ in range(5):
+            ward.tick()
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(
+            ward.trend_alert_hooks.summary()["invoked"], 1
+        )
+
+    def test_callback_failure_is_not_fatal(self):
+        def boom(payload):
+            raise ValueError("pager is down")
+
+        ward = self._storm_ward({"callback": boom})
+        ward.tick()
+        snap = ward.tick()
+        # The tick still completes and the alert still fires.
+        self.assertIsNotNone(ward.monitors[0]._trend_alert)
+        self.assertTrue(snap["beds"][0]["online"])
+        alert = ward.monitors[0]._trend_alert
+        self.assertTrue(alert["hook_invoked"])
+        self.assertEqual(alert["hook_errors"], ["pager is down"])
+        summary = ward.early_warning_summary()["trend_alert_hooks"]
+        self.assertEqual(summary["invoked"], 1)
+        self.assertEqual(summary["failed"], 1)
+
+    def test_webhook_hook_posts_to_stub_server(self):
+        server, port, received = capture_server()
+        try:
+            ward = self._storm_ward(
+                {"webhook_url": "http://127.0.0.1:%d/hooks" % port}
+            )
+            ward.tick()
+            ward.tick()
+            self.assertTrue(ward.trend_alert_hooks.wait(timeout=5))
+            self.assertEqual(len(received), 1)
+            path, content_type, body = received[0]
+            self.assertEqual(path, "/hooks")
+            self.assertEqual(content_type, "application/json")
+            payload = json.loads(body)
+            self.assertEqual(payload["event"], "trend_alert")
+            self.assertEqual(payload["bed"], 0)
+            self.assertEqual(payload["rule"], "jump")
+            self.assertEqual(payload["raised_t"], 2.0)
+            self.assertEqual(payload["start_score"], 7)
+            self.assertEqual(payload["peak_score"], 10)
+            alert = ward.monitors[0]._trend_alert
+            self.assertTrue(alert["hook_invoked"])
+            self.assertEqual(alert["hook_errors"], [])
+            summary = ward.early_warning_summary()["trend_alert_hooks"]
+            self.assertEqual(
+                summary, {"configured": True, "invoked": 1, "failed": 0}
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_webhook_failure_is_not_fatal(self):
+        # A port with nothing listening: the POST fails, the ward
+        # keeps ticking, and the failure is counted, not raised.
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        ward = self._storm_ward(
+            {
+                "webhook_url": "http://127.0.0.1:%d/hooks" % port,
+                "timeout_s": 2,
+            }
+        )
+        ward.tick()
+        snap = ward.tick()
+        self.assertIsNotNone(ward.monitors[0]._trend_alert)
+        self.assertTrue(snap["beds"][0]["online"])
+        # The hook was invoked (dispatched), even though the
+        # delivery failed.
+        alert = ward.monitors[0]._trend_alert
+        self.assertTrue(alert["hook_invoked"])
+        self.assertTrue(ward.trend_alert_hooks.wait(timeout=5))
+        summary = ward.early_warning_summary()["trend_alert_hooks"]
+        self.assertEqual(summary["invoked"], 1)
+        self.assertEqual(summary["failed"], 1)
+
+    def test_webhook_does_not_block_the_tick(self):
+        # A webhook endpoint that takes 10 s to answer: the tick
+        # must still return at once, because the POST runs in a
+        # daemon thread — the delivery is still in flight when
+        # the tick returns.
+        received = []
+
+        class SlowHandler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                import time
+
+                length = int(self.headers.get("Content-Length", 0))
+                received.append(self.rfile.read(length))
+                time.sleep(10)
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), SlowHandler)
+        thread = threading.Thread(
+            target=server.serve_forever, daemon=True
+        )
+        thread.start()
+        try:
+            hooks = TrendAlertHooks(
+                webhook_url="http://127.0.0.1:%d/hooks"
+                % server.server_address[1],
+                timeout_s=30,
+            )
+            ward = self._storm_ward(hooks)
+            import time
+
+            start = time.monotonic()
+            ward.tick()
+            ward.tick()
+            elapsed = time.monotonic() - start
+            self.assertLess(elapsed, 5.0)
+            # The POST was dispatched (it may take a moment to
+            # reach the server under load); the server still takes
+            # 10 s to answer, so the delivery is in flight.
+            deadline = time.monotonic() + 5
+            while len(received) < 1 and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertEqual(len(received), 1)
+            self.assertFalse(hooks.wait(timeout=2))
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_scenario_news2_trend_hooks(self):
+        cfg = load_scenario(
+            os.path.join(
+                HERE, "..", "scenarios", "news2-trend-hooks.json"
+            )
+        )
+        self.assertTrue(cfg["trend_alert_hooks"].configured)
+        server, port, received = capture_server()
+        try:
+            # The scenario's URL is a placeholder; point it at
+            # the stub server for this run.
+            cfg["trend_alert_hooks"] = validate_trend_alert_hooks(
+                {"webhook_url": "http://127.0.0.1:%d/hooks" % port}
+            )
+            ward = build_ward(cfg, seed=42)
+            for _ in range(40):
+                snap = ward.tick()
+            self.assertTrue(ward.trend_alert_hooks.wait(timeout=5))
+            # Three trend alerts over the run, one POST each.
+            self.assertEqual(len(received), 3)
+            beds = sorted(json.loads(body)["bed"] for _, _, body in received)
+            self.assertEqual(beds, [1, 1, 2])
+            # Every alert records that its hook was invoked.
+            history = ward.news2_history_summary()
+            for bed in history["beds"]:
+                for alert in bed["trend_alerts"]:
+                    self.assertTrue(alert["hook_invoked"])
+            self.assertEqual(
+                snap["early_warning"]["trend_alert_hooks"],
+                {"configured": True, "invoked": 3, "failed": 0},
+            )
+            self.assertEqual(
+                snap["early_warning"]["trend_alerts_raised"], 3
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_recorder_summary_carries_hook_totals(self):
+        cfg = load_scenario(
+            os.path.join(
+                HERE, "..", "scenarios", "news2-trend-hooks.json"
+            )
+        )
+        seen = []
+        cfg["trend_alert_hooks"] = validate_trend_alert_hooks(
+            {"callback": seen.append}
+        )
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".jsonl", delete=False
+        ) as f:
+            path = f.name
+        try:
+            with Recorder(path, cfg["beds"], cfg["rate_hz"], seed=42) as rec:
+                ward = build_ward(cfg, seed=42, recorder=rec)
+                for _ in range(40):
+                    ward.tick()
+            self.assertEqual(len(seen), 3)
+            summary = summarize(path)
+            hooks = summary["early_warning"]["trend_alert_hooks"]
+            self.assertEqual(
+                hooks, {"configured": True, "invoked": 3, "failed": 0}
             )
         finally:
             os.unlink(path)

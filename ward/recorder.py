@@ -85,7 +85,9 @@ def summarize(path):
     and early-warning totals from the last tick: how many beds are
     at high, medium, and low NEWS2 risk, how many deterioration
     episodes are open, and how many have raised, and how many
-    NEWS2 trend alerts are open and have raised — and how the ward
+    NEWS2 trend alerts are open and have raised — and whether the
+    trend-alert hooks are configured and how many hook deliveries
+    were invoked and failed — and how the ward
     responded to its escalations: how many got a response, how many
     closed before anyone responded, how many are still waiting, and
     the mean and longest time from an escalation raising to the
@@ -296,6 +298,14 @@ def summarize(path):
                 ),
                 "trend_alerts_raised": last_early_warning.get(
                     "trend_alerts_raised", 0
+                ),
+                "trend_alert_hooks": last_early_warning.get(
+                    "trend_alert_hooks",
+                    {
+                        "configured": False,
+                        "invoked": 0,
+                        "failed": 0,
+                    },
                 ),
                 "not_alert": last_early_warning.get("not_alert", 0),
                 "consciousness_changes": last_early_warning.get(
