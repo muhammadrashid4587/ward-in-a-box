@@ -1,0 +1,1 @@
+{"beds":3,"cleaning_capacity":1,"cleaning_s":10,"discharge_planning":{"lead_time_s":5},"discharge_readiness":{"auto_order":true,"auto_order_lead_time_s":5,"stable_window_s":5},"patients":[{"bed":0,"consciousness":"voice","profile":"stable"},{"bed":1,"profile":"stable"},{"bed":2,"profile":"tachycardic"}],"rate_hz":1.0}

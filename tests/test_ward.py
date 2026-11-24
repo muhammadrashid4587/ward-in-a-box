@@ -4083,7 +4083,10 @@ class TestAutoDischargeOrders(unittest.TestCase):
         # discharging at 21 s. Bed 3 is quiet from admission and
         # auto-discharges at 10 s. Bed 1's dose lands at 30 s:
         # ready then, gone at 35 s. Bed 2's insulin missed, so it
-        # never flags ready and never gets an order.
+        # never flags ready and never gets an order. Beds 0 and 3
+        # both flag ready at 5 s, but bed 3's order is raised
+        # first: its NEWS2 at the flip is 0 against bed 0's 1,
+        # so the priority order puts bed 3 ahead of bed 0.
         self.assertEqual(
             [
                 (o["bed"], o["ordered_t"], o["expected_t"], o["status"],
@@ -4091,8 +4094,8 @@ class TestAutoDischargeOrders(unittest.TestCase):
                 for o in orders
             ],
             [
-                (0, 5.0, 10.0, "cancelled", "auto", 7.0, "not_ready"),
                 (3, 5.0, 10.0, "discharged", "auto", None, None),
+                (0, 5.0, 10.0, "cancelled", "auto", 7.0, "not_ready"),
                 (0, 16.0, 21.0, "discharged", "auto", None, None),
                 (1, 30.0, 35.0, "discharged", "auto", None, None),
             ],
@@ -4262,6 +4265,59 @@ class TestAutoOrderLeadTime(unittest.TestCase):
         )
         self.assertEqual(
             summary["timing"]["max_ready_to_discharge_s"], 2.0
+        )
+
+    def test_scenario_discharge_auto_order_priority(self):
+        cfg = load_scenario(
+            os.path.join(
+                HERE, "..", "scenarios",
+                "discharge-auto-order-priority.json",
+            )
+        )
+        self.assertTrue(cfg["discharge_readiness"].auto_order)
+        self.assertEqual(cfg["cleaning_capacity"], 1)
+        ward = build_ward(cfg, seed=42)
+        for _ in range(6):
+            ward.tick()
+        # All three beds flag ready on the same tick (5 s) but
+        # with different NEWS2 at the flip: bed 1 is the safest
+        # (stable, Alert — 0), bed 0 sits at 3 (stable vitals,
+        # responds only to voice), bed 2 at 4 (tachycardic).
+        priority = ward.discharge_priority_summary()["beds"]
+        self.assertEqual(
+            [(e["bed"], e["news2_at_flip"]) for e in priority],
+            [(1, 0), (0, 3), (2, 4)],
+        )
+        # The auto orders are raised in that priority order —
+        # safest first — not in bed order.
+        self.assertEqual(
+            [o["bed"] for o in ward.discharge_summary()["orders"]],
+            [1, 0, 2],
+        )
+        for _ in range(34):
+            ward.tick()
+        summary = ward.discharge_summary()
+        self.assertEqual(summary["planned"], 3)
+        self.assertEqual(summary["auto_planned"], 3)
+        self.assertEqual(summary["discharged"], 3)
+        self.assertEqual(summary["delayed"], 2)
+        self.assertEqual(summary["total_delay_s"], 30.0)
+        # One cleaning slot, all three due at 10 s: the safest
+        # patient (bed 1) goes on time, the others queue behind
+        # the slot — bed 0 at 20 s, bed 2 at 30 s. Before the
+        # priority ordering, bed 0 (NEWS2 3) went first and the
+        # safest patient waited.
+        self.assertEqual(
+            [
+                (o["bed"], o["ordered_t"], o["expected_t"],
+                 o["actual_t"], o["delay_s"], o["status"], o["source"])
+                for o in summary["orders"]
+            ],
+            [
+                (1, 5.0, 10.0, 10.0, 0.0, "discharged", "auto"),
+                (0, 5.0, 10.0, 20.0, 10.0, "discharged", "auto"),
+                (2, 5.0, 10.0, 30.0, 20.0, "discharged", "auto"),
+            ],
         )
 
     def test_recorder_summary_carries_override(self):

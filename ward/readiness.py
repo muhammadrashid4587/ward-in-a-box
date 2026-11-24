@@ -35,7 +35,11 @@ orders only: a ward that discharges a stable patient an hour after
 rounds can still send a ready patient home in minutes, without
 changing the default lead time for scheduled or manual orders.
 When it is not set, auto orders use the planner's default lead
-time, exactly as before.
+time, exactly as before. When several beds flag ready on the same
+tick, their auto orders are raised in discharge-priority order —
+safest first, by NEWS2 at the flip that made each bed ready — not
+bed order, so the safest patient is first in line when a cleaning
+slot is scarce.
 """
 
 # Default stability window: five minutes of quiet vitals.

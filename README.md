@@ -131,6 +131,12 @@ python3 -m ward.cli scenarios/discharge-auto-order.json --seed 42
 # beds discharge 2 s after flagging ready, not 5 s after
 python3 -m ward.cli scenarios/discharge-auto-order-lead-time.json --seed 42
 
+# Auto discharge orders in NEWS2 priority order: three beds flag
+# ready on the same tick, but the safest (NEWS2 0) is ordered
+# first and discharges on time while the others wait for the one
+# cleaning slot
+python3 -m ward.cli scenarios/discharge-auto-order-priority.json --seed 42
+
 # Early warning: a hypoxic patient sits at medium NEWS2 risk, a
 # febrile patient deteriorates on its own, and an alarm storm at
 # 10 s pushes the febrile patient to high risk
@@ -1032,6 +1038,35 @@ window, a 5-second planner default, and a 2-second override, beds
 1's dose lands at 30 s and it auto-discharges at 32 s, and bed 2
 (missed insulin) never flags ready and gets no order — 3 auto
 orders, 3 discharges, a mean ready-to-discharge time of 2.0 s.
+
+## Auto orders in NEWS2 priority order
+
+When several beds flag discharge-ready on the same tick, the ward
+raises their auto orders in the discharge-priority order — safest
+first, by NEWS2 at the flip that made each bed ready, lowest
+first, ties by earliest flip then bed — instead of bed order.
+The order the orders are raised in is the order they are listed
+in the discharge summary, and the order they come due in, so
+when cleaning is scarce the safest patient is first in line for
+a cleaning slot: with one slot and three beds due at the same
+time, the safest discharges on time and the others queue behind
+it. The ordering only applies within a tick — a bed that flags
+ready later still gets its order later, however safe it is — and
+it only applies to orders the ward raises itself: scheduled and
+manual orders keep the order they were placed in. A queued
+discharge that is waiting for a cleaning slot still starts
+cleaning in expected-time order (bed order on a tie), so among
+patients delayed by the same backlog the slot order is unchanged;
+the priority order decides who gets the first slot, not the
+queue behind it. See
+`scenarios/discharge-auto-order-priority.json` for a runnable
+example: over a seeded 40-tick run with a 5-second window, a
+5-second lead time, and one cleaning slot, beds 0, 1, and 2 all
+flag ready at 5 s — bed 1 at NEWS2 0, bed 0 at NEWS2 3 (stable
+vitals, responds only to voice), bed 2 at NEWS2 4 (tachycardic)
+— so the orders are raised 1, 0, 2, bed 1 discharges at 10 s
+with no delay, bed 0 at 20 s, and bed 2 at 30 s, 30 s of delay
+in total.
 
 ## Discharge-readiness hooks
 
@@ -2260,3 +2295,11 @@ run.
   than the ward clock hour, seeded so runs are reproducible, with
   the ramp config in the triage summary, the live arrivals view's
   current rate tracking it, and the run summary) — done in v0.42.0
+- Auto orders in NEWS2 priority order (when several beds flag
+  discharge-ready on the same tick, their auto orders are raised
+  in the discharge-priority order — safest first, by NEWS2 at the
+  flip — instead of bed order, so the safest patient is first in
+  line when a cleaning slot is scarce; the ordering applies
+  within a tick only, scheduled and manual orders are untouched,
+  and queued discharges still start cleaning in expected-time
+  order) — done in v0.43.0

@@ -383,10 +383,26 @@ class Ward:
         # scheduled orders are never cancelled here: they are a
         # doctor's order, not the ward's. A cancelled auto order
         # leaves the bed free to get a fresh one when it flags
-        # ready again. Placed after the monitor loop so this tick's
-        # readiness already reflects the latest vitals and doses,
-        # and before the snapshot so the order is in it.
+        # ready again. Beds that flag ready on the same tick raise
+        # their orders in discharge-priority order — safest first —
+        # not bed order, so the safest patient is first in line
+        # when a cleaning slot is scarce. Placed after the monitor
+        # loop so this tick's readiness already reflects the latest
+        # vitals and doses, and before the snapshot so the order is
+        # in it.
         if self.readiness.auto_order:
+            # The priority ranking for this tick's newly ready beds:
+            # the same NEWS2-at-flip order the discharge-priority
+            # view serves. A bed flagging ready this tick already
+            # has its flip in the history (the monitor loop above
+            # recorded it), so it is in the ranking; the fallback
+            # only guards against a bed the ranking missed, which
+            # goes last in bed order.
+            priority = {
+                e["bed"]: i
+                for i, e in enumerate(self._priority_entries())
+            }
+            newly_ready = []
             for m in self.monitors:
                 if not m.admitted:
                     continue
@@ -394,16 +410,19 @@ class Ward:
                     self.elapsed, self.readiness.stable_window_s
                 ):
                     if not self.discharge_planner.has_live_order(m.bed_id):
-                        self.discharge_planner.place_order(
-                            m.bed_id,
-                            self.elapsed,
-                            lead_time_s=self.readiness.auto_order_lead_time_s,
-                            source="auto",
-                        )
+                        newly_ready.append(m.bed_id)
                 else:
                     self.discharge_planner.cancel_auto_orders(
                         m.bed_id, self.elapsed
                     )
+            newly_ready.sort(key=lambda bed: (priority.get(bed, 1e9), bed))
+            for bed in newly_ready:
+                self.discharge_planner.place_order(
+                    bed,
+                    self.elapsed,
+                    lead_time_s=self.readiness.auto_order_lead_time_s,
+                    source="auto",
+                )
         # Discharge-priority order: a change since the last
         # emitted order — a bed becoming ready, a ready bed
         # leaving, or the ranking reordering — fires the
