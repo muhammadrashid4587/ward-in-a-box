@@ -1,5 +1,5 @@
-"""Trend-alert hooks: notify something outside the ward when a NEWS2
-trend alert fires.
+"""Alert hooks: notify something outside the ward when a NEWS2
+event fires.
 
 A hook is configured per ward, off by default, in one of two ways:
 
@@ -13,13 +13,21 @@ A hook is configured per ward, off by default, in one of two ways:
   raises is caught, logged, and counted as a failure — the tick
   still completes.
 
-A fired alert records whether the hook was invoked (``"hook_invoked"``
-on the alert, False when no hook is configured) and any synchronous
-error (``"hook_errors"``). The early-warning summary carries the
-ward totals — configured, invoked, failed — so a run summary can
-say how many alerts reached the outside world. Hooks never touch
-the vital-sign alarm list, and a ward with no hooks configured
-behaves exactly as before.
+Two events use hooks. A trend alert (a NEWS2 score rising fast
+enough to trip the jump or creep rule) fires the ward's
+``trend_alert_hooks``; a deterioration episode opening (a
+patient's NEWS2 risk leaving low) fires the ward's
+``escalation_hooks``. Both share the same ``AlertHooks``
+machinery — the same webhook and callback channels, the same
+best-effort delivery — just a different event payload.
+
+A fired event records whether the hook was invoked (``"hook_invoked"``
+on the alert or episode, False when no hook is configured) and any
+synchronous error (``"hook_errors"``). The early-warning summary
+carries the ward totals — configured, invoked, failed — so a run
+summary can say how many alerts reached the outside world. Hooks
+never touch the vital-sign alarm list, and a ward with no hooks
+configured behaves exactly as before.
 """
 
 import json
@@ -36,52 +44,69 @@ log = logging.getLogger("ward.alert_hooks")
 DEFAULT_WEBHOOK_TIMEOUT_S = 5.0
 
 
-def validate_trend_alert_hooks(value):
-    """Normalize a trend-alert hook config.
+def _validate_hooks(value, kind, label):
+    """Normalize a hook config for one event kind.
 
-    None means no hooks (off); a ``TrendAlertHooks`` passes through;
-    a dict may set ``webhook_url`` (an http(s) URL to POST the alert
-    payload to), ``callback`` (an in-process callable, Python API
-    only — a scenario file cannot hold one), and ``timeout_s`` (a
-    number above 0, how long a webhook POST may take). Returns a
-    ``TrendAlertHooks``.
+    None means no hooks (off); an ``AlertHooks`` passes through;
+    a dict may set ``webhook_url`` (an http(s) URL to POST the
+    alert payload to), ``callback`` (an in-process callable,
+    Python API only — a scenario file cannot hold one), and
+    ``timeout_s`` (a number above 0, how long a webhook POST may
+    take). Returns an ``AlertHooks``.
     """
     if value is None:
-        return TrendAlertHooks()
-    if isinstance(value, TrendAlertHooks):
+        return AlertHooks(kind=kind)
+    if isinstance(value, AlertHooks):
         return value
     if not isinstance(value, dict):
-        raise ValueError(
-            "trend_alert_hooks must be a dict, got %r" % (value,)
-        )
+        raise ValueError("%s must be a dict, got %r" % (label, value))
     unknown = sorted(set(value) - {"webhook_url", "callback", "timeout_s"})
     if unknown:
         raise ValueError(
-            "trend_alert_hooks has unknown keys: %s" % ", ".join(unknown)
+            "%s has unknown keys: %s" % (label, ", ".join(unknown))
         )
-    return TrendAlertHooks(
+    return AlertHooks(
         webhook_url=value.get("webhook_url"),
         callback=value.get("callback"),
         timeout_s=value.get("timeout_s", DEFAULT_WEBHOOK_TIMEOUT_S),
+        kind=kind,
     )
 
 
-class TrendAlertHooks:
-    """The configured hooks for one ward, shared by its monitors."""
+def validate_trend_alert_hooks(value):
+    """Normalize a trend-alert hook config (see :func:`_validate_hooks`)."""
+    return _validate_hooks(value, "trend-alert", "trend_alert_hooks")
+
+
+def validate_escalation_hooks(value):
+    """Normalize an escalation hook config (see :func:`_validate_hooks`).
+
+    Fires when a deterioration episode opens — a patient's NEWS2
+    risk leaving low — rather than when a trend alert fires.
+    """
+    return _validate_hooks(value, "escalation", "escalation_hooks")
+
+
+class AlertHooks:
+    """The configured hooks for one ward event, shared by its monitors.
+
+    ``kind`` labels the event in log messages (``"trend-alert"``
+    or ``"escalation"``); it changes nothing about delivery.
+    """
 
     def __init__(self, webhook_url=None, callback=None,
-                 timeout_s=DEFAULT_WEBHOOK_TIMEOUT_S):
+                 timeout_s=DEFAULT_WEBHOOK_TIMEOUT_S, kind="trend-alert"):
         if webhook_url is not None:
             if not isinstance(webhook_url, str) or not webhook_url.startswith(
                 ("http://", "https://")
             ):
                 raise ValueError(
-                    "trend_alert_hooks webhook_url must be an http(s) URL, "
+                    "alert hooks webhook_url must be an http(s) URL, "
                     "got %r" % (webhook_url,)
                 )
         if callback is not None and not callable(callback):
             raise ValueError(
-                "trend_alert_hooks callback must be callable, got %r"
+                "alert hooks callback must be callable, got %r"
                 % (callback,)
             )
         if (
@@ -90,12 +115,13 @@ class TrendAlertHooks:
             or timeout_s <= 0
         ):
             raise ValueError(
-                "trend_alert_hooks timeout_s must be a number > 0, got %r"
+                "alert hooks timeout_s must be a number > 0, got %r"
                 % (timeout_s,)
             )
         self.webhook_url = webhook_url
         self.callback = callback
         self.timeout_s = float(timeout_s)
+        self.kind = kind
         self._lock = threading.Lock()
         # Deliveries attempted and deliveries that failed, counted
         # per channel: one alert with both a webhook and a callback
@@ -110,7 +136,7 @@ class TrendAlertHooks:
         return self.webhook_url is not None or self.callback is not None
 
     def fire(self, payload):
-        """Invoke the configured hooks for one fired trend alert.
+        """Invoke the configured hooks for one fired alert.
 
         ``payload`` is the alert as a plain dict (bed, raised time,
         rule, scores). Returns ``{"invoked": bool, "errors": [...]}``:
@@ -135,7 +161,7 @@ class TrendAlertHooks:
                 errors.append(str(e))
                 with self._lock:
                     self.failed += 1
-                log.warning("trend-alert callback failed: %s", e)
+                log.warning("%s callback failed: %s", self.kind, e)
         if self.webhook_url is not None:
             invoked = True
             with self._lock:
@@ -164,7 +190,9 @@ class TrendAlertHooks:
         except Exception as e:  # noqa: BLE001 - best effort, never fatal
             with self._lock:
                 self.failed += 1
-            log.warning("trend-alert webhook to %s failed: %s", self.webhook_url, e)
+            log.warning(
+                "%s webhook to %s failed: %s", self.kind, self.webhook_url, e
+            )
         finally:
             with self._lock:
                 self._threads = [
@@ -201,3 +229,8 @@ class TrendAlertHooks:
                 "invoked": self.invoked,
                 "failed": self.failed,
             }
+
+
+# Backwards-compatible name: trend-alert hooks were the first
+# event to use this machinery.
+TrendAlertHooks = AlertHooks

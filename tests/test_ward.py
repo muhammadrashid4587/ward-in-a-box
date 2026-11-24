@@ -18,7 +18,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from ward.alert_hooks import TrendAlertHooks, validate_trend_alert_hooks
+from ward.alert_hooks import (
+    TrendAlertHooks,
+    validate_escalation_hooks,
+    validate_trend_alert_hooks,
+)
 from ward.chaos import ChaosEvent
 from ward.cli import build_ward, load_scenario, main
 from ward.discharge import DischargePlanner
@@ -5460,6 +5464,235 @@ class TestTrendAlertHooks(unittest.TestCase):
             hooks = summary["early_warning"]["trend_alert_hooks"]
             self.assertEqual(
                 hooks, {"configured": True, "invoked": 3, "failed": 0}
+            )
+        finally:
+            os.unlink(path)
+
+
+class TestEscalationHooks(unittest.TestCase):
+    def _storm_ward(self, hooks=None):
+        # Febrile bed under an alarm storm: the score is 7 at the
+        # first tick, so a deterioration episode opens at t=1.
+        return Ward(
+            beds=1,
+            profiles=["febrile"],
+            chaos=[ChaosEvent("alarm_storm", at=1, duration=10, bed=0)],
+            seed=3,
+            escalation_hooks=hooks,
+        )
+
+    def test_validate_escalation_hooks(self):
+        hooks = validate_escalation_hooks(None)
+        self.assertIsInstance(hooks, TrendAlertHooks)
+        self.assertFalse(hooks.configured)
+        self.assertEqual(hooks.kind, "escalation")
+        custom = validate_escalation_hooks(
+            {"webhook_url": "https://example.invalid/hooks", "timeout_s": 2}
+        )
+        self.assertTrue(custom.configured)
+        self.assertEqual(custom.kind, "escalation")
+        self.assertEqual(custom.timeout_s, 2.0)
+        seen = []
+        append = seen.append
+        cb = validate_escalation_hooks({"callback": append})
+        self.assertTrue(cb.configured)
+        self.assertIs(cb.callback, append)
+        with self.assertRaises(ValueError):
+            validate_escalation_hooks({"webhook_url": "ftp://x/hooks"})
+        with self.assertRaises(ValueError):
+            validate_escalation_hooks({"callback": "not callable"})
+        with self.assertRaises(ValueError):
+            validate_escalation_hooks({"timeout_s": 0})
+        with self.assertRaises(ValueError):
+            validate_escalation_hooks({"url": "http://x/hooks"})
+        with self.assertRaises(ValueError):
+            validate_escalation_hooks("http://x/hooks")
+
+    def test_hooks_off_by_default(self):
+        # No hooks configured: the episode still opens, and it
+        # records that no hook was invoked.
+        ward = self._storm_ward()
+        self.assertFalse(ward.escalation_hooks.configured)
+        ward.tick()
+        m = ward.monitors[0]
+        self.assertIsNotNone(m._escalation)
+        episode = m._escalation
+        self.assertFalse(episode["hook_invoked"])
+        self.assertEqual(episode["hook_errors"], [])
+        summary = ward.early_warning_summary()["escalation_hooks"]
+        self.assertEqual(
+            summary, {"configured": False, "invoked": 0, "failed": 0}
+        )
+        self.assertEqual(
+            ward.snapshot()["early_warning"]["escalation_hooks"],
+            summary,
+        )
+
+    def test_callback_hook_invoked_on_escalation(self):
+        seen = []
+        ward = self._storm_ward({"callback": seen.append})
+        self.assertTrue(ward.escalation_hooks.configured)
+        ward.tick()
+        self.assertEqual(len(seen), 1)
+        payload = seen[0]
+        self.assertEqual(payload["event"], "escalation")
+        self.assertEqual(payload["bed"], 0)
+        self.assertEqual(payload["raised_t"], 1.0)
+        self.assertEqual(payload["peak_score"], 7)
+        self.assertEqual(payload["peak_risk"], "high")
+        self.assertEqual(
+            payload["response"],
+            "urgent review by critical care team (continuous monitoring)",
+        )
+        # The episode itself records the invocation.
+        episode = ward.monitors[0]._escalation
+        self.assertTrue(episode["hook_invoked"])
+        self.assertEqual(episode["hook_errors"], [])
+        # One invocation, no failure, in the ward totals.
+        summary = ward.early_warning_summary()["escalation_hooks"]
+        self.assertEqual(
+            summary, {"configured": True, "invoked": 1, "failed": 0}
+        )
+        # The hook fires once, when the episode opens: later ticks
+        # while it stays open do not invoke it again.
+        for _ in range(5):
+            ward.tick()
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(
+            ward.escalation_hooks.summary()["invoked"], 1
+        )
+
+    def test_callback_failure_is_not_fatal(self):
+        def boom(payload):
+            raise ValueError("pager is down")
+
+        ward = self._storm_ward({"callback": boom})
+        snap = ward.tick()
+        # The tick still completes and the episode still opens.
+        self.assertIsNotNone(ward.monitors[0]._escalation)
+        self.assertTrue(snap["beds"][0]["online"])
+        episode = ward.monitors[0]._escalation
+        self.assertTrue(episode["hook_invoked"])
+        self.assertEqual(episode["hook_errors"], ["pager is down"])
+        summary = ward.early_warning_summary()["escalation_hooks"]
+        self.assertEqual(summary["invoked"], 1)
+        self.assertEqual(summary["failed"], 1)
+
+    def test_webhook_hook_posts_to_stub_server(self):
+        server, port, received = capture_server()
+        try:
+            ward = self._storm_ward(
+                {"webhook_url": "http://127.0.0.1:%d/hooks" % port}
+            )
+            ward.tick()
+            self.assertTrue(ward.escalation_hooks.wait(timeout=5))
+            self.assertEqual(len(received), 1)
+            path, content_type, body = received[0]
+            self.assertEqual(path, "/hooks")
+            self.assertEqual(content_type, "application/json")
+            payload = json.loads(body)
+            self.assertEqual(payload["event"], "escalation")
+            self.assertEqual(payload["bed"], 0)
+            self.assertEqual(payload["raised_t"], 1.0)
+            self.assertEqual(payload["peak_score"], 7)
+            self.assertEqual(payload["peak_risk"], "high")
+            episode = ward.monitors[0]._escalation
+            self.assertTrue(episode["hook_invoked"])
+            self.assertEqual(episode["hook_errors"], [])
+            summary = ward.early_warning_summary()["escalation_hooks"]
+            self.assertEqual(
+                summary, {"configured": True, "invoked": 1, "failed": 0}
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_webhook_failure_is_not_fatal(self):
+        # A port with nothing listening: the POST fails, the ward
+        # keeps ticking, and the failure is counted, not raised.
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        ward = self._storm_ward(
+            {
+                "webhook_url": "http://127.0.0.1:%d/hooks" % port,
+                "timeout_s": 2,
+            }
+        )
+        snap = ward.tick()
+        self.assertIsNotNone(ward.monitors[0]._escalation)
+        self.assertTrue(snap["beds"][0]["online"])
+        # The hook was invoked (dispatched), even though the
+        # delivery failed.
+        episode = ward.monitors[0]._escalation
+        self.assertTrue(episode["hook_invoked"])
+        self.assertTrue(ward.escalation_hooks.wait(timeout=5))
+        summary = ward.early_warning_summary()["escalation_hooks"]
+        self.assertEqual(summary["invoked"], 1)
+        self.assertEqual(summary["failed"], 1)
+
+    def test_scenario_news2_escalation_hooks(self):
+        cfg = load_scenario(
+            os.path.join(
+                HERE, "..", "scenarios", "news2-escalation-hooks.json"
+            )
+        )
+        self.assertTrue(cfg["escalation_hooks"].configured)
+        server, port, received = capture_server()
+        try:
+            # The scenario's URL is a placeholder; point it at
+            # the stub server for this run.
+            cfg["escalation_hooks"] = validate_escalation_hooks(
+                {"webhook_url": "http://127.0.0.1:%d/hooks" % port}
+            )
+            ward = build_ward(cfg, seed=42)
+            for _ in range(40):
+                snap = ward.tick()
+            self.assertTrue(ward.escalation_hooks.wait(timeout=5))
+            # Two escalations over the run, one POST each.
+            self.assertEqual(len(received), 2)
+            beds = sorted(json.loads(body)["bed"] for _, _, body in received)
+            self.assertEqual(beds, [1, 2])
+            # Every episode records that its hook was invoked.
+            for bed in snap["early_warning"]["beds"]:
+                for episode in bed["episodes"]:
+                    self.assertTrue(episode["hook_invoked"])
+            self.assertEqual(
+                snap["early_warning"]["escalation_hooks"],
+                {"configured": True, "invoked": 2, "failed": 0},
+            )
+            self.assertEqual(
+                snap["early_warning"]["escalations_raised"], 2
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_recorder_summary_carries_hook_totals(self):
+        cfg = load_scenario(
+            os.path.join(
+                HERE, "..", "scenarios", "news2-escalation-hooks.json"
+            )
+        )
+        seen = []
+        cfg["escalation_hooks"] = validate_escalation_hooks(
+            {"callback": seen.append}
+        )
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".jsonl", delete=False
+        ) as f:
+            path = f.name
+        try:
+            with Recorder(path, cfg["beds"], cfg["rate_hz"], seed=42) as rec:
+                ward = build_ward(cfg, seed=42, recorder=rec)
+                for _ in range(40):
+                    ward.tick()
+            self.assertEqual(len(seen), 2)
+            summary = summarize(path)
+            hooks = summary["early_warning"]["escalation_hooks"]
+            self.assertEqual(
+                hooks, {"configured": True, "invoked": 2, "failed": 0}
             )
         finally:
             os.unlink(path)

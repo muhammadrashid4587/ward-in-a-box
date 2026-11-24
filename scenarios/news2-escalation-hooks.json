@@ -1,0 +1,1 @@
+{"beds":3,"chaos":[{"at":5,"beds":[2],"duration":10,"type":"alarm_storm"}],"escalation_hooks":{"webhook_url":"http://127.0.0.1:18099/hooks"},"news2_trend":{"delta":2,"window_s":10},"patients":[{"bed":0,"profile":"stable"},{"bed":1,"profile":"hypoxic"},{"bed":2,"profile":"febrile"}],"rate_hz":1.0}

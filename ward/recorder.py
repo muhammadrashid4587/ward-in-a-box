@@ -307,6 +307,14 @@ def summarize(path):
                         "failed": 0,
                     },
                 ),
+                "escalation_hooks": last_early_warning.get(
+                    "escalation_hooks",
+                    {
+                        "configured": False,
+                        "invoked": 0,
+                        "failed": 0,
+                    },
+                ),
                 "not_alert": last_early_warning.get("not_alert", 0),
                 "consciousness_changes": last_early_warning.get(
                     "consciousness_changes", 0

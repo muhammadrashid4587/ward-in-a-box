@@ -3,7 +3,7 @@
 import random
 from collections import deque
 
-from .alert_hooks import validate_trend_alert_hooks
+from .alert_hooks import validate_escalation_hooks, validate_trend_alert_hooks
 from .meds import MedSchedule
 from .news2 import (
     ACVPU_LEVELS,
@@ -45,7 +45,7 @@ class Monitor:
     seconds); the monitor clears each one when its time passes.
     """
 
-    def __init__(self, bed_id, profile="stable", rng=None, acuity=3, meds=None, on_oxygen=False, consciousness="alert", consciousness_dynamics=None, news2_trend=None, trend_alert_hooks=None):
+    def __init__(self, bed_id, profile="stable", rng=None, acuity=3, meds=None, on_oxygen=False, consciousness="alert", consciousness_dynamics=None, news2_trend=None, trend_alert_hooks=None, escalation_hooks=None):
         self.bed_id = bed_id
         self.profile = profile
         self.acuity = validate_acuity(acuity)
@@ -61,6 +61,13 @@ class Monitor:
         # change. Shared across the ward's monitors, so the ward
         # totals count every delivery.
         self.trend_alert_hooks = validate_trend_alert_hooks(trend_alert_hooks)
+        # Escalation hooks: the ward's configured webhook and/or
+        # in-process callback, invoked when a deterioration
+        # episode opens — the patient's NEWS2 risk leaving low.
+        # Same machinery as the trend-alert hooks, off by default.
+        # Shared across the ward's monitors, so the ward totals
+        # count every delivery.
+        self.escalation_hooks = validate_escalation_hooks(escalation_hooks)
         # Every consciousness change this stay, as
         # {"from": level, "to": level, "t": seconds}; empty while
         # dynamics are off or the level has never moved.
@@ -500,6 +507,23 @@ class Monitor:
                 "time_to_respond_s": None,
             }
             self.escalations_raised += 1
+            # An opening escalation invokes the ward's hooks, if
+            # any are configured — a webhook POST (dispatched in a
+            # daemon thread, so it never blocks the tick) and/or an
+            # in-process callback — and the episode records whether
+            # the hook was invoked, so a snapshot, a recording, or
+            # the run summary can say whether the escalation
+            # reached the outside world. A hook failure is logged
+            # and counted, never fatal to the tick.
+            result = self.escalation_hooks.fire(
+                {
+                    "event": "escalation",
+                    "bed": self.bed_id,
+                    **self._escalation,
+                }
+            )
+            self._escalation["hook_invoked"] = result["invoked"]
+            self._escalation["hook_errors"] = result["errors"]
         else:
             if news2["score"] > self._escalation["peak_score"]:
                 self._escalation["peak_score"] = news2["score"]
@@ -610,7 +634,9 @@ class Monitor:
         score and risk, and each episode carries its response
         timing — which team NEWS2 calls for, when the response
         was due and when it landed, and how long it took, or nulls
-        when the episode closed before anyone responded. ``trend``
+        when the episode closed before anyone responded — and
+        whether the ward's escalation hooks were invoked for it
+        (``hook_invoked``). ``trend``
         is the current rate of change of the score (see
         :func:`ward.news2.trend_for`), and ``trend_alerts`` lists
         every trend alert this stay with raised/cleared times and

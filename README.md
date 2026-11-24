@@ -117,6 +117,10 @@ python3 -m ward.cli scenarios/news2-trend.json --seed 42
 # your own endpoint; a dead endpoint is logged, never fatal)
 python3 -m ward.cli scenarios/news2-trend-hooks.json --seed 42
 
+# NEWS2 escalation hooks: the same ward, with each deterioration
+# episode also POSTed to a webhook when it opens
+python3 -m ward.cli scenarios/news2-escalation-hooks.json --seed 42
+
 # NEWS2 response timing: the hypoxic bed's escalation gets its
 # response 30 s after it raises, the febrile bed's brief medium
 # episode clears before anyone responds, and its high episode
@@ -1133,6 +1137,40 @@ alerts raise as in `news2-trend.json`, each one POSTed to the
 configured webhook, with 3 hook deliveries invoked and 0 failed
 against a stub server.
 
+## NEWS2 escalation hooks
+
+A trend alert says a patient is getting worse fast; an escalation
+says they have already crossed into medium or high risk and need a
+response. A ward that wants the outside world to hear about that
+moment — a pager, a dashboard, a handover note — configures
+escalation hooks, the same channels as the trend-alert hooks
+(webhook and/or in-process callback), on the same
+best-effort, never-fatal terms:
+
+```json
+{"escalation_hooks": {"webhook_url": "http://127.0.0.1:18099/hooks"}}
+```
+
+The hook fires once, in the tick the deterioration episode opens,
+with an `escalation` event payload: the bed, when it raised, the
+score and risk it raised at, the response NEWS2 calls for, and
+when that response is due. The episode records whether the hook
+was invoked (`"hook_invoked"`, False with no hooks) and any
+synchronous error (`"hook_errors"`), and the early-warning
+summary carries the ward escalation-hook totals
+(`"escalation_hooks"`: whether any hook is configured, how many
+deliveries were invoked, how many failed) — in `GET /news2`,
+every snapshot and WebSocket frame, and the run summary
+(`--summary`). Later ticks while the episode stays open fire
+nothing: one escalation, one notification. Hooks are off by
+default, so a ward with none configured behaves exactly as
+before, and like every other NEWS2 feature they never touch the
+vital-sign alarm list. See `scenarios/news2-escalation-hooks.json`
+for a runnable example: over a seeded 40-tick run the hypoxic
+bed escalates at 1 s and the febrile bed escalates at 1 s too,
+before the alarm storm at 5 s pushes it to high — 2 escalations,
+2 hook deliveries invoked and 0 failed against a stub server.
+
 ## NEWS2 response timing
 
 An escalation says a patient needs a response; the response
@@ -1201,7 +1239,7 @@ endpoints returned 503 while it lasted, the ticks did not stop.
 make test
 ```
 
-271 tests: vitals stay inside plausible ranges, dropout actually stops a
+279 tests: vitals stay inside plausible ranges, dropout actually stops a
 monitor's stream, an alarm storm produces alarms, stale readings freeze,
 a partition blocks the snapshot endpoint, the HTTP endpoints serve valid
 JSON, the stream serves JSON lines, scenario files validate, alarm
@@ -1437,7 +1475,16 @@ local stub server with the alert payload as JSON, a webhook to a dead
 port failing without stopping the ward and being counted, a slow
 webhook never blocking the tick, and the `news2-trend-hooks.json`
 scenario POSTing all 3 alerts to a stub server with the run summary
-carrying the hook totals.
+carrying the hook totals. Escalation-hook tests cover validation
+of the hook config, hooks off by default with the episode
+recording no invocation, a callback receiving the escalation
+payload exactly once when the episode opens, a callback that
+raises being caught with the tick completing and the failure
+counted, a webhook POST reaching a local stub server with the
+escalation payload as JSON, a webhook to a dead port failing
+without stopping the ward and being counted, and the
+`news2-escalation-hooks.json` scenario POSTing both escalations
+to a stub server with the run summary carrying the hook totals.
 
 ## Roadmap
 
@@ -1585,3 +1632,13 @@ carrying the hook totals.
   `GET /news2` and `GET /news2/history`, and the run summary carry
   the hook totals; off by default, configured per ward with
   `trend_alert_hooks` in the scenario) — done in v0.30.0
+- NEWS2 escalation hooks (when a deterioration episode opens — a
+  patient's NEWS2 risk leaving low — the ward's configured
+  webhook URL gets an `escalation` event payload POSTed to it in a
+  daemon thread and/or an in-process Python callback is called in
+  the opening tick, reusing the trend-alert hook machinery, best
+  effort and never fatal; each episode records whether the hook
+  was invoked, and the early-warning summary, every snapshot,
+  WebSocket frame, `GET /news2`, and the run summary carry the
+  escalation-hook totals; off by default, configured per ward
+  with `escalation_hooks` in the scenario) — done in v0.31.0

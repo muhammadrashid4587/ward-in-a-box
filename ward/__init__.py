@@ -1,8 +1,13 @@
 """ward-in-a-box: a simulated hospital ward as a load/chaos generator."""
 
-__version__ = "0.30.0"
+__version__ = "0.31.0"
 
-from .alert_hooks import TrendAlertHooks, validate_trend_alert_hooks
+from .alert_hooks import (
+    AlertHooks,
+    TrendAlertHooks,
+    validate_escalation_hooks,
+    validate_trend_alert_hooks,
+)
 from .arrivals import ArrivalModel
 from .chaos import ChaosEngine, ChaosEvent
 from .discharge import DischargePlanner
@@ -17,6 +22,7 @@ from .vitals import PROFILES, alarms_for
 from .ward import Ward
 
 __all__ = [
+    "AlertHooks",
     "ArrivalModel",
     "ChaosEngine",
     "ChaosEvent",
@@ -36,6 +42,7 @@ __all__ = [
     "interaction_warnings",
     "iter_ticks",
     "summarize",
+    "validate_escalation_hooks",
     "validate_med",
     "validate_trend_alert_hooks",
     "__version__",
