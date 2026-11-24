@@ -143,6 +143,15 @@ class Monitor:
         self.oxygen_deficit = 0.0
         self.oxygen_outage_until = None
         self.oxygen_outage_cfg = None
+        # Whether the deficit has reached the outage's floor this
+        # stay: set the tick the deficit first hits the cap (the
+        # walked SpO2 minus the floor), so the ward can fire one
+        # floor-hit hook per patient per outage, and cleared when
+        # the deficit recovers to zero, so a later outage can fire
+        # again. The ward consumes the flag and remembers which
+        # beds it already fired for; the monitor only reports
+        # that the floor was reached.
+        self.oxygen_floor_hit = False
         # Power outage: the mains failed at ``power_outage_since``
         # (elapsed seconds) and returns at
         # ``power_outage_until``, with ``power_outage_cfg``
@@ -593,6 +602,7 @@ class Monitor:
         # is unchanged, only the dark count restarts.
         self.sensor_drift = {}
         self.oxygen_deficit = 0.0
+        self.oxygen_floor_hit = False
         self.power_went_dark = False
         self.power_dark_ticks = 0
         self.signs = initial_signs(self.profile, self.rng, self.acuity)
@@ -656,10 +666,19 @@ class Monitor:
         ):
             cfg = self.oxygen_outage_cfg
             room = max(0.0, self.signs["spo2"] - cfg["floor"])
-            self.oxygen_deficit = round(
-                min(self.oxygen_deficit + cfg["rate"] * dt, room),
-                3,
-            )
+            grown = self.oxygen_deficit + cfg["rate"] * dt
+            self.oxygen_deficit = round(min(grown, room), 3)
+            # The floor is reached when the fall would have grown
+            # past the whole room above it: the patient's reported
+            # SpO2 is now sitting on the floor, and it stays there
+            # while the supply is down. The check uses the
+            # pre-round growth, so rounding the deficit to three
+            # decimals can never hide the hit. A patient whose
+            # walked SpO2 is already at or below the floor has no
+            # room to fall, so there is no outage-driven hit to
+            # report for them.
+            if room > 0 and grown >= room:
+                self.oxygen_floor_hit = True
         elif self.oxygen_deficit > 0:
             rate = (
                 self.oxygen_outage_cfg["recovery_rate"]
@@ -669,6 +688,8 @@ class Monitor:
             self.oxygen_deficit = round(
                 max(0.0, self.oxygen_deficit - rate * dt), 3
             )
+            if self.oxygen_deficit == 0:
+                self.oxygen_floor_hit = False
 
     def reported_signs(self):
         """The vitals as the sensor reports them: true vitals

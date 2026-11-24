@@ -323,6 +323,11 @@ class ChaosEngine:
         self.events = list(events)
         # Discharge events fire once, when their time is reached.
         self._discharged = set()
+        # Oxygen-outage events fire their start hook once, on the
+        # first tick inside the window, and their end hook once,
+        # on the first tick after it.
+        self._oxygen_started = set()
+        self._oxygen_ended = set()
 
     def stockouts(self, ward, now):
         """Active pharmacy stockouts: ``{bed_id: {med, ...}}``.
@@ -372,6 +377,24 @@ class ChaosEngine:
                         if ward.monitors[b].admitted:
                             ward.discharge(b)
                 continue
+            # Oxygen outage: the start hook fires once, on the
+            # first tick inside the window, and the end hook
+            # once, on the first tick after it — so scenario code
+            # hears the supply fail and return exactly once per
+            # event, even across a run that ticks past the end.
+            # The check runs before the active gate below, so an
+            # end is caught on the tick the window closes.
+            if ev.type == "oxygen_outage":
+                if ev.active(now):
+                    if id(ev) not in self._oxygen_started:
+                        self._oxygen_started.add(id(ev))
+                        ward._oxygen_outage_started(ev, now)
+                elif (
+                    id(ev) in self._oxygen_started
+                    and id(ev) not in self._oxygen_ended
+                ):
+                    self._oxygen_ended.add(id(ev))
+                    ward._oxygen_outage_ended(ev, now)
             if not ev.active(now):
                 continue
             if ev.type == "sensor_drift":

@@ -190,6 +190,12 @@ python3 -m ward.cli scenarios/bed-blocker.json --seed 42
 # 82.0 floor with NEWS2 6, and bed 1 (not on oxygen) is untouched
 python3 -m ward.cli scenarios/oxygen-outage.json --seed 42
 
+# Oxygen-outage hooks: the same ward, with the outage start, the
+# SpO2 floor hits, and the outage end also POSTed to a webhook
+# (here a placeholder URL — point it at your own endpoint; a dead
+# endpoint is logged, never fatal)
+python3 -m ward.cli scenarios/oxygen-outage-hooks.json --seed 42
+
 # Power outage: the mains fails from 5 s to 35 s — every monitor
 # runs on battery for 10 s, then goes dark until power returns
 # and it has rebooted for 5 s, so no bed emits a reading from
@@ -788,6 +794,60 @@ alarm at 19 s, peaks at NEWS2 4 (medium), and is fully recovered
 by 50 s; bed 2 (hypoxic, on oxygen) sits on the 82.0 floor from
 21 s with NEWS2 6 (medium); bed 1 (stable, not on oxygen) is
 untouched by the outage — its deficit stays 0.0 throughout.
+
+## Oxygen-outage hooks
+
+An oxygen outage is the moment a ward most needs the outside
+world to hear about it — the supply has failed, and a patient is
+falling towards the lowest saturation the outage can push them
+to — so the hook makes sure something outside the ward hears
+about it. A ward that wants the outside world to hear about that
+moment — a dashboard, a pager, an escalation policy — configures
+oxygen-outage hooks, the same channels as the NEWS2 hooks
+(webhook and/or in-process callback), on the same best-effort,
+never-fatal terms:
+
+```json
+{"oxygen_outage_hooks": {"webhook_url": "http://127.0.0.1:18099/hooks"}}
+```
+
+Three events fire. `oxygen_outage_started` fires once, in the
+tick the supply fails, with the outage window (`"at"`,
+`"ends"`, `"duration"`), the beds it targets, and the outage's
+rate, floor, and recovery rate. `oxygen_outage_ended` fires
+once, in the tick the supply returns, with the same window.
+`oxygen_spo2_floor_hit` fires once per patient per outage, in
+the tick their deficit first reaches the floor — with the bed,
+the SpO2 they are sitting on, the floor, and the deficit that
+got them there — so a hook can escalate on the floor hit: the
+patient has hit the lowest saturation the outage can push them
+to, and the low_spo2 alarm and NEWS2 climb from here are the
+outage doing its worst. A patient who sits on the floor for
+twenty ticks fires once, not twenty times, and a second outage
+fires again once the deficit has recovered to zero. An
+in-process callback gets the same payloads in the tick the event
+fires (Python API only — a scenario file cannot hold a
+callable), so scenario code can log or escalate on the floor hit
+directly. Each event records whether the hook was invoked
+(`"hook_invoked"`, False with no hooks) and any synchronous
+error (`"hook_errors"`), and the oxygen-outage summary carries
+the event totals (`"event_count"`, the full `"events"` history)
+and the ward oxygen-outage-hook totals
+(`"oxygen_outage_hooks"`: whether any hook is configured, how
+many deliveries were invoked, how many failed, how many retries
+were spent, and how many deliveries eventually landed) — in
+`GET /oxygen-outage`, every snapshot and WebSocket frame, and the
+run summary (`--summary`). The same retry rules as the NEWS2
+hooks apply — a failed webhook POST is retried with backoff up
+to `"max_retries"` times, and the event records `"hook_retries"`
+and `"hook_final_status"` alongside `"hook_invoked"`. Hooks are
+off by default, so a ward with none configured behaves exactly
+as before. See `scenarios/oxygen-outage-hooks.json` for a
+runnable example: over a seeded 70-tick run the same ward as
+`oxygen-outage.json` starts its outage at 5 s, bed 2 hits the
+floor at 21 s, bed 0 hits it at 34 s, and the supply returns at
+35 s — POSTed to the configured webhook, with 4 hook deliveries
+invoked and 0 failed against a stub server.
 
 ## Power outage
 
@@ -2345,7 +2405,18 @@ in snapshots, the `GET /staffing` endpoint (503 while
 partitioned), and the run summary, and the
 `news2-staffing-escalation.json` scenario raising 1 escalation
 at 5 s with the load factor falling from 2.0 to 1.0 over a seeded
-run.
+run. Oxygen-outage-hook tests cover validation of the hook
+config, hooks off by default with the outage still starting,
+hitting the floor, and ending and each event recording no
+invocation, a callback receiving the start, floor-hit, and end
+payloads exactly once each (the floor hit firing once while the
+patient sits on the floor, and again for a second outage once
+the deficit has recovered), a callback that raises being caught
+with the tick completing and the failure counted, a webhook POST
+reaching a local stub server with the event payloads as JSON, and
+the `oxygen-outage-hooks.json` scenario POSTing all 4 events to
+a stub server with the run summary carrying the event count and
+the hook totals.
 
 ## Roadmap
 
@@ -2691,3 +2762,18 @@ run.
   with `"power_dark": true`, and the outage state rides in every
   snapshot, WebSocket frame, a `GET /power-outage` endpoint, and
   the run summary) — done in v0.49.0
+- Oxygen-outage hooks (when an oxygen outage starts or ends — a
+  configured webhook URL gets an `oxygen_outage_started` /
+  `oxygen_outage_ended` event payload POSTed to it, and when a
+  patient on oxygen first hits the outage's SpO2 floor a
+  configured webhook URL gets an `oxygen_spo2_floor_hit` payload
+  POSTed to it, or an in-process callback is called with the same
+  payload in the firing tick, so a hook can escalate on the floor
+  hit; one floor hit per patient per outage, re-armed when the
+  deficit recovers to zero; reusing the NEWS2 hook machinery,
+  best effort and never fatal; each event records whether the hook
+  was invoked, and the oxygen-outage summary carries the event
+  history and the oxygen-outage-hook totals, in every snapshot,
+  WebSocket frame, a `GET /oxygen-outage` endpoint, and the run
+  summary; off by default, configured per ward with
+  `oxygen_outage_hooks` in the scenario) — done in v0.50.0

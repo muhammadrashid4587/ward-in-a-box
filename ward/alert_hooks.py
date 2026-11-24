@@ -29,7 +29,9 @@ patient becoming discharge-ready, or stopping being ready)
 fires the ward's ``discharge_readiness_hooks``; a change in the
 discharge-priority order (a bed becoming ready, a ready bed
 leaving, or the ranking reordering) fires the ward's
-``discharge_priority_hooks``. All seven share
+``discharge_priority_hooks``; an oxygen outage starting, ending,
+or pushing a patient onto the SpO2 floor fires the ward's
+``oxygen_outage_hooks``. All eight share
 the same ``AlertHooks`` machinery — the same webhook and
 callback channels, the same best-effort delivery — just a
 different event payload.
@@ -196,13 +198,26 @@ def validate_discharge_priority_hooks(value):
     )
 
 
+def validate_oxygen_outage_hooks(value):
+    """Normalize an oxygen-outage hook config (see
+    :func:`_validate_hooks`).
+
+    Fires when an oxygen outage starts or ends, and when a
+    patient on oxygen first hits the outage's SpO2 floor —
+    rather than when a NEWS2 event fires.
+    """
+    return _validate_hooks(
+        value, "oxygen-outage", "oxygen_outage_hooks"
+    )
+
+
 class AlertHooks:
     """The configured hooks for one ward event, shared by its monitors.
 
     ``kind`` labels the event in log messages (``"trend-alert"``,
     ``"escalation"``, ``"boarding-full"``, ``"wait-time"``,
-    ``"missed-dose"``, ``"discharge-readiness"``, or
-    ``"discharge-priority"``); it changes
+    ``"missed-dose"``, ``"discharge-readiness"``,
+    ``"discharge-priority"``, or ``"oxygen-outage"``); it changes
     nothing about delivery.
     """
 

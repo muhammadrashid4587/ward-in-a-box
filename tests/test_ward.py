@@ -25,6 +25,7 @@ from ward.alert_hooks import (
     validate_discharge_readiness_hooks,
     validate_escalation_hooks,
     validate_missed_dose_hooks,
+    validate_oxygen_outage_hooks,
     validate_trend_alert_hooks,
     validate_wait_time_hooks,
 )
@@ -9985,6 +9986,334 @@ class TestOxygenOutage(unittest.TestCase):
         ward2 = build_ward(cfg, seed=42)
         snaps2 = [ward2.tick() for _ in range(70)]
         self.assertEqual(snaps, snaps2)
+
+
+class TestOxygenOutageHooks(unittest.TestCase):
+    # Oxygen-outage hooks: an outage starting, ending, or pushing
+    # a patient onto the SpO2 floor fires the ward's
+    # oxygen_outage_hooks — the same webhook/callback machinery
+    # as the NEWS2 hooks — so something outside the ward hears
+    # the supply fail and the patient hit the floor. A callback
+    # can use the floor hit to escalate: the patient has hit the
+    # lowest saturation the outage can push them to.
+    OXYGEN = {"rate": 2.0, "floor": 82.0, "recovery_rate": 1.0}
+
+    def _outage_ward(self, hooks=None):
+        return Ward(
+            beds=2,
+            profiles=["stable", "stable"],
+            oxygen=[True, False],
+            chaos=[
+                ChaosEvent(
+                    "oxygen_outage",
+                    at=5,
+                    duration=30,
+                    bed=0,
+                    oxygen=self.OXYGEN,
+                )
+            ],
+            seed=42,
+            discharge_readiness={"stable_window_s": 5},
+            oxygen_outage_hooks=hooks,
+        )
+
+    def test_validate_oxygen_outage_hooks(self):
+        hooks = validate_oxygen_outage_hooks(None)
+        self.assertIsInstance(hooks, TrendAlertHooks)
+        self.assertFalse(hooks.configured)
+        self.assertEqual(hooks.kind, "oxygen-outage")
+        custom = validate_oxygen_outage_hooks(
+            {"webhook_url": "https://example.invalid/hooks", "timeout_s": 2}
+        )
+        self.assertTrue(custom.configured)
+        self.assertEqual(custom.kind, "oxygen-outage")
+        self.assertEqual(custom.timeout_s, 2.0)
+        seen = []
+        append = seen.append
+        cb = validate_oxygen_outage_hooks({"callback": append})
+        self.assertTrue(cb.configured)
+        self.assertIs(cb.callback, append)
+        with self.assertRaises(ValueError):
+            validate_oxygen_outage_hooks(
+                {"webhook_url": "ftp://x/hooks"}
+            )
+        with self.assertRaises(ValueError):
+            validate_oxygen_outage_hooks({"callback": "not callable"})
+        with self.assertRaises(ValueError):
+            validate_oxygen_outage_hooks({"timeout_s": 0})
+        with self.assertRaises(ValueError):
+            validate_oxygen_outage_hooks({"url": "http://x/hooks"})
+        with self.assertRaises(ValueError):
+            validate_oxygen_outage_hooks("http://x/hooks")
+
+    def test_hooks_off_by_default(self):
+        # No hooks configured: the outage still starts, hits the
+        # floor, and ends, and each event is recorded with no
+        # hook invoked.
+        ward = self._outage_ward()
+        self.assertFalse(ward.oxygen_outage_hooks.configured)
+        for _ in range(40):
+            ward.tick()
+        summary = ward.oxygen_outage_summary()
+        self.assertEqual(summary["event_count"], 3)
+        self.assertEqual(
+            [
+                (e["event"], e["t"])
+                for e in summary["events"]
+            ],
+            [
+                ("oxygen_outage_started", 5.0),
+                ("oxygen_spo2_floor_hit", 11.0),
+                ("oxygen_outage_ended", 35.0),
+            ],
+        )
+        for event in summary["events"]:
+            self.assertFalse(event["hook_invoked"])
+            self.assertEqual(event["hook_errors"], [])
+            self.assertEqual(event["hook_retries"], 0)
+            self.assertEqual(
+                event["hook_final_status"], "not_invoked"
+            )
+        self.assertEqual(
+            summary["oxygen_outage_hooks"],
+            {"configured": False, "invoked": 0, "failed": 0, "retries": 0, "delivered": 0},
+        )
+        self.assertEqual(
+            ward.snapshot()["oxygen_outage"]["event_count"], 3
+        )
+
+    def test_callback_hook_fires_for_start_floor_and_end(self):
+        seen = []
+        ward = self._outage_ward({"callback": seen.append})
+        self.assertTrue(ward.oxygen_outage_hooks.configured)
+        for _ in range(40):
+            ward.tick()
+        # Three events over the run: the outage starts at 5 s,
+        # the patient hits the 82.0 floor at 11 s, and the supply
+        # returns at 35 s. The patient sits on the floor from
+        # 11 s until the outage ends, but the floor hit fires
+        # once, not once a tick.
+        self.assertEqual(
+            [(p["event"], p["t"]) for p in seen],
+            [
+                ("oxygen_outage_started", 5.0),
+                ("oxygen_spo2_floor_hit", 11.0),
+                ("oxygen_outage_ended", 35.0),
+            ],
+        )
+        start, floor, end = seen
+        self.assertEqual(
+            {k: v for k, v in start.items() if k != "hook_retries"
+             and k != "hook_final_status"},
+            {
+                "event": "oxygen_outage_started",
+                "t": 5.0,
+                "at": 5.0,
+                "ends": 35.0,
+                "duration": 30,
+                "beds": [0],
+                "oxygen": self.OXYGEN,
+            },
+        )
+        self.assertEqual(
+            {k: v for k, v in floor.items() if k != "hook_retries"
+             and k != "hook_final_status"},
+            {
+                "event": "oxygen_spo2_floor_hit",
+                "t": 11.0,
+                "bed": 0,
+                "spo2": 82.0,
+                "floor": 82.0,
+                "deficit": 13.0,
+            },
+        )
+        self.assertEqual(end["event"], "oxygen_outage_ended")
+        self.assertEqual(end["t"], 35.0)
+        self.assertEqual(end["beds"], [0])
+        # Every event records the invocation.
+        summary = ward.oxygen_outage_summary()
+        self.assertEqual(summary["event_count"], 3)
+        for event in summary["events"]:
+            self.assertTrue(event["hook_invoked"])
+            self.assertEqual(event["hook_errors"], [])
+            self.assertEqual(event["hook_final_status"], "delivered")
+        self.assertEqual(
+            summary["oxygen_outage_hooks"],
+            {"configured": True, "invoked": 3, "failed": 0, "retries": 0, "delivered": 3},
+        )
+
+    def test_floor_hit_fires_again_for_a_second_outage(self):
+        # Two outages on the same bed: the floor hit fires once
+        # per outage — the flag clears when the deficit recovers
+        # to zero, so the second outage can fire again.
+        seen = []
+        ward = Ward(
+            beds=1,
+            profiles=["stable"],
+            oxygen=[True],
+            chaos=[
+                ChaosEvent(
+                    "oxygen_outage",
+                    at=5,
+                    duration=10,
+                    bed=0,
+                    oxygen=self.OXYGEN,
+                ),
+                ChaosEvent(
+                    "oxygen_outage",
+                    at=30,
+                    duration=10,
+                    bed=0,
+                    oxygen=self.OXYGEN,
+                ),
+            ],
+            seed=42,
+            oxygen_outage_hooks={"callback": seen.append},
+        )
+        for _ in range(45):
+            ward.tick()
+        self.assertEqual(
+            [(p["event"], p["t"]) for p in seen],
+            [
+                ("oxygen_outage_started", 5.0),
+                ("oxygen_spo2_floor_hit", 11.0),
+                ("oxygen_outage_ended", 15.0),
+                ("oxygen_outage_started", 30.0),
+                ("oxygen_spo2_floor_hit", 37.0),
+                ("oxygen_outage_ended", 40.0),
+            ],
+        )
+        self.assertEqual(
+            ward.oxygen_outage_summary()["oxygen_outage_hooks"],
+            {"configured": True, "invoked": 6, "failed": 0, "retries": 0, "delivered": 6},
+        )
+
+    def test_callback_failure_is_not_fatal(self):
+        def boom(payload):
+            raise ValueError("pager is down")
+
+        ward = self._outage_ward({"callback": boom})
+        for _ in range(5):
+            ward.tick()  # t=5: outage starts, hook raises
+        snap = ward.tick()  # t=6: the tick still completes
+        self.assertTrue(snap["beds"][0]["online"])
+        event = ward.oxygen_outage_summary()["events"][0]
+        self.assertEqual(event["event"], "oxygen_outage_started")
+        self.assertTrue(event["hook_invoked"])
+        self.assertEqual(event["hook_errors"], ["pager is down"])
+        self.assertEqual(event["hook_final_status"], "failed")
+        summary = ward.oxygen_outage_summary()["oxygen_outage_hooks"]
+        self.assertEqual(summary["invoked"], 1)
+        self.assertEqual(summary["failed"], 1)
+
+    def test_webhook_posts_to_stub_server(self):
+        server, port, received = capture_server()
+        try:
+            ward = self._outage_ward(
+                {"webhook_url": "http://127.0.0.1:%d/hooks" % port}
+            )
+            for _ in range(40):
+                ward.tick()
+            self.assertTrue(ward.oxygen_outage_hooks.wait(timeout=5))
+            self.assertEqual(len(received), 3)
+            payloads = sorted(
+                (json.loads(r[2]) for r in received),
+                key=lambda p: p["t"],
+            )
+            self.assertEqual(
+                [(p["event"], p["t"]) for p in payloads],
+                [
+                    ("oxygen_outage_started", 5.0),
+                    ("oxygen_spo2_floor_hit", 11.0),
+                    ("oxygen_outage_ended", 35.0),
+                ],
+            )
+            path, content_type, body = received[0]
+            self.assertEqual(path, "/hooks")
+            self.assertEqual(content_type, "application/json")
+            floor = [p for p in payloads if p.get("bed") == 0][0]
+            self.assertEqual(floor["spo2"], 82.0)
+            self.assertEqual(floor["floor"], 82.0)
+            summary = ward.oxygen_outage_summary()
+            self.assertEqual(
+                summary["oxygen_outage_hooks"],
+                {"configured": True, "invoked": 3, "failed": 0, "retries": 0, "delivered": 3},
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_scenario_oxygen_outage_hooks(self):
+        cfg = load_scenario(
+            os.path.join(
+                HERE, "..", "scenarios", "oxygen-outage-hooks.json"
+            )
+        )
+        self.assertTrue(cfg["oxygen_outage_hooks"].configured)
+        server, port, received = capture_server()
+        path = os.path.join(tempfile.mkdtemp(), "run.jsonl")
+        try:
+            # The scenario's URL is a placeholder; point it at
+            # the stub server for this run.
+            cfg["oxygen_outage_hooks"] = (
+                validate_oxygen_outage_hooks(
+                    {"webhook_url": "http://127.0.0.1:%d/hooks" % port}
+                )
+            )
+            ward = build_ward(cfg, seed=42)
+            with Recorder(path, ward.beds, ward.rate_hz, seed=42) as rec:
+                ward.recorder = rec
+                for _ in range(70):
+                    snap = ward.tick()
+            self.assertTrue(ward.oxygen_outage_hooks.wait(timeout=5))
+            # Four events over the run: the supply fails at 5 s,
+            # the hypoxic bed hits the floor at 21 s, the stable
+            # bed hits it at 34 s, and the supply returns at 35 s.
+            # The deliveries run in separate daemon threads, so
+            # their arrival order at the stub is not guaranteed
+            # — sort by event time before asserting.
+            self.assertEqual(len(received), 4)
+            payloads = sorted(
+                (json.loads(r[2]) for r in received),
+                key=lambda p: p["t"],
+            )
+            self.assertEqual(
+                [
+                    (p["event"], p["t"], p.get("bed"))
+                    for p in payloads
+                ],
+                [
+                    ("oxygen_outage_started", 5.0, None),
+                    ("oxygen_spo2_floor_hit", 21.0, 2),
+                    ("oxygen_spo2_floor_hit", 34.0, 0),
+                    ("oxygen_outage_ended", 35.0, None),
+                ],
+            )
+            # Every event records that its hook was invoked.
+            for event in snap["oxygen_outage"]["events"]:
+                self.assertTrue(event["hook_invoked"])
+            summary = ward.oxygen_outage_summary()
+            self.assertEqual(summary["event_count"], 4)
+            self.assertEqual(
+                summary["oxygen_outage_hooks"],
+                {"configured": True, "invoked": 4, "failed": 0, "retries": 0, "delivered": 4},
+            )
+            # The run summary carries the event count and the
+            # hook totals from the last tick — but only as of
+            # that tick: the snapshot in the file was recorded
+            # before the last delivery settled, so delivered is
+            # read from the live summary above, not from here.
+            run = summarize(path)
+            self.assertEqual(run["oxygen_outage"]["event_count"], 4)
+            self.assertTrue(
+                run["oxygen_outage"]["oxygen_outage_hooks"]["configured"]
+            )
+            self.assertEqual(
+                run["oxygen_outage"]["oxygen_outage_hooks"]["invoked"], 4
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 class TestPowerOutage(unittest.TestCase):

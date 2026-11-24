@@ -10,6 +10,7 @@ from .alert_hooks import (
     validate_discharge_readiness_hooks,
     validate_escalation_hooks,
     validate_missed_dose_hooks,
+    validate_oxygen_outage_hooks,
     validate_trend_alert_hooks,
     validate_wait_time_hooks,
 )
@@ -46,7 +47,7 @@ class Ward:
     snapshot to a JSONL file.
     """
 
-    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None, cleaning_s=30.0, meds=None, triage=None, discharge_planning=None, cleaning_capacity=None, discharge_readiness=None, oxygen=None, consciousness=None, consciousness_dynamics=None, news2_trend=None, trend_alert_hooks=None, escalation_hooks=None, boarding_full_hooks=None, wait_time_hooks=None, missed_dose_hooks=None, discharge_readiness_hooks=None, discharge_priority_hooks=None, news2_staffing_escalation=None):
+    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None, cleaning_s=30.0, meds=None, triage=None, discharge_planning=None, cleaning_capacity=None, discharge_readiness=None, oxygen=None, consciousness=None, consciousness_dynamics=None, news2_trend=None, trend_alert_hooks=None, escalation_hooks=None, boarding_full_hooks=None, wait_time_hooks=None, missed_dose_hooks=None, discharge_readiness_hooks=None, discharge_priority_hooks=None, oxygen_outage_hooks=None, news2_staffing_escalation=None):
         if not 1 <= beds <= 64:
             raise ValueError("beds must be 1..64")
         if rate_hz <= 0:
@@ -137,6 +138,24 @@ class Ward:
         self.discharge_priority_hooks = (
             validate_discharge_priority_hooks(discharge_priority_hooks)
         )
+        # Oxygen-outage hooks: one shared object for the whole
+        # ward (a webhook URL and/or an in-process callback),
+        # invoked when an oxygen outage starts or ends, and when
+        # a patient on oxygen first hits the outage's SpO2 floor.
+        # Off by default. The ward owns the object: an outage is
+        # a ward-level event, not a per-bed one.
+        self.oxygen_outage_hooks = validate_oxygen_outage_hooks(
+            oxygen_outage_hooks
+        )
+        # Every oxygen-outage hook event this run — the audit
+        # trail for the oxygen-outage hooks — and the beds whose
+        # floor hit has already been fired for the current
+        # deficit episode, so a patient sitting on the floor
+        # fires once, not once a tick. A bed leaves the set when
+        # its deficit recovers to zero, so a later outage can
+        # fire for it again.
+        self.oxygen_outage_events = []
+        self._oxygen_floor_fired = set()
         # The priority order last sent to the hooks (empty
         # before the first ready bed), and every order change
         # this run — the audit trail for the priority hooks.
@@ -358,6 +377,11 @@ class Ward:
                         self.elapsed, self.readiness.stable_window_s
                     ),
                 )
+        # Oxygen-outage floor hits: a patient on oxygen whose
+        # deficit reached the floor fires one hook event, in the
+        # tick the floor is reached — after the monitor loop, so
+        # this tick's deficit is already in.
+        self._check_oxygen_floor_hits()
         # NEWS2-driven staffing escalation: with this tick's
         # scores in, count the deterioration episodes open at
         # high risk — at the threshold the ward calls in extra
@@ -487,6 +511,100 @@ class Ward:
             "max_bias": max_bias,
         }
 
+    def _oxygen_outage_started(self, event, now):
+        """Fire the start hook for one oxygen-outage event.
+
+        Called by the chaos engine on the first tick inside the
+        event's window (see :meth:`chaos.ChaosEngine.apply`).
+        """
+        self._fire_oxygen_outage_event(
+            "oxygen_outage_started", event, now
+        )
+
+    def _oxygen_outage_ended(self, event, now):
+        """Fire the end hook for one oxygen-outage event.
+
+        Called by the chaos engine on the first tick after the
+        event's window closes.
+        """
+        self._fire_oxygen_outage_event(
+            "oxygen_outage_ended", event, now
+        )
+
+    def _fire_oxygen_outage_event(self, kind, event, now):
+        """Fire one ward-level oxygen-outage hook event.
+
+        The payload carries the event kind, the tick, the
+        outage window (``at``, ``ends``, ``duration``), the beds
+        it targets, and the outage's rate, floor, and recovery
+        rate — so a hook can tell a ward-wide supply failure
+        from a single-bed one and know how far patients will
+        fall. The event is recorded on the audit trail with
+        whether the hook was invoked for it, any synchronous
+        error, and the retries and final delivery outcome.
+        """
+        payload = {
+            "event": kind,
+            "t": now,
+            "at": event.at,
+            "ends": event.end,
+            "duration": event.duration,
+            "beds": event.targets(self),
+            "oxygen": dict(event.oxygen),
+        }
+        self.oxygen_outage_events.append(payload)
+        result = self.oxygen_outage_hooks.fire(
+            dict(payload),
+            record=payload,
+        )
+        payload["hook_invoked"] = result["invoked"]
+        payload["hook_errors"] = result["errors"]
+
+    def _check_oxygen_floor_hits(self):
+        """Fire one floor-hit hook per patient per outage.
+
+        A monitor flags the tick its deficit first reaches the
+        outage's floor; the ward fires one
+        ``oxygen_spo2_floor_hit`` event for that bed — with the
+        bed, the tick, the SpO2 the patient is sitting on, the
+        floor, and the deficit that got them there — and
+        remembers the bed until its deficit recovers to zero, so
+        a patient sitting on the floor fires once, not once a
+        tick, and a later outage can fire for them again. A
+        callback can use the event to escalate: the patient has
+        hit the lowest saturation the outage can push them to,
+        and the low_spo2 alarm and NEWS2 climb from here are
+        the outage doing its worst.
+        """
+        for m in self.monitors:
+            if m.oxygen_deficit <= 0:
+                self._oxygen_floor_fired.discard(m.bed_id)
+                continue
+            if not m.oxygen_floor_hit:
+                continue
+            if m.bed_id in self._oxygen_floor_fired:
+                continue
+            self._oxygen_floor_fired.add(m.bed_id)
+            payload = {
+                "event": "oxygen_spo2_floor_hit",
+                "t": self.elapsed,
+                "bed": m.bed_id,
+                "spo2": m.reported_signs()["spo2"],
+                "floor": (
+                    m.oxygen_outage_cfg["floor"]
+                    if m.oxygen_outage_cfg is not None
+                    else None
+                ),
+                "deficit": m.oxygen_deficit,
+            }
+            self.oxygen_outage_events.append(payload)
+            result = self.oxygen_outage_hooks.fire(
+                dict(payload),
+                record=payload,
+            )
+            payload["hook_invoked"] = result["invoked"]
+            payload["hook_errors"] = result["errors"]
+
     def oxygen_outage_summary(self):
         """Per-bed oxygen-outage state and ward totals.
 
@@ -499,6 +617,17 @@ class Ward:
         returned), and ``max_deficit`` is the largest SpO2 loss
         on any bed, so a client can see at a glance how far the
         ward's oxygen-dependent patients have fallen.
+        ``event_count`` counts every oxygen-outage hook event this
+        run — outage starts, outage ends, and per-patient SpO2
+        floor hits — and ``events`` lists them, each with the
+        tick, the outage window or the bed and floor, and whether
+        the ward's hooks were invoked for it (``hook_invoked``)
+        and the retries and final delivery outcome
+        (``hook_retries``, ``hook_final_status``);
+        ``oxygen_outage_hooks`` carries the hook totals: whether
+        any hook is configured, how many hook deliveries were
+        invoked, how many failed, how many retries were spent,
+        and how many deliveries eventually landed.
         """
         beds = [m.oxygen_outage_detail(self.elapsed) for m in self.monitors]
         return {
@@ -509,6 +638,11 @@ class Ward:
                 1 for b in beds if b["desaturating"]
             ),
             "max_deficit": max((b["deficit"] for b in beds), default=0.0),
+            "event_count": len(self.oxygen_outage_events),
+            "events": [dict(e) for e in self.oxygen_outage_events],
+            "oxygen_outage_hooks": (
+                self.oxygen_outage_hooks.summary()
+            ),
         }
 
     def power_outage_summary(self):

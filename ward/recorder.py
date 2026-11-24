@@ -528,7 +528,11 @@ def summarize(path):
         # patients are on oxygen, how many are desaturating from
         # a failed supply, each desaturating bed's SpO2 loss, and
         # the largest loss on any bed — so a run's oxygen failure
-        # is visible without replaying every tick.
+        # is visible without replaying every tick — plus how many
+        # oxygen-outage hook events fired this run, and whether
+        # the oxygen-outage hooks are configured and how many
+        # hook deliveries were invoked, failed, retried, and
+        # delivered.
         "oxygen_outage": (
             {
                 "beds_on_oxygen": last_oxygen_outage[
@@ -544,6 +548,19 @@ def summarize(path):
                 },
                 "max_deficit": last_oxygen_outage.get(
                     "max_deficit", 0.0
+                ),
+                "event_count": last_oxygen_outage.get(
+                    "event_count", 0
+                ),
+                "oxygen_outage_hooks": last_oxygen_outage.get(
+                    "oxygen_outage_hooks",
+                    {
+                        "configured": False,
+                        "invoked": 0,
+                        "failed": 0,
+                        "retries": 0,
+                        "delivered": 0,
+                    },
                 ),
             }
             if last_oxygen_outage is not None
