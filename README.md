@@ -899,6 +899,53 @@ ward is dark: the hypoxic bed's low_spo2 episode cleared at
 11 s, before the outage, and the next one raises at 60 s, after
 the monitors came back.
 
+## Power-outage hooks
+
+A power outage is the moment a ward most needs the outside
+world to hear about it — the mains has failed, the monitors are
+on borrowed battery time, and the ward is about to go blind —
+so the hook makes sure something outside the ward hears about
+it. A ward that wants the outside world to hear about that
+moment — a dashboard, a pager, an escalation policy —
+configures power-outage hooks, the same channels as the NEWS2
+hooks (webhook and/or in-process callback), on the same
+best-effort, never-fatal terms:
+
+```json
+{"power_outage_hooks": {"webhook_url": "http://127.0.0.1:18099/hooks"}}
+```
+
+Two events fire. `power_outage_started` fires once, in the
+tick the mains fails, with the outage window (`"at"`,
+`"ends"`, `"duration"`), the beds it targets, and the outage's
+battery and reboot times. `power_outage_ended` fires once, in
+the tick the mains returns, with the same window. A ward that
+stays dark for twenty ticks fires once, not twenty times, and
+a second outage fires again — the start and end are per event,
+not per run. An in-process callback gets the same payloads in
+the tick the event fires (Python API only — a scenario file
+cannot hold a callable), so scenario code can log or escalate
+on the mains failing directly. Each event records whether the
+hook was invoked (`"hook_invoked"`, False with no hooks) and
+any synchronous error (`"hook_errors"`), and the power-outage
+summary carries the event totals (`"event_count"`, the full
+`"events"` history) and the ward power-outage-hook totals
+(`"power_outage_hooks"`: whether any hook is configured, how
+many deliveries were invoked, how many failed, how many
+retries were spent, and how many deliveries eventually landed)
+— in `GET /power-outage`, every snapshot and WebSocket frame,
+and the run summary (`--summary`). The same retry rules as the
+NEWS2 hooks apply — a failed webhook POST is retried with
+backoff up to `"max_retries"` times, and the event records
+`"hook_retries"` and `"hook_final_status"` alongside
+`"hook_invoked"`. Hooks are off by default, so a ward with none
+configured behaves exactly as before. See
+`scenarios/power-outage-hooks.json` for a runnable example:
+over a seeded 70-tick run the same ward as
+`power-outage.json` loses its mains at 5 s and gets it back at
+35 s — POSTed to the configured webhook, with 2 hook
+deliveries invoked and 0 failed against a stub server.
+
 ## Triage / ED intake queue
 
 Patients arrive at triage with an acuity and wait in an intake queue
@@ -2777,3 +2824,16 @@ the hook totals.
   WebSocket frame, a `GET /oxygen-outage` endpoint, and the run
   summary; off by default, configured per ward with
   `oxygen_outage_hooks` in the scenario) — done in v0.50.0
+- Power-outage hooks (when a power outage starts or ends — a
+  configured webhook URL gets a `power_outage_started` /
+  `power_outage_ended` event payload POSTed to it, or an
+  in-process callback is called with the same payload in the
+  firing tick, so a hook can escalate on the mains failing; one
+  start and one end per outage, re-armed for a second outage;
+  reusing the NEWS2 hook machinery, best effort and never
+  fatal; each event records whether the hook was invoked, and
+  the power-outage summary carries the event history and the
+  power-outage-hook totals, in every snapshot, WebSocket frame,
+  a `GET /power-outage` endpoint, and the run summary; off by
+  default, configured per ward with `power_outage_hooks` in
+  the scenario) — done in v0.51.0

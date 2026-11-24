@@ -26,6 +26,7 @@ from ward.alert_hooks import (
     validate_escalation_hooks,
     validate_missed_dose_hooks,
     validate_oxygen_outage_hooks,
+    validate_power_outage_hooks,
     validate_trend_alert_hooks,
     validate_wait_time_hooks,
 )
@@ -10316,6 +10317,309 @@ class TestOxygenOutageHooks(unittest.TestCase):
             server.server_close()
 
 
+class TestPowerOutageHooks(unittest.TestCase):
+    # Power-outage hooks: an outage starting or ending fires the
+    # ward's power_outage_hooks — the same webhook/callback
+    # machinery as the NEWS2 hooks — so something outside the
+    # ward hears the mains fail and return. A callback can use
+    # the start to escalate: the monitors are on borrowed
+    # battery time, and the ward is about to go blind.
+    POWER = {"battery_s": 10.0, "reboot_s": 5.0}
+
+    def _outage_ward(self, hooks=None):
+        return Ward(
+            beds=2,
+            profiles=["stable", "stable"],
+            chaos=[
+                ChaosEvent(
+                    "power_outage",
+                    at=5,
+                    duration=30,
+                    bed=0,
+                    power=self.POWER,
+                )
+            ],
+            seed=42,
+            discharge_readiness={"stable_window_s": 5},
+            power_outage_hooks=hooks,
+        )
+
+    def test_validate_power_outage_hooks(self):
+        hooks = validate_power_outage_hooks(None)
+        self.assertIsInstance(hooks, TrendAlertHooks)
+        self.assertFalse(hooks.configured)
+        self.assertEqual(hooks.kind, "power-outage")
+        custom = validate_power_outage_hooks(
+            {"webhook_url": "https://example.invalid/hooks", "timeout_s": 2}
+        )
+        self.assertTrue(custom.configured)
+        self.assertEqual(custom.kind, "power-outage")
+        self.assertEqual(custom.timeout_s, 2.0)
+        seen = []
+        append = seen.append
+        cb = validate_power_outage_hooks({"callback": append})
+        self.assertTrue(cb.configured)
+        self.assertIs(cb.callback, append)
+        with self.assertRaises(ValueError):
+            validate_power_outage_hooks(
+                {"webhook_url": "ftp://x/hooks"}
+            )
+        with self.assertRaises(ValueError):
+            validate_power_outage_hooks({"callback": "not callable"})
+        with self.assertRaises(ValueError):
+            validate_power_outage_hooks({"timeout_s": 0})
+        with self.assertRaises(ValueError):
+            validate_power_outage_hooks({"url": "http://x/hooks"})
+        with self.assertRaises(ValueError):
+            validate_power_outage_hooks("http://x/hooks")
+
+    def test_hooks_off_by_default(self):
+        # No hooks configured: the outage still starts and ends,
+        # and each event is recorded with no hook invoked.
+        ward = self._outage_ward()
+        self.assertFalse(ward.power_outage_hooks.configured)
+        for _ in range(40):
+            ward.tick()
+        summary = ward.power_outage_summary()
+        self.assertEqual(summary["event_count"], 2)
+        self.assertEqual(
+            [
+                (e["event"], e["t"])
+                for e in summary["events"]
+            ],
+            [
+                ("power_outage_started", 5.0),
+                ("power_outage_ended", 35.0),
+            ],
+        )
+        for event in summary["events"]:
+            self.assertFalse(event["hook_invoked"])
+            self.assertEqual(event["hook_errors"], [])
+            self.assertEqual(event["hook_retries"], 0)
+            self.assertEqual(
+                event["hook_final_status"], "not_invoked"
+            )
+        self.assertEqual(
+            summary["power_outage_hooks"],
+            {"configured": False, "invoked": 0, "failed": 0, "retries": 0, "delivered": 0},
+        )
+        self.assertEqual(
+            ward.snapshot()["power_outage"]["event_count"], 2
+        )
+
+    def test_callback_hook_fires_for_start_and_end(self):
+        seen = []
+        ward = self._outage_ward({"callback": seen.append})
+        self.assertTrue(ward.power_outage_hooks.configured)
+        for _ in range(40):
+            ward.tick()
+        # Two events over the run: the mains fails at 5 s and
+        # returns at 35 s. The monitors sit dark from 15 s
+        # until the reboot finishes, but the outage itself fires
+        # once on start and once on end, not once a tick.
+        self.assertEqual(
+            [(p["event"], p["t"]) for p in seen],
+            [
+                ("power_outage_started", 5.0),
+                ("power_outage_ended", 35.0),
+            ],
+        )
+        start, end = seen
+        self.assertEqual(
+            {k: v for k, v in start.items() if k != "hook_retries"
+             and k != "hook_final_status"},
+            {
+                "event": "power_outage_started",
+                "t": 5.0,
+                "at": 5.0,
+                "ends": 35.0,
+                "duration": 30,
+                "beds": [0],
+                "power": self.POWER,
+            },
+        )
+        self.assertEqual(end["event"], "power_outage_ended")
+        self.assertEqual(end["t"], 35.0)
+        self.assertEqual(end["beds"], [0])
+        # Every event records the invocation.
+        summary = ward.power_outage_summary()
+        self.assertEqual(summary["event_count"], 2)
+        for event in summary["events"]:
+            self.assertTrue(event["hook_invoked"])
+            self.assertEqual(event["hook_errors"], [])
+            self.assertEqual(event["hook_final_status"], "delivered")
+        self.assertEqual(
+            summary["power_outage_hooks"],
+            {"configured": True, "invoked": 2, "failed": 0, "retries": 0, "delivered": 2},
+        )
+
+    def test_start_and_end_fire_again_for_a_second_outage(self):
+        # Two outages on the same bed: the start and the end
+        # fire once per outage — the engine tracks each event
+        # separately, so the second outage fires again.
+        seen = []
+        ward = Ward(
+            beds=1,
+            profiles=["stable"],
+            chaos=[
+                ChaosEvent(
+                    "power_outage",
+                    at=5,
+                    duration=10,
+                    bed=0,
+                    power=self.POWER,
+                ),
+                ChaosEvent(
+                    "power_outage",
+                    at=30,
+                    duration=10,
+                    bed=0,
+                    power=self.POWER,
+                ),
+            ],
+            seed=42,
+            power_outage_hooks={"callback": seen.append},
+        )
+        for _ in range(45):
+            ward.tick()
+        self.assertEqual(
+            [(p["event"], p["t"]) for p in seen],
+            [
+                ("power_outage_started", 5.0),
+                ("power_outage_ended", 15.0),
+                ("power_outage_started", 30.0),
+                ("power_outage_ended", 40.0),
+            ],
+        )
+        self.assertEqual(
+            ward.power_outage_summary()["power_outage_hooks"],
+            {"configured": True, "invoked": 4, "failed": 0, "retries": 0, "delivered": 4},
+        )
+
+    def test_callback_failure_is_not_fatal(self):
+        def boom(payload):
+            raise ValueError("pager is down")
+
+        ward = self._outage_ward({"callback": boom})
+        for _ in range(5):
+            ward.tick()  # t=5: outage starts, hook raises
+        snap = ward.tick()  # t=6: the tick still completes
+        self.assertTrue(snap["beds"][0]["online"])
+        event = ward.power_outage_summary()["events"][0]
+        self.assertEqual(event["event"], "power_outage_started")
+        self.assertTrue(event["hook_invoked"])
+        self.assertEqual(event["hook_errors"], ["pager is down"])
+        self.assertEqual(event["hook_final_status"], "failed")
+        summary = ward.power_outage_summary()["power_outage_hooks"]
+        self.assertEqual(summary["invoked"], 1)
+        self.assertEqual(summary["failed"], 1)
+
+    def test_webhook_posts_to_stub_server(self):
+        server, port, received = capture_server()
+        try:
+            ward = self._outage_ward(
+                {"webhook_url": "http://127.0.0.1:%d/hooks" % port}
+            )
+            for _ in range(40):
+                ward.tick()
+            self.assertTrue(ward.power_outage_hooks.wait(timeout=5))
+            self.assertEqual(len(received), 2)
+            payloads = sorted(
+                (json.loads(r[2]) for r in received),
+                key=lambda p: p["t"],
+            )
+            self.assertEqual(
+                [(p["event"], p["t"]) for p in payloads],
+                [
+                    ("power_outage_started", 5.0),
+                    ("power_outage_ended", 35.0),
+                ],
+            )
+            path, content_type, body = received[0]
+            self.assertEqual(path, "/hooks")
+            self.assertEqual(content_type, "application/json")
+            start = [p for p in payloads if p["event"] == "power_outage_started"][0]
+            self.assertEqual(start["power"], self.POWER)
+            self.assertEqual(start["beds"], [0])
+            summary = ward.power_outage_summary()
+            self.assertEqual(
+                summary["power_outage_hooks"],
+                {"configured": True, "invoked": 2, "failed": 0, "retries": 0, "delivered": 2},
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_scenario_power_outage_hooks(self):
+        cfg = load_scenario(
+            os.path.join(
+                HERE, "..", "scenarios", "power-outage-hooks.json"
+            )
+        )
+        self.assertTrue(cfg["power_outage_hooks"].configured)
+        server, port, received = capture_server()
+        path = os.path.join(tempfile.mkdtemp(), "run.jsonl")
+        try:
+            # The scenario's URL is a placeholder; point it at
+            # the stub server for this run.
+            cfg["power_outage_hooks"] = (
+                validate_power_outage_hooks(
+                    {"webhook_url": "http://127.0.0.1:%d/hooks" % port}
+                )
+            )
+            ward = build_ward(cfg, seed=42)
+            with Recorder(path, ward.beds, ward.rate_hz, seed=42) as rec:
+                ward.recorder = rec
+                for _ in range(70):
+                    snap = ward.tick()
+            self.assertTrue(ward.power_outage_hooks.wait(timeout=5))
+            # Two events over the run: the mains fails at 5 s
+            # and returns at 35 s. The deliveries run in
+            # separate daemon threads, so their arrival order at
+            # the stub is not guaranteed — sort by event time
+            # before asserting.
+            self.assertEqual(len(received), 2)
+            payloads = sorted(
+                (json.loads(r[2]) for r in received),
+                key=lambda p: p["t"],
+            )
+            self.assertEqual(
+                [
+                    (p["event"], p["t"], p.get("bed"))
+                    for p in payloads
+                ],
+                [
+                    ("power_outage_started", 5.0, None),
+                    ("power_outage_ended", 35.0, None),
+                ],
+            )
+            # Every event records that its hook was invoked.
+            for event in snap["power_outage"]["events"]:
+                self.assertTrue(event["hook_invoked"])
+            summary = ward.power_outage_summary()
+            self.assertEqual(summary["event_count"], 2)
+            self.assertEqual(
+                summary["power_outage_hooks"],
+                {"configured": True, "invoked": 2, "failed": 0, "retries": 0, "delivered": 2},
+            )
+            # The run summary carries the event count and the
+            # hook totals from the last tick — but only as of
+            # that tick: the snapshot in the file was recorded
+            # before the last delivery settled, so delivered is
+            # read from the live summary above, not from here.
+            run = summarize(path)
+            self.assertEqual(run["power_outage"]["event_count"], 2)
+            self.assertTrue(
+                run["power_outage"]["power_outage_hooks"]["configured"]
+            )
+            self.assertEqual(
+                run["power_outage"]["power_outage_hooks"]["invoked"], 2
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
 class TestPowerOutage(unittest.TestCase):
     # A power outage: the mains fails from t=5 for 30 s, so the
     # monitor runs on battery for 10 s — still emitting readings,
@@ -10584,6 +10888,14 @@ class TestPowerOutage(unittest.TestCase):
                 "beds_rebooting": 0,
                 "beds": {"0": 25},
                 "dark_ticks": 25,
+                "event_count": 2,
+                "power_outage_hooks": {
+                    "configured": False,
+                    "invoked": 0,
+                    "failed": 0,
+                    "retries": 0,
+                    "delivered": 0,
+                },
             },
         )
 

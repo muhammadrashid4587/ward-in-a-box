@@ -570,7 +570,11 @@ def summarize(path):
         # monitors are on battery, how many have gone dark, how
         # many are rebooting, each dark bed's dark ticks, and
         # the ward's total dark ticks — so a run's mains failure
-        # is visible without replaying every tick.
+        # is visible without replaying every tick — plus how many
+        # power-outage hook events fired this run, and whether
+        # the power-outage hooks are configured and how many
+        # hook deliveries were invoked, failed, retried, and
+        # delivered.
         "power_outage": (
             {
                 "beds_on_battery": last_power_outage[
@@ -587,6 +591,19 @@ def summarize(path):
                 },
                 "dark_ticks": last_power_outage.get(
                     "dark_ticks", 0
+                ),
+                "event_count": last_power_outage.get(
+                    "event_count", 0
+                ),
+                "power_outage_hooks": last_power_outage.get(
+                    "power_outage_hooks",
+                    {
+                        "configured": False,
+                        "invoked": 0,
+                        "failed": 0,
+                        "retries": 0,
+                        "delivered": 0,
+                    },
                 ),
             }
             if last_power_outage is not None

@@ -1,0 +1,1 @@
+{"beds":3,"chaos":[{"at":5,"duration":30,"power":{"battery_s":10,"reboot_s":5},"type":"power_outage"}],"discharge_readiness":{"stable_window_s":5},"patients":[{"bed":0,"profile":"stable"},{"bed":1,"profile":"stable"},{"bed":2,"profile":"hypoxic"}],"power_outage_hooks":{"webhook_url":"http://127.0.0.1:18099/hooks"},"rate_hz":1.0}

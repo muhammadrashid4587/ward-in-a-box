@@ -11,6 +11,7 @@ from .alert_hooks import (
     validate_escalation_hooks,
     validate_missed_dose_hooks,
     validate_oxygen_outage_hooks,
+    validate_power_outage_hooks,
     validate_trend_alert_hooks,
     validate_wait_time_hooks,
 )
@@ -278,6 +279,16 @@ def load_scenario(path):
             )
         except ValueError as e:
             raise ValueError("oxygen_outage_hooks: %s" % e)
+    power_outage_hooks = None
+    if "power_outage_hooks" in data:
+        if not isinstance(data["power_outage_hooks"], dict):
+            raise ValueError("power_outage_hooks must be an object")
+        try:
+            power_outage_hooks = validate_power_outage_hooks(
+                data["power_outage_hooks"]
+            )
+        except ValueError as e:
+            raise ValueError("power_outage_hooks: %s" % e)
     return {
         "beds": beds,
         "rate_hz": rate,
@@ -304,6 +315,7 @@ def load_scenario(path):
         "discharge_readiness_hooks": discharge_readiness_hooks,
         "discharge_priority_hooks": discharge_priority_hooks,
         "oxygen_outage_hooks": oxygen_outage_hooks,
+        "power_outage_hooks": power_outage_hooks,
         "triage": triage,
         "host": data.get("host", "127.0.0.1"),
         "port": data.get("port", 8080),
@@ -338,6 +350,7 @@ def build_ward(cfg, seed=None, recorder=None):
         discharge_readiness_hooks=cfg.get("discharge_readiness_hooks"),
         discharge_priority_hooks=cfg.get("discharge_priority_hooks"),
         oxygen_outage_hooks=cfg.get("oxygen_outage_hooks"),
+        power_outage_hooks=cfg.get("power_outage_hooks"),
         triage=cfg.get("triage"),
         recorder=recorder,
     )
