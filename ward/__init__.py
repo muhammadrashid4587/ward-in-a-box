@@ -1,6 +1,6 @@
 """ward-in-a-box: a simulated hospital ward as a load/chaos generator."""
 
-__version__ = "0.45.0"
+__version__ = "0.46.0"
 
 from .alert_hooks import (
     AlertHooks,

@@ -1,9 +1,40 @@
 """Chaos events: device dropout, alarm storms, stale readings, partitions,
-discharges, pharmacy stockouts, slow sensor drift."""
+discharges, pharmacy stockouts, slow sensor drift, staff shortages."""
 
+from .staffing import ROLES
 from .vitals import NORMAL
 
-VALID_TYPES = ("dropout", "alarm_storm", "stale", "partition", "discharge", "stockout", "sensor_drift")
+VALID_TYPES = ("dropout", "alarm_storm", "stale", "partition", "discharge", "stockout", "sensor_drift", "staff_shortage")
+
+
+def validate_shortage(shortage):
+    """A staff-shortage config: ``{role: count_lost, ...}``.
+
+    Each role must be one the ward rosters, each count a
+    non-negative int — how many of that role call in sick for
+    the event's window — and at least one count must be
+    non-zero, or the event does nothing at all.
+    """
+    if not isinstance(shortage, dict) or not shortage:
+        raise ValueError(
+            "staff_shortage needs a shortage map, got %r" % (shortage,)
+        )
+    out = {}
+    for role, count in shortage.items():
+        if role not in ROLES:
+            raise ValueError(
+                "staff_shortage: unknown staff role: %r" % (role,)
+            )
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            raise ValueError(
+                "staff_shortage: count for %r must be a non-negative int, got %r"
+                % (role, count)
+            )
+        if count != 0:
+            out[role] = count
+    if not out:
+        raise ValueError("staff_shortage needs at least one non-zero count")
+    return out
 
 
 def validate_drift(drift):
@@ -64,9 +95,20 @@ class ChaosEvent:
     miscalibration, not a step change. The bias stays once the
     event ends (a drifted sensor does not heal itself) and is
     cleared only when a new patient is admitted to the bed.
+    ``staff_shortage`` needs ``shortage`` (a map of staff role to
+    how many of that role are lost, see :func:`validate_shortage`):
+    while it is active, that many staff are off the effective
+    roster — a nurse calling in sick mid-shift — so the
+    nurse-to-patient ratio rises and alarms take longer to
+    acknowledge and vitals checks slip, exactly as a thin roster
+    would. It is ward-wide like ``partition`` and ignores
+    ``bed``/``beds``. Only lost nurses change the modelled care:
+    a lost doctor or tech is recorded in the staffing summary
+    but slows nothing, because the model keys response times
+    off nurses alone.
     """
 
-    def __init__(self, type, at, duration=None, bed=None, beds=None, med=None, drift=None):
+    def __init__(self, type, at, duration=None, bed=None, beds=None, med=None, drift=None, shortage=None):
         if type not in VALID_TYPES:
             raise ValueError("unknown chaos type: %r" % type)
         if type == "stockout":
@@ -74,6 +116,8 @@ class ChaosEvent:
                 raise ValueError("stockout needs a medication name, got %r" % (med,))
         if type == "sensor_drift":
             drift = validate_drift(drift)
+        if type == "staff_shortage":
+            shortage = validate_shortage(shortage)
         if type == "discharge":
             duration = 0 if duration is None else duration
             if duration < 0:
@@ -89,6 +133,7 @@ class ChaosEvent:
         self.beds = list(beds) if beds is not None else None
         self.med = med.strip().lower() if isinstance(med, str) else None
         self.drift = drift
+        self.shortage = shortage
 
     @property
     def end(self):
@@ -129,6 +174,22 @@ class ChaosEngine:
                 meds = ward.monitors[b].meds.meds
                 if any(m["name"].lower() == ev.med for m in meds):
                     out.setdefault(b, set()).add(ev.med)
+        return out
+
+    def shortage(self, ward, now):
+        """Staff lost to active staff-shortage events: ``{role: count}``.
+
+        Ward-wide, so bed/beds on the event are ignored, and
+        overlapping events add up — two sick calls for one nurse
+        each lose two nurses. Only roles with a non-zero loss are
+        listed, so an empty dict means the roster is whole.
+        """
+        out = {}
+        for ev in self.events:
+            if ev.type != "staff_shortage" or not ev.active(now):
+                continue
+            for role, count in ev.shortage.items():
+                out[role] = out.get(role, 0) + count
         return out
 
     def apply(self, ward, now, dt=1.0):

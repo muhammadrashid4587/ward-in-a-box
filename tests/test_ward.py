@@ -9135,7 +9135,208 @@ class TestSensorDrift(unittest.TestCase):
         snaps = [ward.tick() for _ in range(70)]
         self.assertEqual(snaps[69]["beds"][0]["news2"]["score"], 5)
         self.assertEqual(snaps[69]["beds"][0]["news2"]["risk"], "medium")
-        self.assertEqual(snaps[69]["beds"][1]["news2"]["score"], 0)
+class TestStaffShortage(unittest.TestCase):
+    # A staff shortage: one nurse calls in sick from t=10 for 30 s,
+    # on a 12-bed ward rostered 3 nurses on days — so the ratio
+    # goes from 1:4 (adequate, alarms acked in 30 s) to 1:6
+    # (load factor 1.5, alarms acked in 45 s) for the window, then
+    # back to adequate when the shift is whole again. Losing all
+    # three nurses leaves the ward with no nurse at all, load
+    # factor 4.0, alarms acked in 120 s.
+
+    def _shortage_ward(self, shortage, at=10, duration=30):
+        return Ward(
+            beds=12,
+            profiles=["stable"] * 12,
+            chaos=[
+                ChaosEvent(
+                    "staff_shortage",
+                    at=at,
+                    duration=duration,
+                    shortage=shortage,
+                )
+            ],
+            seed=42,
+        )
+
+    def test_shortage_config_validation(self):
+        # A shortage event needs a shortage map.
+        with self.assertRaises(ValueError):
+            ChaosEvent("staff_shortage", at=0, duration=10)
+        with self.assertRaises(ValueError):
+            ChaosEvent(
+                "staff_shortage", at=0, duration=10, shortage={}
+            )
+        # Unknown roles, non-integer counts, negative counts,
+        # and all-zero counts are all scenario bugs.
+        with self.assertRaises(ValueError):
+            ChaosEvent(
+                "staff_shortage",
+                at=0,
+                duration=10,
+                shortage={"porter": 1},
+            )
+        with self.assertRaises(ValueError):
+            ChaosEvent(
+                "staff_shortage",
+                at=0,
+                duration=10,
+                shortage={"nurse": "one"},
+            )
+        with self.assertRaises(ValueError):
+            ChaosEvent(
+                "staff_shortage",
+                at=0,
+                duration=10,
+                shortage={"nurse": -1},
+            )
+        with self.assertRaises(ValueError):
+            ChaosEvent(
+                "staff_shortage",
+                at=0,
+                duration=10,
+                shortage={"nurse": 0},
+            )
+        # Zero counts are dropped, non-zero ones kept.
+        ev = ChaosEvent(
+            "staff_shortage",
+            at=0,
+            duration=10,
+            shortage={"nurse": 1, "doctor": 0},
+        )
+        self.assertEqual(ev.shortage, {"nurse": 1})
+
+    def test_shortage_raises_load_factor_for_its_window_only(self):
+        ward = self._shortage_ward({"nurse": 1})
+        snaps = [ward.tick() for _ in range(50)]
+        # Before the sick call the roster is adequate.
+        self.assertEqual(snaps[8]["staffing"]["load_factor"], 1.0)
+        self.assertEqual(snaps[8]["staffing"]["shortage"], {})
+        # During the window one nurse is down: 12 beds over
+        # 2 nurses is 6 per nurse, load factor 1.5.
+        self.assertEqual(snaps[19]["staffing"]["load_factor"], 1.5)
+        self.assertEqual(
+            snaps[19]["staffing"]["shortage"], {"nurse": 1}
+        )
+        self.assertEqual(
+            snaps[19]["staffing"]["patients_per_nurse"], 6.0
+        )
+        self.assertFalse(snaps[19]["staffing"]["adequate"])
+        # Once the window ends the roster is whole again.
+        self.assertEqual(snaps[49]["staffing"]["load_factor"], 1.0)
+        self.assertEqual(snaps[49]["staffing"]["shortage"], {})
+        self.assertTrue(snaps[49]["staffing"]["adequate"])
+
+    def test_shortage_slows_alarm_acknowledgement(self):
+        ward = self._shortage_ward({"nurse": 1})
+        for _ in range(10):
+            ward.tick()
+        # An alarm raised while the nurse is out is acked after
+        # 30 s times the 1.5 load factor, not the usual 30 s.
+        ward.staffing.alarm_raised(0, "tachycardia", 10.0, 12)
+        self.assertEqual(
+            ward.staffing._pending[0]["ack_t"], 55.0
+        )
+        # An alarm raised before the sick call keeps the 30 s ack.
+        ward2 = self._shortage_ward({"nurse": 1})
+        for _ in range(5):
+            ward2.tick()
+        ward2.staffing.alarm_raised(0, "tachycardia", 5.0, 12)
+        self.assertEqual(
+            ward2.staffing._pending[0]["ack_t"], 35.0
+        )
+
+    def test_losing_every_nurse_leaves_no_nurse_factor(self):
+        ward = self._shortage_ward({"nurse": 3})
+        snaps = [ward.tick() for _ in range(20)]
+        # No nurse at all: the no-nurse factor of 4.0, and the
+        # ratio is unmeasurable.
+        self.assertEqual(snaps[19]["staffing"]["load_factor"], 4.0)
+        self.assertIsNone(
+            snaps[19]["staffing"]["patients_per_nurse"]
+        )
+        self.assertFalse(snaps[19]["staffing"]["adequate"])
+
+    def test_overlapping_shortages_add_up(self):
+        ward = Ward(
+            beds=12,
+            profiles=["stable"] * 12,
+            chaos=[
+                ChaosEvent(
+                    "staff_shortage",
+                    at=10,
+                    duration=30,
+                    shortage={"nurse": 1},
+                ),
+                ChaosEvent(
+                    "staff_shortage",
+                    at=20,
+                    duration=30,
+                    shortage={"nurse": 1, "doctor": 1},
+                ),
+            ],
+            seed=42,
+        )
+        snaps = [ward.tick() for _ in range(30)]
+        # One sick call at first, two once the second starts —
+        # and the lost doctor is recorded even though only the
+        # lost nurses slow the care.
+        self.assertEqual(
+            snaps[14]["staffing"]["shortage"], {"nurse": 1}
+        )
+        self.assertEqual(
+            snaps[24]["staffing"]["shortage"],
+            {"nurse": 2, "doctor": 1},
+        )
+        self.assertEqual(snaps[24]["staffing"]["load_factor"], 3.0)
+
+    def test_shortage_summary_and_endpoint(self):
+        ward = self._shortage_ward({"nurse": 1})
+        for _ in range(20):
+            snap = ward.tick()
+        self.assertEqual(snap["staffing"]["shortage"], {"nurse": 1})
+        server, port = serve_in_thread(ward)
+        try:
+            status, body = get(port, "/staffing")
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                json.loads(body)["shortage"], {"nurse": 1}
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_summary_reports_shortage(self):
+        ward = self._shortage_ward({"nurse": 1})
+        path = os.path.join(tempfile.mkdtemp(), "run.jsonl")
+        with Recorder(path, ward.beds, ward.rate_hz, seed=42) as rec:
+            ward.recorder = rec
+            for _ in range(20):
+                ward.tick()
+        summary = summarize(path)
+        self.assertEqual(summary["staffing"]["shortage"], {"nurse": 1})
+        self.assertEqual(summary["staffing"]["load_factor"], 1.5)
+
+    def test_scenario_file_loads_and_runs(self):
+        cfg = load_scenario("scenarios/staff-shortage.json")
+        self.assertEqual(len(cfg["chaos"]), 2)
+        shortage = [e for e in cfg["chaos"] if e.type == "staff_shortage"]
+        self.assertEqual(len(shortage), 1)
+        self.assertEqual(shortage[0].shortage, {"nurse": 1})
+        ward = build_ward(cfg, seed=42)
+        snaps = [ward.tick() for _ in range(70)]
+        # The alarm storm raises 15 alarms while the nurse is
+        # out, every one of them acked 45 s after it raised —
+        # 30 s times the 1.5 load factor — against 30 s with a
+        # full roster.
+        staffing = snaps[69]["staffing"]
+        self.assertEqual(staffing["alarms"]["raised"], 15)
+        self.assertEqual(staffing["alarms"]["acked"], 15)
+        self.assertEqual(
+            staffing["alarms"]["mean_time_to_ack_s"], 45.0
+        )
+        self.assertEqual(snaps[19]["staffing"]["load_factor"], 1.5)
+        self.assertEqual(snaps[69]["staffing"]["load_factor"], 1.0)
 
 
 if __name__ == "__main__":

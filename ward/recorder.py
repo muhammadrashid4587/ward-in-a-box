@@ -485,15 +485,17 @@ def summarize(path):
         ),
         # Staffing totals from the last tick: the load factor, how
         # many extra nurses a NEWS2 staffing escalation has called
-        # in, and the escalation state — whether one is configured
-        # and active, how many high-risk episodes are open, and
-        # every escalation raised so far.
+        # in, the staff an active staff-shortage event has taken
+        # off the roster, and the escalation state — whether one
+        # is configured and active, how many high-risk episodes
+        # are open, and every escalation raised so far.
         "staffing": (
             {
                 "load_factor": last_staffing["load_factor"],
                 "escalation_nurses": last_staffing.get(
                     "escalation_nurses", 0
                 ),
+                "shortage": last_staffing.get("shortage", {}),
                 "escalation": last_staffing.get(
                     "escalation",
                     {

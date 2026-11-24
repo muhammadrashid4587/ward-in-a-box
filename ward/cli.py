@@ -103,6 +103,7 @@ def load_scenario(path):
                     beds=ev.get("beds"),
                     med=ev.get("med"),
                     drift=ev.get("drift"),
+                    shortage=ev.get("shortage"),
                 )
             )
         except KeyError as e:

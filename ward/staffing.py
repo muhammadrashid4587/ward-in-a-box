@@ -97,6 +97,14 @@ class Staffing:
         # nurse-to-patient ratio exactly like rostered nurses, so
         # an escalation lowers the load factor from the next tick.
         self.escalation_nurses = 0
+        # Staff lost to active staff-shortage chaos events (see
+        # ward.chaos): set by the ward each tick as a
+        # ``{role: count}`` map, {} when the roster is whole.
+        # Lost nurses come off the effective roster, so a sick
+        # call raises the load factor from the next tick; lost
+        # doctors and techs are recorded but change nothing,
+        # because the model keys response times off nurses alone.
+        self.shortage = {}
 
     def shift_at(self, elapsed):
         """Which shift is on at ``elapsed`` seconds into the run."""
@@ -119,8 +127,15 @@ class Staffing:
 
     def effective_nurses(self, elapsed):
         """Nurses on duty at ``elapsed``, roster plus any called in
-        by a NEWS2 staffing escalation."""
-        return self.on_shift(elapsed)["nurse"] + self.escalation_nurses
+        by a NEWS2 staffing escalation, minus any lost to an
+        active staff shortage — never below zero, so losing the
+        whole roster leaves the ward with no nurse at all."""
+        return max(
+            0,
+            self.on_shift(elapsed)["nurse"]
+            + self.escalation_nurses
+            - self.shortage.get("nurse", 0),
+        )
 
     def patients_per_nurse(self, occupied_beds, elapsed):
         """Occupied beds per nurse on shift, or None with no nurse.
@@ -194,8 +209,10 @@ class Staffing:
 
         ``on_shift`` is the rostered staff; ``escalation_nurses``
         is how many extra nurses a NEWS2 staffing escalation has
-        called in (0 without one) — the ratio and the load factor
-        count both.
+        called in (0 without one) and ``shortage`` is the staff
+        an active staff-shortage event has taken off the roster
+        ({} with none) — the ratio and the load factor count
+        both.
         """
         ppn = self.patients_per_nurse(occupied_beds, now)
         return {
@@ -204,6 +221,7 @@ class Staffing:
             "handover": self.in_handover(now),
             "on_shift": self.on_shift(now),
             "escalation_nurses": self.escalation_nurses,
+            "shortage": dict(self.shortage),
             "occupied_beds": occupied_beds,
             "patients_per_nurse": None if ppn is None else round(ppn, 2),
             "adequate": ppn is not None and ppn <= ADEQUATE_PATIENTS_PER_NURSE,

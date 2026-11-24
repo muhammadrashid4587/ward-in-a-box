@@ -171,6 +171,12 @@ python3 -m ward.cli scenarios/news2-trend.json --seed 42
 # while bed 1 stays at NEWS2 0
 python3 -m ward.cli scenarios/sensor-drift.json --seed 42
 
+# Staff shortage: one nurse calls in sick at 10 s for 30 s, during
+# an alarm storm on beds 0-2 — the ratio goes 1:4 to 1:6, the load
+# factor 1.0 to 1.5, and all 15 storm alarms are acked in 45.0 s
+# instead of 30.0 s
+python3 -m ward.cli scenarios/staff-shortage.json --seed 42
+
 # NEWS2 trend alert hooks: the same ward, with each trend alert
 # also POSTed to a webhook (here a placeholder URL — point it at
 # your own endpoint; a dead endpoint is logged, never fatal)
@@ -387,6 +393,15 @@ Chaos types:
   jumping — a ramp, not a step. The bias stays once the event ends
   (a drifted sensor does not heal itself) and is cleared only when a
   new patient is admitted to the bed; see Slow sensor drift below.
+- `staff_shortage` — staff call in sick for `duration` seconds;
+  needs `"shortage"`, a map of staff role to how many of that
+  role are lost (for example `{"nurse": 1}`). While it is active
+  the lost staff are off the effective roster, so the
+  nurse-to-patient ratio rises and alarms take longer to
+  acknowledge and vitals checks slip, exactly as a thin roster
+  would; ward-wide, so `bed`/`beds` are ignored. Only lost
+  nurses change the modelled care — a lost doctor or tech is
+  recorded but slows nothing; see Staff shortage below.
 
 `bed` targets one bed, `beds` targets several, neither targets all beds
 (`partition` is always ward-wide). Times are elapsed seconds from start.
@@ -594,6 +609,39 @@ heart-rate bias +30.0, its NEWS2 creeps 0, 1, 2, 4, 5 to medium
 risk, a `low_spo2` alarm raises at 47 s, and it stops being
 discharge-ready on the same tick after flagging ready at 5 s,
 while bed 1 stays at NEWS2 0.
+
+## Staff shortage
+
+A `staff_shortage` chaos event takes staff off the effective
+roster for a window — a nurse calling in sick mid-shift:
+
+```json
+{"type": "staff_shortage", "at": 10, "duration": 30,
+ "shortage": {"nurse": 1}}
+```
+
+While the event is active, that many staff are gone: the
+nurse-to-patient ratio rises and care slows exactly as a thin
+roster would — alarms take longer to acknowledge, routine
+vitals checks slip later, and medication doses land later,
+all through the same load factor the staffing model already
+uses. When the window ends the roster is whole again and the
+load factor drops straight back. Overlapping shortage events
+add up, so two sick calls for one nurse each lose two nurses,
+and losing the whole roster leaves the ward with no nurse at
+all (load factor 4.0). The staffing summary carries the
+current shortage (`"shortage"`, empty when the roster is
+whole) alongside the rostered staff and the escalation
+nurses, in every snapshot, WebSocket frame, `GET /staffing`,
+and the run summary (`--summary`). Only lost nurses change
+the modelled care: a lost doctor or tech is recorded in the
+summary but slows nothing, because the model keys response
+times off nurses alone. See `scenarios/staff-shortage.json`
+for a runnable example: over a seeded 70-tick run one nurse
+is out from 10 s to 40 s during an alarm storm on beds 0-2,
+the load factor sits at 1.5 for the window and 1.0 either
+side of it, and all 15 storm alarms are acknowledged in
+45.0 s on average instead of 30.0 s.
 
 ## Triage / ED intake queue
 
@@ -1798,7 +1846,7 @@ endpoints returned 503 while it lasted, the ticks did not stop.
 make test
 ```
 
-345 tests: vitals stay inside plausible ranges, dropout actually stops a
+387 tests: vitals stay inside plausible ranges, dropout actually stops a
 monitor's stream, an alarm storm produces alarms, stale readings freeze,
 a partition blocks the snapshot endpoint, the HTTP endpoints serve valid
 JSON, the stream serves JSON lines, scenario files validate, alarm
@@ -1827,7 +1875,12 @@ alarm storm proving one nurse for twelve beds triples mean time-to-ack
 (90.0 s vs 30.0 s) and delays vitals checks (24 delayed vs 0),
 staffing in snapshots and ward summaries, the `/staffing` endpoint
 (503 while partitioned), and the `staffing.json` scenario loading with
-per-shift rosters. Turnover tests cover discharge moving a bed to
+per-shift rosters. Staff-shortage tests cover config validation, the
+load factor rising for the shortage window only, alarms acked slower
+while a nurse is out, losing the whole roster, overlapping shortages
+adding up, the shortage in the staffing summary, the endpoint, and
+the run summary, and the `staff-shortage.json` scenario loading with
+all 15 storm alarms acked in 45.0 s. Turnover tests cover discharge moving a bed to
 cleaning and stopping its readings, a discharged bed refusing
 re-admission until turnover finishes and then taking a new patient
 with fresh vitals, per-bed turnover counts and total cleaning time,
@@ -2402,3 +2455,12 @@ run.
   `"sensor_drift"` object in every snapshot, WebSocket frame, a
   `GET /sensor-drift` endpoint, and the run summary) — done in
   v0.45.0
+- Staff shortage (a `staff_shortage` chaos event takes staff off
+  the effective roster for a window — a nurse calling in sick
+  mid-shift — so the nurse-to-patient ratio rises and the load
+  factor, alarm acknowledgement, vitals checks, and medication
+  timing all slow exactly as a thin roster would, with
+  overlapping events adding up and the whole roster lost leaving
+  the no-nurse factor; the current shortage rides in the
+  staffing summary — every snapshot, WebSocket frame,
+  `GET /staffing`, and the run summary) — done in v0.46.0

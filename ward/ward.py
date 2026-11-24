@@ -270,6 +270,11 @@ class Ward:
         dt = dt if dt is not None else 1.0 / self.rate_hz
         self.elapsed = round(self.elapsed + dt, 3)
         self.chaos.apply(self, self.elapsed, dt)
+        # Staff shortage: staff lost to an active shortage event
+        # come off the effective roster before anything in this
+        # tick reads the load factor, so alarms raised and checks
+        # scheduled now already feel the sick call.
+        self.staffing.shortage = self.chaos.shortage(self, self.elapsed)
         # Discharge planning: orders due now are placed, and orders
         # whose expected time has arrived are discharged — or queued
         # behind a full cleaning roster until a slot frees up.
