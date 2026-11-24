@@ -280,6 +280,9 @@ def summarize(path):
                 "auto_cancelled": last_discharge.get("auto_cancelled", 0),
                 "total_delay_s": last_discharge["total_delay_s"],
                 "mean_delay_s": last_discharge["mean_delay_s"],
+                "cleaning_queue": last_discharge.get(
+                    "cleaning_queue", []
+                ),
                 "timing": last_discharge.get(
                     "timing",
                     {

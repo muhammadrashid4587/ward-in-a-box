@@ -137,6 +137,12 @@ python3 -m ward.cli scenarios/discharge-auto-order-lead-time.json --seed 42
 # cleaning slot
 python3 -m ward.cli scenarios/discharge-auto-order-priority.json --seed 42
 
+# Queued cleaning in NEWS2 priority order: two discharges queue
+# behind one cleaning slot, but the safest (NEWS2 0, due 12 s)
+# starts cleaning at 15 s ahead of the sicker one (NEWS2 2,
+# due 10 s), which waits until 25 s
+python3 -m ward.cli scenarios/discharge-cleaning-priority.json --seed 42
+
 # Early warning: a hypoxic patient sits at medium NEWS2 risk, a
 # febrile patient deteriorates on its own, and an alarm storm at
 # 10 s pushes the febrile patient to high risk
@@ -897,7 +903,9 @@ or `"auto"` — and, for a cancelled order, when it was withdrawn
 and why, `cancelled_t` and `cancel_reason`), how many were
 planned, discharged, delayed, and cancelled, and the total and
 mean delay, plus the cleaning capacity,
-how many beds are cleaning, and how many are awaiting a slot. The same
+how many beds are cleaning, and how many are awaiting a slot,
+in the order cleaning will start them (`cleaning_queue`,
+discharge-priority order, safest first). The same
 summary is served by `GET /discharge` and carried in every
 WebSocket frame, and the run summary (`--summary`) reports the
 discharge totals. See `scenarios/discharge.json` for a runnable
@@ -1054,11 +1062,16 @@ it. The ordering only applies within a tick — a bed that flags
 ready later still gets its order later, however safe it is — and
 it only applies to orders the ward raises itself: scheduled and
 manual orders keep the order they were placed in. A queued
-discharge that is waiting for a cleaning slot still starts
-cleaning in expected-time order (bed order on a tie), so among
-patients delayed by the same backlog the slot order is unchanged;
-the priority order decides who gets the first slot, not the
-queue behind it. See
+discharge that is waiting for a cleaning slot also starts
+cleaning in discharge-priority order — lowest NEWS2 at the flip
+that made the bed ready first, ties by earliest flip then bed —
+not in expected-time order, so among patients delayed by the
+same backlog the safest patient gets the next slot even when
+their discharge was due later; a bed that never flagged ready
+has no NEWS2 at a flip and waits behind every ready bed, in
+expected-time then bed order. The queue is visible in the
+discharge summary (`cleaning_queue`, in start order) and the run
+summary (`--summary`). See
 `scenarios/discharge-auto-order-priority.json` for a runnable
 example: over a seeded 40-tick run with a 5-second window, a
 5-second lead time, and one cleaning slot, beds 0, 1, and 2 all
@@ -1066,7 +1079,13 @@ flag ready at 5 s — bed 1 at NEWS2 0, bed 0 at NEWS2 3 (stable
 vitals, responds only to voice), bed 2 at NEWS2 4 (tachycardic)
 — so the orders are raised 1, 0, 2, bed 1 discharges at 10 s
 with no delay, bed 0 at 20 s, and bed 2 at 30 s, 30 s of delay
-in total.
+in total. See `scenarios/discharge-cleaning-priority.json` for
+the queued case: over a seeded 40-tick run with one cleaning
+slot, bed 0 discharges at 5 s and cleans until 15 s, bed 1
+(tachycardic, NEWS2 2 at its flip) is due at 10 s and bed 2
+(stable, NEWS2 0) at 12 s, so both queue — but bed 2 takes the
+slot freed at 15 s and leaves 3 s late, while bed 1 waits until
+25 s, 15 s late, 18 s of delay in total.
 
 ## Discharge-readiness hooks
 

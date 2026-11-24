@@ -276,9 +276,9 @@ class Ward:
         self.discharge_planner.tick(self.elapsed, self)
         # Cleaning slots freed by now (a bed's turnover ends when
         # ``now`` reaches its cleaning time, by the state check, not
-        # by the monitor loop below) go to queued discharges,
-        # earliest expected discharge first — before the monitor loop
-        # runs, so the snapshot is consistent within the tick.
+        # by the monitor loop below) go to queued discharges, in
+        # discharge-priority order — before the monitor loop runs,
+        # so the snapshot is consistent within the tick.
         self._start_queued_cleanings()
         if self.timeline is not None:
             for i, m in enumerate(self.monitors):
@@ -506,21 +506,77 @@ class Ward:
         m.discharge(self.elapsed, self.cleaning_s)
         return "discharged"
 
-    def _start_queued_cleanings(self):
-        """Start cleaning for discharges queued behind a full roster.
+    def _last_ready_flip(self, monitor):
+        """The monitor's latest flip to discharge-ready, or None.
 
-        Earliest expected discharge first; each one frees its patient
-        from the bed and tells the discharge planner the order is
-        complete, with its delay.
+        The flip carries the NEWS2 score at the moment the bed was
+        flagged ready — the stable, recorded value the
+        discharge-priority ranking uses, not the score drifting
+        tick by tick.
+        """
+        flips = [e for e in monitor.readiness_history if e["ready"]]
+        return flips[-1] if flips else None
+
+    def _queued_cleaning_monitors(self):
+        """Beds queued for cleaning, in the order cleaning starts.
+
+        Discharge-priority order — the same ranking the
+        discharge-priority view serves: lowest NEWS2 at the flip
+        that made the bed ready first, ties by earliest flip then
+        bed — so when several beds queue behind a full roster the
+        safest patient gets the next slot, not the one whose
+        discharge was due first. A bed that never flagged ready
+        has no NEWS2 at a flip and sorts after every ready bed,
+        in expected-discharge then bed order, exactly as before.
         """
         queued = [m for m in self.monitors if m.awaiting_cleaning]
-        queued.sort(
-            key=lambda m: (
+
+        def key(m):
+            flip = self._last_ready_flip(m)
+            news2 = flip["news2"] if flip is not None else None
+            return (
+                news2["score"] if news2 is not None else 1e9,
+                flip["ready_t"] if flip is not None else 1e9,
                 m.pending_since if m.pending_since is not None else 0,
                 m.bed_id,
             )
-        )
-        for m in queued:
+
+        queued.sort(key=key)
+        return queued
+
+    def cleaning_queue(self):
+        """Beds awaiting a cleaning slot, in the order cleaning
+        will start them — see :meth:`_queued_cleaning_monitors`.
+
+        Each entry carries the bed, the NEWS2 at the flip that
+        made it ready (null when it never flagged ready), when it
+        flagged ready, and when its discharge was expected.
+        """
+        queue = []
+        for m in self._queued_cleaning_monitors():
+            flip = self._last_ready_flip(m)
+            news2 = flip["news2"] if flip is not None else None
+            queue.append(
+                {
+                    "bed": m.bed_id,
+                    "news2_at_flip": (
+                        news2["score"] if news2 is not None else None
+                    ),
+                    "ready_t": flip["ready_t"] if flip is not None else None,
+                    "expected_t": m.pending_since,
+                }
+            )
+        return queue
+
+    def _start_queued_cleanings(self):
+        """Start cleaning for discharges queued behind a full roster.
+
+        In discharge-priority order (see
+        :meth:`_queued_cleaning_monitors`); each one frees its
+        patient from the bed and tells the discharge planner the
+        order is complete, with its delay.
+        """
+        for m in self._queued_cleaning_monitors():
             if (
                 self.cleaning_capacity is not None
                 and self.cleaning_active_count(self.elapsed)
@@ -850,13 +906,21 @@ class Ward:
         return self._monitor(bed_id).news2_history_detail(self.elapsed)
 
     def discharge_summary(self):
-        """Planned discharges, cleaning capacity, and queued beds."""
+        """Planned discharges, cleaning capacity, and queued beds.
+
+        ``cleaning_queue`` lists the beds awaiting a cleaning slot
+        in the order cleaning will start them — discharge-priority
+        order, safest first (see :meth:`cleaning_queue`) — so a
+        client can see who is next for a slot, not just how many
+        are waiting.
+        """
         summary = self.discharge_planner.summary(self.elapsed)
         summary["cleaning_capacity"] = self.cleaning_capacity
         summary["cleaning_active"] = self.cleaning_active_count(self.elapsed)
         summary["awaiting_cleaning"] = sum(
             1 for m in self.monitors if m.awaiting_cleaning
         )
+        summary["cleaning_queue"] = self.cleaning_queue()
         return summary
 
     def admit(self, bed_id, profile=None, acuity=None, on_oxygen=None, consciousness=None):

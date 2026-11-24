@@ -4348,6 +4348,155 @@ class TestAutoOrderLeadTime(unittest.TestCase):
             os.unlink(path)
 
 
+class TestCleaningPriority(unittest.TestCase):
+    def test_scenario_discharge_cleaning_priority(self):
+        cfg = load_scenario(
+            os.path.join(
+                HERE, "..", "scenarios",
+                "discharge-cleaning-priority.json",
+            )
+        )
+        self.assertEqual(cfg["cleaning_capacity"], 1)
+        ward = build_ward(cfg, seed=42)
+        for _ in range(6):
+            ward.tick()
+        # Bed 0 is gone at 5 s; beds 1 and 2 flag ready at 5 s —
+        # bed 2 the safest (stable, Alert — 0), bed 1 at 2
+        # (tachycardic).
+        priority = ward.discharge_priority_summary()["beds"]
+        self.assertEqual(
+            [(e["bed"], e["news2_at_flip"]) for e in priority],
+            [(2, 0), (1, 2)],
+        )
+        for _ in range(7):
+            ward.tick()
+        # Both beds are queued behind bed 0's cleaning (until
+        # 15 s), and the queue is in discharge-priority order —
+        # bed 2 ahead of bed 1 — even though bed 1's discharge
+        # was due first (10 s against 12 s).
+        self.assertEqual(
+            ward.discharge_summary()["cleaning_queue"],
+            [
+                {
+                    "bed": 2,
+                    "news2_at_flip": 0,
+                    "ready_t": 5.0,
+                    "expected_t": 12.0,
+                },
+                {
+                    "bed": 1,
+                    "news2_at_flip": 2,
+                    "ready_t": 5.0,
+                    "expected_t": 10.0,
+                },
+            ],
+        )
+        self.assertEqual(
+            [
+                b["bed"]
+                for b in ward.snapshot()["discharge"]["cleaning_queue"]
+            ],
+            [2, 1],
+        )
+        for _ in range(27):
+            ward.tick()
+        summary = ward.discharge_summary()
+        self.assertEqual(summary["planned"], 3)
+        self.assertEqual(summary["discharged"], 3)
+        self.assertEqual(summary["delayed"], 2)
+        self.assertEqual(summary["total_delay_s"], 18.0)
+        # The safest patient (bed 2) takes the slot freed at 15 s
+        # and leaves 3 s late; bed 1 waits until 25 s, 15 s late.
+        # In expected-time order bed 1 would have gone first, at
+        # 15 s, and bed 2 at 25 s.
+        self.assertEqual(
+            [
+                (o["bed"], o["ordered_t"], o["expected_t"],
+                 o["actual_t"], o["delay_s"], o["status"], o["source"])
+                for o in summary["orders"]
+            ],
+            [
+                (0, 0.0, 5.0, 5.0, 0.0, "discharged", "scheduled"),
+                (1, 0.0, 10.0, 25.0, 15.0, "discharged", "scheduled"),
+                (2, 0.0, 12.0, 15.0, 3.0, "discharged", "scheduled"),
+            ],
+        )
+        self.assertEqual(summary["cleaning_queue"], [])
+
+    def test_cleaning_queue_in_recorder_summary(self):
+        cfg = load_scenario(
+            os.path.join(
+                HERE, "..", "scenarios",
+                "discharge-cleaning-priority.json",
+            )
+        )
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".jsonl", delete=False
+        ) as f:
+            path = f.name
+        try:
+            with Recorder(path, cfg["beds"], cfg["rate_hz"], seed=42) as rec:
+                ward = build_ward(cfg, seed=42, recorder=rec)
+                for _ in range(13):
+                    ward.tick()
+            summary = summarize(path)
+            self.assertEqual(
+                [
+                    b["bed"]
+                    for b in summary["discharge"]["cleaning_queue"]
+                ],
+                [2, 1],
+            )
+        finally:
+            os.unlink(path)
+
+    def test_never_ready_bed_sorts_after_ready_beds(self):
+        # Bed 1 never flags ready: an alarm storm keeps its vitals
+        # out of band, so it has no NEWS2 at a flip and sorts after
+        # every ready bed — even though its discharge was due first.
+        ward = Ward(
+            beds=3,
+            profiles=["stable", "stable", "stable"],
+            cleaning_capacity=1,
+            cleaning_s=10,
+            discharge_readiness={"stable_window_s": 5},
+            chaos=[ChaosEvent("alarm_storm", 0, 30, bed=1)],
+            seed=42,
+        )
+        ward.tick()  # t=1
+        ward.discharge(0)  # cleaning 1-11 s
+        ward.tick()  # t=2
+        ward.discharge(1)  # queued, expected 2 s, never ready
+        for _ in range(4):
+            ward.tick()  # t=6: bed 2 flagged ready at 5 s
+        ward.discharge(2)  # queued, expected 6 s, NEWS2 0 at flip
+        for _ in range(4):
+            ward.tick()  # t=10
+        self.assertEqual(
+            ward.discharge_summary()["cleaning_queue"],
+            [
+                {
+                    "bed": 2,
+                    "news2_at_flip": 0,
+                    "ready_t": 5.0,
+                    "expected_t": 6.0,
+                },
+                {
+                    "bed": 1,
+                    "news2_at_flip": None,
+                    "ready_t": None,
+                    "expected_t": 2.0,
+                },
+            ],
+        )
+        ward.tick()  # t=11: bed 2 takes the freed slot, bed 1 waits
+        self.assertEqual(ward.monitors[2].cleaning_until, 21.0)
+        self.assertTrue(ward.monitors[1].awaiting_cleaning)
+        for _ in range(10):
+            ward.tick()  # t=21: bed 1 starts cleaning
+        self.assertEqual(ward.monitors[1].cleaning_until, 31.0)
+
+
 class TestDischargeTiming(unittest.TestCase):
     def _ward(self, beds=1, cleaning_s=10.0, **kw):
         return Ward(

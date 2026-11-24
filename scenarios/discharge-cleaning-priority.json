@@ -1,0 +1,1 @@
+{"beds":3,"cleaning_capacity":1,"cleaning_s":10,"discharge_planning":{"lead_time_s":5,"orders":[{"at":0,"bed":0,"lead_time_s":5},{"at":0,"bed":1,"lead_time_s":10},{"at":0,"bed":2,"lead_time_s":12}]},"discharge_readiness":{"stable_window_s":5},"patients":[{"bed":0,"profile":"stable"},{"bed":1,"profile":"tachycardic"},{"bed":2,"profile":"stable"}],"rate_hz":1.0}
