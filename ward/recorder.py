@@ -93,7 +93,10 @@ def summarize(path):
     the mean and longest time from an escalation raising to the
     response landing — and NEWS2 history
     totals per bed: ticks scored, peak score and risk, and ticks at
-    each risk level.
+    each risk level — and medication totals from the last tick:
+    doses given, late, missed, and skipped for a stockout, and
+    whether the missed-dose hooks are configured and how many hook
+    deliveries were invoked and failed.
     Returns ``None`` fields for a recording with no ticks.
     """
     header = None
@@ -109,6 +112,7 @@ def summarize(path):
     last_discharge = None
     last_readiness = None
     last_early_warning = None
+    last_meds = None
     with open(path) as f:
         for line in f:
             line = line.strip()
@@ -127,6 +131,8 @@ def summarize(path):
             last_t = t
             if isinstance(obj.get("triage"), dict):
                 last_triage = obj["triage"]
+            if isinstance(obj.get("meds"), dict):
+                last_meds = obj["meds"]
             if isinstance(obj.get("discharge"), dict):
                 last_discharge = obj["discharge"]
             if isinstance(obj.get("discharge_readiness"), dict):
@@ -267,6 +273,30 @@ def summarize(path):
                 ),
             }
             if last_discharge is not None
+            else None
+        ),
+        # Medication totals from the last tick: doses given, late,
+        # missed, and skipped for a stockout — and whether the
+        # missed-dose hooks are configured and how many hook
+        # deliveries were invoked, failed, retried, and delivered.
+        "meds": (
+            {
+                "total_given": last_meds["total_given"],
+                "total_late": last_meds["total_late"],
+                "total_missed": last_meds["total_missed"],
+                "total_stockout": last_meds["total_stockout"],
+                "missed_dose_hooks": last_meds.get(
+                    "missed_dose_hooks",
+                    {
+                        "configured": False,
+                        "invoked": 0,
+                        "failed": 0,
+                        "retries": 0,
+                        "delivered": 0,
+                    },
+                ),
+            }
+            if last_meds is not None
             else None
         ),
         # Discharge-readiness totals from the last tick: how many

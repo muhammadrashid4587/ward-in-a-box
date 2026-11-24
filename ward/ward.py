@@ -7,6 +7,7 @@ import time
 from .alert_hooks import (
     validate_boarding_full_hooks,
     validate_escalation_hooks,
+    validate_missed_dose_hooks,
     validate_trend_alert_hooks,
     validate_wait_time_hooks,
 )
@@ -39,7 +40,7 @@ class Ward:
     snapshot to a JSONL file.
     """
 
-    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None, cleaning_s=30.0, meds=None, triage=None, discharge_planning=None, cleaning_capacity=None, discharge_readiness=None, oxygen=None, consciousness=None, consciousness_dynamics=None, news2_trend=None, trend_alert_hooks=None, escalation_hooks=None, boarding_full_hooks=None, wait_time_hooks=None):
+    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None, cleaning_s=30.0, meds=None, triage=None, discharge_planning=None, cleaning_capacity=None, discharge_readiness=None, oxygen=None, consciousness=None, consciousness_dynamics=None, news2_trend=None, trend_alert_hooks=None, escalation_hooks=None, boarding_full_hooks=None, wait_time_hooks=None, missed_dose_hooks=None):
         if not 1 <= beds <= 64:
             raise ValueError("beds must be 1..64")
         if rate_hz <= 0:
@@ -92,6 +93,14 @@ class Ward:
         # triage queue owns the object from here on, exactly like
         # the boarding-full hooks above.
         self.wait_time_hooks = validate_wait_time_hooks(wait_time_hooks)
+        # Missed-dose hooks: one shared object for the whole ward
+        # (a webhook URL and/or an in-process callback), invoked
+        # when a dose is missed or skipped for a stockout. Off by
+        # default. Each monitor's schedule owns the object from
+        # here on, exactly like the trend-alert hooks above.
+        self.missed_dose_hooks = validate_missed_dose_hooks(
+            missed_dose_hooks
+        )
         if discharge_planning is None:
             self.discharge_planner = DischargePlanner()
         elif isinstance(discharge_planning, DischargePlanner):
@@ -187,7 +196,7 @@ class Ward:
                 and i < len(consciousness_dynamics)
                 else None
             )
-            monitor = Monitor(i, profile, rng=self.rng, acuity=acuity, meds=bed_meds, on_oxygen=on_oxygen, consciousness=bed_consciousness, consciousness_dynamics=bed_dynamics, news2_trend=self.news2_trend, trend_alert_hooks=self.trend_alert_hooks, escalation_hooks=self.escalation_hooks)
+            monitor = Monitor(i, profile, rng=self.rng, acuity=acuity, meds=bed_meds, on_oxygen=on_oxygen, consciousness=bed_consciousness, consciousness_dynamics=bed_dynamics, news2_trend=self.news2_trend, trend_alert_hooks=self.trend_alert_hooks, escalation_hooks=self.escalation_hooks, missed_dose_hooks=self.missed_dose_hooks)
             # With a timeline, beds start unadmitted and come online as
             # the timeline admits them; without one, all beds start open.
             if timeline is not None:
@@ -561,7 +570,13 @@ class Ward:
         }
 
     def meds_summary(self):
-        """Per-bed medication state and ward dose totals."""
+        """Per-bed medication state and ward dose totals.
+
+        ``missed_dose_hooks`` carries the missed-dose hook totals:
+        whether any hook is configured, how many hook deliveries
+        were invoked, how many failed, how many retries were spent,
+        and how many deliveries eventually landed.
+        """
         beds = [m.meds.summary(self.elapsed) for m in self.monitors]
         return {
             "t": self.elapsed,
@@ -571,6 +586,7 @@ class Ward:
             "total_missed": sum(b["doses"]["missed"] for b in beds),
             "total_stockout": sum(b["doses"]["stockout"] for b in beds),
             "total_warnings": sum(len(b["warnings"]) for b in beds),
+            "missed_dose_hooks": self.missed_dose_hooks.summary(),
         }
 
     def staffing_summary(self):

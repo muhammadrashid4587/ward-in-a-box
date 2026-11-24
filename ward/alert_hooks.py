@@ -21,9 +21,13 @@ patient's NEWS2 risk leaving low) fires the ward's
 patient diverted while ED boarding is full) fires the ward's
 ``boarding_full_hooks``; a wait-time alarm raising (a waiting
 patient passing their acuity's wait threshold) fires the ward's
-``wait_time_hooks``. All four share the same ``AlertHooks``
-machinery — the same webhook and callback channels, the same
-best-effort delivery — just a different event payload.
+``wait_time_hooks``; a dose missed — given up on because the ward
+was too thin to give it inside its grace window, or skipped
+because the pharmacy was out of that medication — fires the
+ward's ``missed_dose_hooks``. All five share the same
+``AlertHooks`` machinery — the same webhook and callback
+channels, the same best-effort delivery — just a different
+event payload.
 
 A fired event records whether the hook was invoked (``"hook_invoked"``
 on the alert or episode, False when no hook is configured) and any
@@ -150,12 +154,23 @@ def validate_wait_time_hooks(value):
     return _validate_hooks(value, "wait-time", "wait_time_hooks")
 
 
+def validate_missed_dose_hooks(value):
+    """Normalize a missed-dose hook config (see :func:`_validate_hooks`).
+
+    Fires when a dose is missed — its grace window expired before
+    the ward could give it, or it was skipped because the pharmacy
+    was out of that medication — rather than when a NEWS2 event
+    fires.
+    """
+    return _validate_hooks(value, "missed-dose", "missed_dose_hooks")
+
+
 class AlertHooks:
     """The configured hooks for one ward event, shared by its monitors.
 
     ``kind`` labels the event in log messages (``"trend-alert"``,
-    ``"escalation"``, ``"boarding-full"``, or ``"wait-time"``); it
-    changes nothing about delivery.
+    ``"escalation"``, ``"boarding-full"``, ``"wait-time"``, or
+    ``"missed-dose"``); it changes nothing about delivery.
     """
 
     def __init__(self, webhook_url=None, callback=None,

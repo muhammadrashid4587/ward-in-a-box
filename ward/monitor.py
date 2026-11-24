@@ -3,7 +3,11 @@
 import random
 from collections import deque
 
-from .alert_hooks import validate_escalation_hooks, validate_trend_alert_hooks
+from .alert_hooks import (
+    validate_escalation_hooks,
+    validate_missed_dose_hooks,
+    validate_trend_alert_hooks,
+)
 from .meds import MedSchedule
 from .news2 import (
     ACVPU_LEVELS,
@@ -45,7 +49,7 @@ class Monitor:
     seconds); the monitor clears each one when its time passes.
     """
 
-    def __init__(self, bed_id, profile="stable", rng=None, acuity=3, meds=None, on_oxygen=False, consciousness="alert", consciousness_dynamics=None, news2_trend=None, trend_alert_hooks=None, escalation_hooks=None):
+    def __init__(self, bed_id, profile="stable", rng=None, acuity=3, meds=None, on_oxygen=False, consciousness="alert", consciousness_dynamics=None, news2_trend=None, trend_alert_hooks=None, escalation_hooks=None, missed_dose_hooks=None):
         self.bed_id = bed_id
         self.profile = profile
         self.acuity = validate_acuity(acuity)
@@ -68,6 +72,15 @@ class Monitor:
         # Shared across the ward's monitors, so the ward totals
         # count every delivery.
         self.escalation_hooks = validate_escalation_hooks(escalation_hooks)
+        # Missed-dose hooks: the ward's configured webhook and/or
+        # in-process callback, invoked when one of this bed's doses
+        # is missed or skipped for a stockout. Same machinery as
+        # the trend-alert hooks, off by default. Shared across the
+        # ward's monitors, so the ward totals count every delivery.
+        # The schedule owns the object from here on.
+        self.missed_dose_hooks = validate_missed_dose_hooks(
+            missed_dose_hooks
+        )
         # Every consciousness change this stay, as
         # {"from": level, "to": level, "t": seconds}; empty while
         # dynamics are off or the level has never moved.
@@ -76,7 +89,9 @@ class Monitor:
         # direction; each resets when the risk flips.
         self._deteriorating_s = 0.0
         self._recovering_s = 0.0
-        self.meds = MedSchedule(bed_id, meds)
+        self.meds = MedSchedule(
+            bed_id, meds, missed_dose_hooks=self.missed_dose_hooks
+        )
         self.rng = rng if rng is not None else random.Random()
         self.signs = initial_signs(profile, self.rng, self.acuity)
         self.seq = 0

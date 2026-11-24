@@ -100,14 +100,34 @@ class MedSchedule:
     ``stockout``, counted separately, and also flagged in
     ``missed_active``, because a skipped dose is a missed dose from
     the patient's point of view.
+
+    A missed dose — given up on when its grace window expired, or
+    skipped for a stockout — also fires the ward's missed-dose
+    hooks, when ``missed_dose_hooks`` is configured: the same
+    webhook and/or in-process callback channels as the other ward
+    events, best effort and never fatal to the tick. The dose's
+    history entry records whether the hook was invoked
+    (``"hook_invoked"``, False with no hooks) and any synchronous
+    error (``"hook_errors"``), plus the retries and final delivery
+    outcome (``"hook_retries"``, ``"hook_final_status"``).
     """
 
-    def __init__(self, bed_id, meds=None):
+    def __init__(self, bed_id, meds=None, missed_dose_hooks=None):
+        from .alert_hooks import validate_missed_dose_hooks
+
         self.bed_id = bed_id
         self.meds = [validate_med(m) for m in (meds or [])]
         names = [m["name"].lower() for m in self.meds]
         if len(set(names)) != len(names):
             raise ValueError("bed %d: duplicate medication names" % bed_id)
+        # Missed-dose hooks: the ward's configured webhook and/or
+        # in-process callback, invoked when a dose is missed or
+        # skipped for a stockout. Off by default — no hooks, no
+        # invocation, no behaviour change. Shared across the ward's
+        # schedules, so the ward totals count every delivery.
+        self.missed_dose_hooks = validate_missed_dose_hooks(
+            missed_dose_hooks
+        )
         self.warnings = interaction_warnings(self.meds)
         self._next_due = {m["name"]: m["first_at"] for m in self.meds}
         self._grace = {m["name"]: m["grace_s"] for m in self.meds}
@@ -153,12 +173,12 @@ class MedSchedule:
                 due_t = round(self._next_due[name], 3)
                 self._next_due[name] = round(due_t + self._every[name], 3)
                 if name in self.stockout_active:
-                    self.history.append(
-                        {"med": name, "due_t": due_t, "admin_t": None,
-                         "status": "stockout", "delay_s": None}
-                    )
+                    entry = {"med": name, "due_t": due_t, "admin_t": None,
+                             "status": "stockout", "delay_s": None}
+                    self.history.append(entry)
                     self.stockout += 1
                     self.missed_active.add(name)
+                    self._fire_missed_dose(entry, "stockout", now)
                     continue
                 delay = round(BASE_ADMIN_S * load_factor, 3)
                 admin_t = round(due_t + delay, 3)
@@ -188,12 +208,40 @@ class MedSchedule:
                         self.late += 1
                     self.missed_active.discard(pending["med"])
                 else:
-                    self.history.append(
-                        {"med": pending["med"], "due_t": pending["due_t"],
-                         "admin_t": None, "status": "missed", "delay_s": None}
-                    )
+                    entry = {"med": pending["med"], "due_t": pending["due_t"],
+                             "admin_t": None, "status": "missed",
+                             "delay_s": None}
+                    self.history.append(entry)
                     self.missed += 1
                     self.missed_active.add(pending["med"])
+                    self._fire_missed_dose(entry, "staffing", now)
+
+    def _fire_missed_dose(self, entry, reason, now):
+        """Invoke the missed-dose hooks for one missed dose.
+
+        ``reason`` is ``"staffing"`` when the grace window expired
+        before the ward could give the dose, ``"stockout"`` when
+        the pharmacy was out of that medication. The dose's history
+        entry is the record: it carries whether the hook was
+        invoked, any synchronous error, and the retries and final
+        delivery outcome, so a snapshot, a recording, or the run
+        summary can say whether the miss reached the outside
+        world. A hook failure is logged and counted, never fatal
+        to the tick.
+        """
+        result = self.missed_dose_hooks.fire(
+            {
+                "event": "missed_dose",
+                "bed": self.bed_id,
+                "med": entry["med"],
+                "due_t": entry["due_t"],
+                "missed_t": round(now, 3),
+                "reason": reason,
+            },
+            record=entry,
+        )
+        entry["hook_invoked"] = result["invoked"]
+        entry["hook_errors"] = result["errors"]
 
     def orders_complete(self):
         """True when no medication order is outstanding: no dose

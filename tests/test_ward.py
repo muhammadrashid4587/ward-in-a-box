@@ -22,6 +22,7 @@ from ward.alert_hooks import (
     TrendAlertHooks,
     validate_boarding_full_hooks,
     validate_escalation_hooks,
+    validate_missed_dose_hooks,
     validate_trend_alert_hooks,
     validate_wait_time_hooks,
 )
@@ -6723,6 +6724,298 @@ class TestWaitTimeHooks(unittest.TestCase):
             hooks = summary["triage"]["wait_time_hooks"]
             self.assertEqual(
                 hooks, {"configured": True, "invoked": 2, "failed": 0, "retries": 0, "delivered": 2}
+            )
+        finally:
+            os.unlink(path)
+
+
+class TestMissedDoseHooks(unittest.TestCase):
+    def _ward(self, hooks=None):
+        # No nurse on shift: a dose takes 120 s to administer, so
+        # time-critical insulin (60 s grace) is missed at 60 s
+        # while metoprolol (600 s grace) is given at 120 s.
+        return Ward(
+            beds=2,
+            staffing=Staffing(day={"nurse": 0, "doctor": 1, "tech": 0}),
+            meds=[
+                [
+                    {
+                        "name": "insulin",
+                        "every_s": 3600,
+                        "first_at": 0,
+                        "grace_s": 60,
+                    }
+                ],
+                [{"name": "metoprolol", "every_s": 3600, "first_at": 0}],
+            ],
+            missed_dose_hooks=hooks,
+            seed=42,
+        )
+
+    def test_validate_missed_dose_hooks(self):
+        hooks = validate_missed_dose_hooks(None)
+        self.assertIsInstance(hooks, TrendAlertHooks)
+        self.assertFalse(hooks.configured)
+        self.assertEqual(hooks.kind, "missed-dose")
+        custom = validate_missed_dose_hooks(
+            {"webhook_url": "https://example.invalid/hooks", "timeout_s": 2}
+        )
+        self.assertTrue(custom.configured)
+        self.assertEqual(custom.kind, "missed-dose")
+        self.assertEqual(custom.timeout_s, 2.0)
+        seen = []
+        append = seen.append
+        cb = validate_missed_dose_hooks({"callback": append})
+        self.assertTrue(cb.configured)
+        self.assertIs(cb.callback, append)
+        with self.assertRaises(ValueError):
+            validate_missed_dose_hooks({"webhook_url": "ftp://x/hooks"})
+        with self.assertRaises(ValueError):
+            validate_missed_dose_hooks({"callback": "not callable"})
+        with self.assertRaises(ValueError):
+            validate_missed_dose_hooks({"timeout_s": 0})
+        with self.assertRaises(ValueError):
+            validate_missed_dose_hooks({"url": "http://x/hooks"})
+        with self.assertRaises(ValueError):
+            validate_missed_dose_hooks("http://x/hooks")
+
+    def test_hooks_off_by_default(self):
+        # No hooks configured: the dose is still missed, and its
+        # history entry records that no hook was invoked.
+        ward = self._ward()
+        self.assertFalse(ward.missed_dose_hooks.configured)
+        for _ in range(60):
+            ward.tick()  # t=60: grace expires, dose missed
+        summary = ward.meds_summary()
+        self.assertEqual(summary["total_missed"], 1)
+        self.assertEqual(
+            summary["missed_dose_hooks"],
+            {"configured": False, "invoked": 0, "failed": 0, "retries": 0, "delivered": 0},
+        )
+        entry = summary["beds"][0]["history"][0]
+        self.assertEqual(entry["status"], "missed")
+        self.assertFalse(entry["hook_invoked"])
+        self.assertEqual(entry["hook_errors"], [])
+        self.assertEqual(entry["hook_retries"], 0)
+        self.assertEqual(entry["hook_final_status"], "not_invoked")
+        self.assertEqual(
+            ward.snapshot()["meds"]["missed_dose_hooks"],
+            summary["missed_dose_hooks"],
+        )
+
+    def test_callback_hook_invoked_on_missed_dose(self):
+        seen = []
+        ward = self._ward({"callback": seen.append})
+        self.assertTrue(ward.missed_dose_hooks.configured)
+        for _ in range(60):
+            ward.tick()  # t=60: insulin missed
+        self.assertEqual(len(seen), 1)
+        payload = seen[0]
+        self.assertEqual(payload["event"], "missed_dose")
+        self.assertEqual(payload["bed"], 0)
+        self.assertEqual(payload["med"], "insulin")
+        self.assertEqual(payload["due_t"], 0.0)
+        self.assertEqual(payload["missed_t"], 60.0)
+        self.assertEqual(payload["reason"], "staffing")
+        # The dose's history entry records the invocation.
+        entry = ward.meds_summary()["beds"][0]["history"][0]
+        self.assertTrue(entry["hook_invoked"])
+        self.assertEqual(entry["hook_errors"], [])
+        self.assertEqual(entry["hook_final_status"], "delivered")
+        # One invocation, no failure, in the ward totals.
+        summary = ward.meds_summary()["missed_dose_hooks"]
+        self.assertEqual(
+            summary, {"configured": True, "invoked": 1, "failed": 0, "retries": 0, "delivered": 1}
+        )
+        # The metoprolol dose is given at 120 s: a given dose
+        # fires nothing.
+        for _ in range(60):
+            ward.tick()  # t=120
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(ward.meds_summary()["total_given"], 1)
+
+    def test_stockout_skip_fires_hook_with_stockout_reason(self):
+        seen = []
+        ward = Ward(
+            beds=1,
+            meds=[[{"name": "insulin", "every_s": 3600, "first_at": 10}]],
+            chaos=[ChaosEvent("stockout", 5, 3600, bed=0, med="insulin")],
+            missed_dose_hooks={"callback": seen.append},
+            seed=42,
+        )
+        for _ in range(10):
+            ward.tick()  # t=10: insulin due, pharmacy is out
+        self.assertEqual(len(seen), 1)
+        payload = seen[0]
+        self.assertEqual(payload["event"], "missed_dose")
+        self.assertEqual(payload["bed"], 0)
+        self.assertEqual(payload["med"], "insulin")
+        self.assertEqual(payload["due_t"], 10.0)
+        self.assertEqual(payload["missed_t"], 10.0)
+        self.assertEqual(payload["reason"], "stockout")
+        entry = ward.meds_summary()["beds"][0]["history"][0]
+        self.assertEqual(entry["status"], "stockout")
+        self.assertTrue(entry["hook_invoked"])
+        self.assertEqual(entry["hook_final_status"], "delivered")
+        self.assertEqual(
+            ward.meds_summary()["missed_dose_hooks"]["delivered"], 1
+        )
+
+    def test_callback_failure_is_not_fatal(self):
+        def boom(payload):
+            raise ValueError("pager is down")
+
+        ward = self._ward({"callback": boom})
+        for _ in range(60):
+            ward.tick()  # t=60: insulin missed
+        snap = ward.tick()  # t=61: the tick still completes
+        self.assertTrue(snap["beds"][0]["online"])
+        entry = ward.meds_summary()["beds"][0]["history"][0]
+        self.assertTrue(entry["hook_invoked"])
+        self.assertEqual(entry["hook_errors"], ["pager is down"])
+        self.assertEqual(entry["hook_final_status"], "failed")
+        summary = ward.meds_summary()["missed_dose_hooks"]
+        self.assertEqual(summary["invoked"], 1)
+        self.assertEqual(summary["failed"], 1)
+
+    def test_webhook_hook_posts_to_stub_server(self):
+        server, port, received = capture_server()
+        try:
+            ward = self._ward(
+                {"webhook_url": "http://127.0.0.1:%d/hooks" % port}
+            )
+            for _ in range(60):
+                ward.tick()  # t=60: insulin missed
+            self.assertTrue(ward.missed_dose_hooks.wait(timeout=5))
+            self.assertEqual(len(received), 1)
+            path, content_type, body = received[0]
+            self.assertEqual(path, "/hooks")
+            self.assertEqual(content_type, "application/json")
+            payload = json.loads(body)
+            self.assertEqual(payload["event"], "missed_dose")
+            self.assertEqual(payload["bed"], 0)
+            self.assertEqual(payload["med"], "insulin")
+            self.assertEqual(payload["due_t"], 0.0)
+            self.assertEqual(payload["missed_t"], 60.0)
+            self.assertEqual(payload["reason"], "staffing")
+            entry = ward.meds_summary()["beds"][0]["history"][0]
+            self.assertTrue(entry["hook_invoked"])
+            self.assertEqual(entry["hook_errors"], [])
+            self.assertEqual(entry["hook_final_status"], "delivered")
+            summary = ward.meds_summary()["missed_dose_hooks"]
+            self.assertEqual(
+                summary, {"configured": True, "invoked": 1, "failed": 0, "retries": 0, "delivered": 1}
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_webhook_failure_is_not_fatal(self):
+        # A port with nothing listening: the POST fails, the ward
+        # keeps ticking, and the failure is counted, not raised.
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        ward = self._ward(
+            {
+                "webhook_url": "http://127.0.0.1:%d/hooks" % port,
+                "timeout_s": 2,
+            }
+        )
+        for _ in range(60):
+            ward.tick()  # t=60: insulin missed
+        snap = ward.tick()  # t=61: the tick still completes
+        self.assertTrue(snap["beds"][0]["online"])
+        # The hook was invoked (dispatched), even though the
+        # delivery failed.
+        self.assertTrue(
+            ward.meds_summary()["beds"][0]["history"][0][
+                "hook_invoked"
+            ]
+        )
+        self.assertTrue(ward.missed_dose_hooks.wait(timeout=5))
+        entry = ward.meds_summary()["beds"][0]["history"][0]
+        self.assertEqual(entry["hook_final_status"], "failed")
+        summary = ward.meds_summary()["missed_dose_hooks"]
+        self.assertEqual(summary["invoked"], 1)
+        self.assertEqual(summary["failed"], 1)
+
+    def test_scenario_missed_dose_hooks(self):
+        cfg = load_scenario(
+            os.path.join(
+                HERE, "..", "scenarios", "missed-dose-hooks.json"
+            )
+        )
+        self.assertTrue(cfg["missed_dose_hooks"].configured)
+        server, port, received = capture_server()
+        try:
+            # The scenario's URL is a placeholder; point it at
+            # the stub server for this run.
+            cfg["missed_dose_hooks"] = validate_missed_dose_hooks(
+                {"webhook_url": "http://127.0.0.1:%d/hooks" % port}
+            )
+            ward = build_ward(cfg, seed=42)
+            for _ in range(3650):
+                snap = ward.tick()
+            self.assertTrue(ward.missed_dose_hooks.wait(timeout=5))
+            # Two missed doses over the run: the first insulin
+            # dose missed at 60 s because no nurse was on shift,
+            # the second skipped at 3600 s because the pharmacy
+            # was out of insulin. The deliveries run in separate
+            # daemon threads, so their arrival order at the stub
+            # is not guaranteed — sort by missed time before
+            # asserting.
+            self.assertEqual(len(received), 2)
+            payloads = sorted(
+                (json.loads(r[2]) for r in received),
+                key=lambda p: p["missed_t"],
+            )
+            self.assertEqual(
+                [p["event"] for p in payloads],
+                ["missed_dose", "missed_dose"],
+            )
+            self.assertEqual(payloads[0]["missed_t"], 60.0)
+            self.assertEqual(payloads[0]["reason"], "staffing")
+            self.assertEqual(payloads[1]["missed_t"], 3600.0)
+            self.assertEqual(payloads[1]["reason"], "stockout")
+            # Every missed dose records that its hook was invoked.
+            for entry in snap["meds"]["beds"][0]["history"]:
+                if entry["status"] in ("missed", "stockout"):
+                    self.assertTrue(entry["hook_invoked"])
+            # The totals are read from a fresh summary after the
+            # wait: the snapshot from the last tick was taken
+            # before the last delivery settled.
+            self.assertEqual(
+                ward.meds_summary()["missed_dose_hooks"],
+                {"configured": True, "invoked": 2, "failed": 0, "retries": 0, "delivered": 2},
+            )
+            self.assertEqual(ward.meds_summary()["total_missed"], 1)
+            self.assertEqual(ward.meds_summary()["total_stockout"], 1)
+            self.assertEqual(ward.meds_summary()["total_given"], 1)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_recorder_summary_carries_hook_totals(self):
+        seen = []
+        ward = self._ward({"callback": seen.append})
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".jsonl", delete=False
+        ) as f:
+            path = f.name
+        try:
+            with Recorder(path, ward.beds, ward.rate_hz, seed=42) as rec:
+                ward.recorder = rec
+                for _ in range(60):
+                    ward.tick()
+            self.assertEqual(len(seen), 1)
+            summary = summarize(path)
+            self.assertEqual(summary["meds"]["total_missed"], 1)
+            self.assertEqual(summary["meds"]["total_stockout"], 0)
+            hooks = summary["meds"]["missed_dose_hooks"]
+            self.assertEqual(
+                hooks, {"configured": True, "invoked": 1, "failed": 0, "retries": 0, "delivered": 1}
             )
         finally:
             os.unlink(path)

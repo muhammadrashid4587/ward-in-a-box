@@ -86,6 +86,13 @@ python3 -m ward.cli scenarios/boarding-full-hooks.json --seed 42
 # fatal)
 python3 -m ward.cli scenarios/wait-time-hooks.json --seed 42
 
+# Missed-dose hooks: no nurse on shift, so the insulin dose due
+# at 0 s is missed at 60 s, and the dose due at 3600 s is skipped
+# because the pharmacy is out of insulin — both POSTed to a
+# webhook (here a placeholder URL — point it at your own endpoint;
+# a dead endpoint is logged, never fatal)
+python3 -m ward.cli scenarios/missed-dose-hooks.json --seed 42
+
 # Discharge planning: three orders, one cleaning slot — two
 # discharges wait for a slot and land 10 s and 8 s late
 python3 -m ward.cli scenarios/discharge.json --seed 42
@@ -167,7 +174,8 @@ python3 -m ward.cli scenarios/example.json --seed 42
   `available`), turnovers and total cleaning time per bed, plus ward
   totals, as JSON (503 while partitioned)
 - `GET /meds` — per-bed medication schedules, interaction warnings,
-  and given/late/missed dose counts, plus ward totals, as JSON
+  and given/late/missed dose counts, plus ward totals and
+  missed-dose hook totals, as JSON
   (503 while partitioned)
 - `GET /triage` — the ED intake queue: waiting patients in priority
   order with acuity and wait so far, waiting counts per acuity,
@@ -745,6 +753,47 @@ with none configured behaves exactly as before. See
 seeded 25-tick run the same 2 wait-time alarms raise as in
 `wait-alarm.json`, POSTed to the configured webhook, with 2 hook
 deliveries invoked and 0 failed against a stub server.
+
+## Missed-dose hooks
+
+A missed dose says a patient did not get a medication they were
+due — because the ward was too thin to give it inside its grace
+window, or because the pharmacy was out of it; the hook makes sure
+something outside the ward hears about it. A ward that wants the
+outside world to hear about that moment — a pager, a dashboard, a
+pharmacist — configures missed-dose hooks, the same channels as
+the NEWS2 hooks (webhook and/or in-process callback), on the same
+best-effort, never-fatal terms:
+
+```json
+{"missed_dose_hooks": {"webhook_url": "http://127.0.0.1:18099/hooks"}}
+```
+
+The hook fires once per missed dose, in the tick the miss is
+recorded, with a `missed_dose` event payload: the bed, the
+medication, when the dose was due, when it was missed, and why —
+`"reason": "staffing"` when the grace window expired before the
+ward could give it, `"stockout"` when the pharmacy was out of
+that medication. The dose's history entry records whether the
+hook was invoked (`"hook_invoked"`, False with no hooks) and any
+synchronous error (`"hook_errors"`), and the medication summary
+carries the ward missed-dose-hook totals
+(`"missed_dose_hooks"`: whether any hook is configured, how many
+deliveries were invoked, how many failed, how many retries were
+spent, and how many deliveries eventually landed) — in
+`GET /meds`, every snapshot and WebSocket frame, and the run
+summary (`--summary`). The same retry rules as the NEWS2 hooks
+apply — a failed webhook POST is retried with backoff up to
+`"max_retries"` times, and the entry records `"hook_retries"`
+and `"hook_final_status"` alongside `"hook_invoked"`. A dose
+given on time fires nothing: only a miss reaches the outside
+world. Hooks are off by default, so a ward with none configured
+behaves exactly as before. See
+`scenarios/missed-dose-hooks.json` for a runnable example: over a
+seeded 3650-tick run with no nurse on shift the insulin dose due
+at 0 s is missed at 60 s and the dose due at 3600 s is skipped
+while the pharmacy is out, POSTed to the configured webhook, with
+2 hook deliveries invoked and 0 failed against a stub server.
 
 ## Discharge planning
 
@@ -1363,7 +1412,7 @@ endpoints returned 503 while it lasted, the ticks did not stop.
 make test
 ```
 
-297 tests: vitals stay inside plausible ranges, dropout actually stops a
+315 tests: vitals stay inside plausible ranges, dropout actually stops a
 monitor's stream, an alarm storm produces alarms, stale readings freeze,
 a partition blocks the snapshot endpoint, the HTTP endpoints serve valid
 JSON, the stream serves JSON lines, scenario files validate, alarm
@@ -1628,6 +1677,18 @@ escalation payload as JSON, a webhook to a dead port failing
 without stopping the ward and being counted, and the
 `news2-escalation-hooks.json` scenario POSTing both escalations
 to a stub server with the run summary carrying the hook totals.
+Missed-dose-hook tests cover validation of the hook config, hooks
+off by default with the dose's history entry recording no
+invocation, a callback receiving the missed-dose payload exactly
+once per missed dose (with the staffing reason when the grace
+window expired and the stockout reason when the pharmacy was
+out), a callback that raises being caught with the tick
+completing and the failure counted, a webhook POST reaching a
+local stub server with the missed-dose payload as JSON, a webhook
+to a dead port failing without stopping the ward and being
+counted, a given dose firing nothing, and the
+`missed-dose-hooks.json` scenario POSTing both missed doses to a
+stub server with the run summary carrying the hook totals.
 
 ## Roadmap
 
@@ -1814,3 +1875,14 @@ to a stub server with the run summary carrying the hook totals.
   snapshot, WebSocket frame, `GET /triage`, and the run summary
   carry the wait-time-hook totals; off by default, configured per
   ward with `wait_time_hooks` in the scenario) — done in v0.34.0
+- Missed-dose hooks (when a dose is missed — its grace window
+  expiring before the ward could give it — or skipped because the
+  pharmacy was out of that medication, the ward's configured webhook
+  URL gets a `missed_dose` event payload POSTed to it in a daemon
+  thread and/or an in-process Python callback is called in the
+  recording tick, reusing the NEWS2 hook machinery, best effort and
+  never fatal; each missed dose's history entry records whether the
+  hook was invoked, and the medication summary, every snapshot,
+  WebSocket frame, `GET /meds`, and the run summary carry the
+  missed-dose-hook totals; off by default, configured per ward with
+  `missed_dose_hooks` in the scenario) — done in v0.35.0
