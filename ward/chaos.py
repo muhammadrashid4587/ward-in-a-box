@@ -340,6 +340,12 @@ class ChaosEngine:
         # same beds is a new event, so it fires again.
         self._sensor_drift_started = set()
         self._sensor_drift_ended = set()
+        # Bed-blocker events fire their start hook once, on the
+        # first tick inside the window, and their end hook once,
+        # on the first tick after it — a second block on the
+        # same bed is a new event, so it fires again.
+        self._bed_blocker_started = set()
+        self._bed_blocker_ended = set()
 
     def stockouts(self, ward, now):
         """Active pharmacy stockouts: ``{bed_id: {med, ...}}``.
@@ -444,6 +450,25 @@ class ChaosEngine:
                 ):
                     self._sensor_drift_ended.add(id(ev))
                     ward._sensor_drift_ended(ev, now)
+            # Bed blocker: the start hook fires once, on the
+            # first tick inside the window, and the end hook
+            # once, on the first tick after it — so scenario
+            # code hears the bed go out of use and come back
+            # exactly once per event, even across a run that
+            # ticks past the end. The check runs before the
+            # active gate below, so an end is caught on the
+            # tick the window closes.
+            if ev.type == "bed_blocker":
+                if ev.active(now):
+                    if id(ev) not in self._bed_blocker_started:
+                        self._bed_blocker_started.add(id(ev))
+                        ward._bed_blocker_started(ev, now)
+                elif (
+                    id(ev) in self._bed_blocker_started
+                    and id(ev) not in self._bed_blocker_ended
+                ):
+                    self._bed_blocker_ended.add(id(ev))
+                    ward._bed_blocker_ended(ev, now)
             if not ev.active(now):
                 continue
             if ev.type == "sensor_drift":

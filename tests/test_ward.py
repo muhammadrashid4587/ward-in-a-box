@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from ward.alert_hooks import (
     TrendAlertHooks,
+    validate_bed_blocker_hooks,
     validate_boarding_full_hooks,
     validate_discharge_priority_hooks,
     validate_discharge_readiness_hooks,
@@ -10922,6 +10923,337 @@ class TestSensorDriftHooks(unittest.TestCase):
             )
             self.assertEqual(
                 run["sensor_drift"]["sensor_drift_hooks"]["invoked"], 2
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+class TestBedBlockerHooks(unittest.TestCase):
+    # Bed-blocker hooks: a block starting or ending fires the
+    # ward's bed_blocker_hooks — the same webhook/callback
+    # machinery as the NEWS2 hooks — so something outside the
+    # ward hears a bed go out of use and come back. A callback
+    # can use the start to escalate: the bed cannot take a new
+    # admission and its patient cannot be discharged until the
+    # block clears, so the ward is about to hold a discharge
+    # and turn a patient away from a bed that looks free.
+    BLOCKS = [
+        ChaosEvent(
+            "bed_blocker", at=5, duration=20, bed=1, reason="porter"
+        ),
+        ChaosEvent("discharge", at=10, bed=1),
+        ChaosEvent("discharge", at=10, bed=2),
+        ChaosEvent("discharge", at=5, bed=3),
+        ChaosEvent(
+            "bed_blocker",
+            at=12,
+            duration=18,
+            bed=3,
+            reason="isolation_clean",
+        ),
+    ]
+
+    def _blocker_ward(self, hooks=None):
+        return Ward(
+            beds=4,
+            profiles=["stable", "stable", "stable", "stable"],
+            chaos=list(self.BLOCKS),
+            cleaning_s=10,
+            triage={
+                "capacity": 5,
+                "arrivals": [
+                    {"at": 0, "acuity": 1, "profile": "stable"}
+                ],
+            },
+            seed=42,
+            bed_blocker_hooks=hooks,
+        )
+
+    def test_validate_bed_blocker_hooks(self):
+        hooks = validate_bed_blocker_hooks(None)
+        self.assertIsInstance(hooks, TrendAlertHooks)
+        self.assertFalse(hooks.configured)
+        self.assertEqual(hooks.kind, "bed-blocker")
+        custom = validate_bed_blocker_hooks(
+            {"webhook_url": "https://example.invalid/hooks", "timeout_s": 2}
+        )
+        self.assertTrue(custom.configured)
+        self.assertEqual(custom.kind, "bed-blocker")
+        self.assertEqual(custom.timeout_s, 2.0)
+        seen = []
+        append = seen.append
+        cb = validate_bed_blocker_hooks({"callback": append})
+        self.assertTrue(cb.configured)
+        self.assertIs(cb.callback, append)
+        with self.assertRaises(ValueError):
+            validate_bed_blocker_hooks(
+                {"webhook_url": "ftp://x/hooks"}
+            )
+        with self.assertRaises(ValueError):
+            validate_bed_blocker_hooks({"callback": "not callable"})
+        with self.assertRaises(ValueError):
+            validate_bed_blocker_hooks({"timeout_s": 0})
+        with self.assertRaises(ValueError):
+            validate_bed_blocker_hooks({"url": "http://x/hooks"})
+        with self.assertRaises(ValueError):
+            validate_bed_blocker_hooks("http://x/hooks")
+
+    def test_hooks_off_by_default(self):
+        # No hooks configured: the blocks still start and end,
+        # and each event is recorded with no hook invoked.
+        ward = self._blocker_ward()
+        self.assertFalse(ward.bed_blocker_hooks.configured)
+        for _ in range(40):
+            ward.tick()
+        summary = ward.bed_blocker_summary()
+        self.assertEqual(summary["event_count"], 4)
+        self.assertEqual(
+            [
+                (e["event"], e["t"])
+                for e in summary["events"]
+            ],
+            [
+                ("bed_blocker_started", 5.0),
+                ("bed_blocker_started", 12.0),
+                ("bed_blocker_ended", 25.0),
+                ("bed_blocker_ended", 30.0),
+            ],
+        )
+        for event in summary["events"]:
+            self.assertFalse(event["hook_invoked"])
+            self.assertEqual(event["hook_errors"], [])
+            self.assertEqual(event["hook_retries"], 0)
+            self.assertEqual(
+                event["hook_final_status"], "not_invoked"
+            )
+        self.assertEqual(
+            summary["bed_blocker_hooks"],
+            {"configured": False, "invoked": 0, "failed": 0, "retries": 0, "delivered": 0},
+        )
+        self.assertEqual(
+            ward.snapshot()["bed_blocker"]["event_count"], 4
+        )
+
+    def test_callback_hook_fires_for_start_and_end(self):
+        seen = []
+        ward = self._blocker_ward({"callback": seen.append})
+        self.assertTrue(ward.bed_blocker_hooks.configured)
+        for _ in range(40):
+            ward.tick()
+        # Four events over the run: bed 1 blocks at 5 s and
+        # comes back at 25 s, bed 3 blocks at 12 s and comes
+        # back at 30 s. A bed blocked for twenty ticks fires
+        # once on start and once on end, not once a tick.
+        self.assertEqual(
+            [(p["event"], p["t"]) for p in seen],
+            [
+                ("bed_blocker_started", 5.0),
+                ("bed_blocker_started", 12.0),
+                ("bed_blocker_ended", 25.0),
+                ("bed_blocker_ended", 30.0),
+            ],
+        )
+        start, _, end, _ = seen
+        self.assertEqual(
+            {k: v for k, v in start.items() if k != "hook_retries"
+             and k != "hook_final_status"},
+            {
+                "event": "bed_blocker_started",
+                "t": 5.0,
+                "at": 5.0,
+                "ends": 25.0,
+                "duration": 20,
+                "beds": [1],
+                "reason": "porter",
+            },
+        )
+        self.assertEqual(end["event"], "bed_blocker_ended")
+        self.assertEqual(end["t"], 25.0)
+        self.assertEqual(end["beds"], [1])
+        self.assertEqual(end["reason"], "porter")
+        # Every event records the invocation.
+        summary = ward.bed_blocker_summary()
+        self.assertEqual(summary["event_count"], 4)
+        for event in summary["events"]:
+            self.assertTrue(event["hook_invoked"])
+            self.assertEqual(event["hook_errors"], [])
+            self.assertEqual(event["hook_final_status"], "delivered")
+        self.assertEqual(
+            summary["bed_blocker_hooks"],
+            {"configured": True, "invoked": 4, "failed": 0, "retries": 0, "delivered": 4},
+        )
+
+    def test_start_and_end_fire_again_for_a_second_block(self):
+        # Two blocks on the same bed: the start and the end
+        # fire once per block — the engine tracks each event
+        # separately, so the second block fires again.
+        seen = []
+        ward = Ward(
+            beds=1,
+            profiles=["stable"],
+            chaos=[
+                ChaosEvent(
+                    "bed_blocker",
+                    at=5,
+                    duration=10,
+                    bed=0,
+                    reason="porter",
+                ),
+                ChaosEvent(
+                    "bed_blocker",
+                    at=30,
+                    duration=10,
+                    bed=0,
+                    reason="equipment_fault",
+                ),
+            ],
+            seed=42,
+            bed_blocker_hooks={"callback": seen.append},
+        )
+        for _ in range(45):
+            ward.tick()
+        self.assertEqual(
+            [(p["event"], p["t"]) for p in seen],
+            [
+                ("bed_blocker_started", 5.0),
+                ("bed_blocker_ended", 15.0),
+                ("bed_blocker_started", 30.0),
+                ("bed_blocker_ended", 40.0),
+            ],
+        )
+        self.assertEqual(
+            [p["reason"] for p in seen],
+            ["porter", "porter", "equipment_fault", "equipment_fault"],
+        )
+        self.assertEqual(
+            ward.bed_blocker_summary()["bed_blocker_hooks"],
+            {"configured": True, "invoked": 4, "failed": 0, "retries": 0, "delivered": 4},
+        )
+
+    def test_callback_failure_is_not_fatal(self):
+        def boom(payload):
+            raise ValueError("pager is down")
+
+        ward = self._blocker_ward({"callback": boom})
+        for _ in range(5):
+            ward.tick()  # t=5: block starts, hook raises
+        snap = ward.tick()  # t=6: the tick still completes
+        self.assertTrue(snap["beds"][0]["online"])
+        event = ward.bed_blocker_summary()["events"][0]
+        self.assertEqual(event["event"], "bed_blocker_started")
+        self.assertTrue(event["hook_invoked"])
+        self.assertEqual(event["hook_errors"], ["pager is down"])
+        self.assertEqual(event["hook_final_status"], "failed")
+        summary = ward.bed_blocker_summary()["bed_blocker_hooks"]
+        self.assertEqual(summary["invoked"], 1)
+        self.assertEqual(summary["failed"], 1)
+
+    def test_webhook_posts_to_stub_server(self):
+        server, port, received = capture_server()
+        try:
+            ward = self._blocker_ward(
+                {"webhook_url": "http://127.0.0.1:%d/hooks" % port}
+            )
+            for _ in range(40):
+                ward.tick()
+            self.assertTrue(ward.bed_blocker_hooks.wait(timeout=5))
+            self.assertEqual(len(received), 4)
+            payloads = sorted(
+                (json.loads(r[2]) for r in received),
+                key=lambda p: p["t"],
+            )
+            self.assertEqual(
+                [(p["event"], p["t"]) for p in payloads],
+                [
+                    ("bed_blocker_started", 5.0),
+                    ("bed_blocker_started", 12.0),
+                    ("bed_blocker_ended", 25.0),
+                    ("bed_blocker_ended", 30.0),
+                ],
+            )
+            path, content_type, body = received[0]
+            self.assertEqual(path, "/hooks")
+            self.assertEqual(content_type, "application/json")
+            start = [p for p in payloads if p["event"] == "bed_blocker_started" and p["t"] == 5.0][0]
+            self.assertEqual(start["reason"], "porter")
+            self.assertEqual(start["beds"], [1])
+            summary = ward.bed_blocker_summary()
+            self.assertEqual(
+                summary["bed_blocker_hooks"],
+                {"configured": True, "invoked": 4, "failed": 0, "retries": 0, "delivered": 4},
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_scenario_bed_blocker_hooks(self):
+        cfg = load_scenario(
+            os.path.join(
+                HERE, "..", "scenarios", "bed-blocker-hooks.json"
+            )
+        )
+        self.assertTrue(cfg["bed_blocker_hooks"].configured)
+        server, port, received = capture_server()
+        path = os.path.join(tempfile.mkdtemp(), "run.jsonl")
+        try:
+            # The scenario's URL is a placeholder; point it at
+            # the stub server for this run.
+            cfg["bed_blocker_hooks"] = (
+                validate_bed_blocker_hooks(
+                    {"webhook_url": "http://127.0.0.1:%d/hooks" % port}
+                )
+            )
+            ward = build_ward(cfg, seed=42)
+            with Recorder(path, ward.beds, ward.rate_hz, seed=42) as rec:
+                ward.recorder = rec
+                for _ in range(40):
+                    snap = ward.tick()
+            self.assertTrue(ward.bed_blocker_hooks.wait(timeout=5))
+            # Four events over the run: bed 1 blocks at 5 s and
+            # comes back at 25 s, bed 3 blocks at 12 s and comes
+            # back at 30 s. The deliveries run in separate daemon
+            # threads, so their arrival order at the stub is
+            # not guaranteed — sort by event time before
+            # asserting.
+            self.assertEqual(len(received), 4)
+            payloads = sorted(
+                (json.loads(r[2]) for r in received),
+                key=lambda p: p["t"],
+            )
+            self.assertEqual(
+                [
+                    (p["event"], p["t"], p.get("bed"))
+                    for p in payloads
+                ],
+                [
+                    ("bed_blocker_started", 5.0, None),
+                    ("bed_blocker_started", 12.0, None),
+                    ("bed_blocker_ended", 25.0, None),
+                    ("bed_blocker_ended", 30.0, None),
+                ],
+            )
+            # Every event records that its hook was invoked.
+            for event in snap["bed_blocker"]["events"]:
+                self.assertTrue(event["hook_invoked"])
+            summary = ward.bed_blocker_summary()
+            self.assertEqual(summary["event_count"], 4)
+            self.assertEqual(
+                summary["bed_blocker_hooks"],
+                {"configured": True, "invoked": 4, "failed": 0, "retries": 0, "delivered": 4},
+            )
+            # The run summary carries the event count and the
+            # hook totals from the last tick — but only as of
+            # that tick: the snapshot in the file was recorded
+            # before the last delivery settled, so delivered is
+            # read from the live summary above, not from here.
+            run = summarize(path)
+            self.assertEqual(run["bed_blocker"]["event_count"], 4)
+            self.assertTrue(
+                run["bed_blocker"]["bed_blocker_hooks"]["configured"]
+            )
+            self.assertEqual(
+                run["bed_blocker"]["bed_blocker_hooks"]["invoked"], 4
             )
         finally:
             server.shutdown()

@@ -107,7 +107,9 @@ def summarize(path):
     hook deliveries were invoked — and bed-blocker totals from the last tick: how many
     beds are blocked and why, how many discharges are still held
     by a block, and how many discharges the run has held this
-    way — and oxygen-outage totals from the last tick: how many
+    way — plus how many bed-blocker hook events fired this run,
+    and whether the bed-blocker hooks are configured and how many
+    hook deliveries were invoked — and oxygen-outage totals from the last tick: how many
     patients are on oxygen, how many are desaturating from a
     failed supply, each desaturating bed's SpO2 loss, and the
     largest loss on any bed — and power-outage totals from the
@@ -529,7 +531,11 @@ def summarize(path):
         # are blocked and why, how many discharges are still
         # held by a block, and how many discharges the run has
         # held this way — so a run's beds out of use are visible
-        # without replaying every tick.
+        # without replaying every tick — plus how many
+        # bed-blocker hook events fired this run, and whether
+        # the bed-blocker hooks are configured and how many
+        # hook deliveries were invoked, failed, retried, and
+        # delivered.
         "bed_blocker": (
             {
                 "beds_blocked": last_bed_blocker["beds_blocked"],
@@ -543,6 +549,19 @@ def summarize(path):
                 ),
                 "discharges_held": last_bed_blocker.get(
                     "discharges_held", 0
+                ),
+                "event_count": last_bed_blocker.get(
+                    "event_count", 0
+                ),
+                "bed_blocker_hooks": last_bed_blocker.get(
+                    "bed_blocker_hooks",
+                    {
+                        "configured": False,
+                        "invoked": 0,
+                        "failed": 0,
+                        "retries": 0,
+                        "delivered": 0,
+                    },
                 ),
             }
             if last_bed_blocker is not None

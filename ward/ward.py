@@ -5,6 +5,7 @@ import threading
 import time
 
 from .alert_hooks import (
+    validate_bed_blocker_hooks,
     validate_boarding_full_hooks,
     validate_discharge_priority_hooks,
     validate_discharge_readiness_hooks,
@@ -49,7 +50,7 @@ class Ward:
     snapshot to a JSONL file.
     """
 
-    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None, cleaning_s=30.0, meds=None, triage=None, discharge_planning=None, cleaning_capacity=None, discharge_readiness=None, oxygen=None, consciousness=None, consciousness_dynamics=None, news2_trend=None, trend_alert_hooks=None, escalation_hooks=None, boarding_full_hooks=None, wait_time_hooks=None, missed_dose_hooks=None, discharge_readiness_hooks=None, discharge_priority_hooks=None, oxygen_outage_hooks=None, power_outage_hooks=None, sensor_drift_hooks=None, news2_staffing_escalation=None):
+    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None, cleaning_s=30.0, meds=None, triage=None, discharge_planning=None, cleaning_capacity=None, discharge_readiness=None, oxygen=None, consciousness=None, consciousness_dynamics=None, news2_trend=None, trend_alert_hooks=None, escalation_hooks=None, boarding_full_hooks=None, wait_time_hooks=None, missed_dose_hooks=None, discharge_readiness_hooks=None, discharge_priority_hooks=None, oxygen_outage_hooks=None, power_outage_hooks=None, sensor_drift_hooks=None, bed_blocker_hooks=None, news2_staffing_escalation=None):
         if not 1 <= beds <= 64:
             raise ValueError("beds must be 1..64")
         if rate_hz <= 0:
@@ -180,6 +181,17 @@ class Ward:
         # Every sensor-drift hook event this run — the audit
         # trail for the sensor-drift hooks.
         self.sensor_drift_events = []
+        # Bed-blocker hooks: one shared object for the whole
+        # ward (a webhook URL and/or an in-process callback),
+        # invoked when a bed-blocker event starts or ends.
+        # Off by default. The ward owns the object: a block
+        # is a ward-level event, not a per-bed one.
+        self.bed_blocker_hooks = validate_bed_blocker_hooks(
+            bed_blocker_hooks
+        )
+        # Every bed-blocker hook event this run — the audit
+        # trail for the bed-blocker hooks.
+        self.bed_blocker_events = []
         # The priority order last sent to the hooks (empty
         # before the first ready bed), and every order change
         # this run — the audit trail for the priority hooks.
@@ -599,6 +611,55 @@ class Ward:
         payload["hook_invoked"] = result["invoked"]
         payload["hook_errors"] = result["errors"]
 
+    def _bed_blocker_started(self, event, now):
+        """Fire the start hook for one bed-blocker event.
+
+        Called by the chaos engine on the first tick inside the
+        event's window (see :meth:`chaos.ChaosEngine.apply`).
+        """
+        self._fire_bed_blocker_event(
+            "bed_blocker_started", event, now
+        )
+
+    def _bed_blocker_ended(self, event, now):
+        """Fire the end hook for one bed-blocker event.
+
+        Called by the chaos engine on the first tick after the
+        event's window closes.
+        """
+        self._fire_bed_blocker_event(
+            "bed_blocker_ended", event, now
+        )
+
+    def _fire_bed_blocker_event(self, kind, event, now):
+        """Fire one ward-level bed-blocker hook event.
+
+        The payload carries the event kind, the tick, the
+        block window (``at``, ``ends``, ``duration``), the beds
+        it targets, and the block reason — so a hook can tell
+        a bed waiting for a porter from an isolation clean
+        and know how long the bed is out of use. The event is
+        recorded on the audit trail with whether the hook was
+        invoked for it, any synchronous error, and the retries
+        and final delivery outcome.
+        """
+        payload = {
+            "event": kind,
+            "t": now,
+            "at": event.at,
+            "ends": event.end,
+            "duration": event.duration,
+            "beds": event.targets(self),
+            "reason": event.reason,
+        }
+        self.bed_blocker_events.append(payload)
+        result = self.bed_blocker_hooks.fire(
+            dict(payload),
+            record=payload,
+        )
+        payload["hook_invoked"] = result["invoked"]
+        payload["hook_errors"] = result["errors"]
+
     def _oxygen_outage_started(self, event, now):
         """Fire the start hook for one oxygen-outage event.
 
@@ -839,6 +900,16 @@ class Ward:
         counts every discharge the run has held this way, so a
         client can see both the beds out of use now and how
         often a block has held a patient back.
+        ``event_count`` counts every bed-blocker hook event this
+        run — block starts and block ends — and ``events`` lists
+        them, each with the tick, the block window, and whether
+        the ward's hooks were invoked for it (``hook_invoked``)
+        and the retries and final delivery outcome
+        (``hook_retries``, ``hook_final_status``);
+        ``bed_blocker_hooks`` carries the hook totals: whether
+        any hook is configured, how many hook deliveries were
+        invoked, how many failed, how many retries were spent,
+        and how many deliveries eventually landed.
         """
         beds = [m.bed_blocker_detail(self.elapsed) for m in self.monitors]
         return {
@@ -849,6 +920,11 @@ class Ward:
                 1 for b in beds if b["discharge_pending"]
             ),
             "discharges_held": self.bed_blocker_held,
+            "event_count": len(self.bed_blocker_events),
+            "events": [dict(e) for e in self.bed_blocker_events],
+            "bed_blocker_hooks": (
+                self.bed_blocker_hooks.summary()
+            ),
         }
 
     def alarm_summary(self, window_s=60.0):

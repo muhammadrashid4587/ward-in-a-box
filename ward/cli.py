@@ -5,6 +5,7 @@ import json
 import sys
 
 from .alert_hooks import (
+    validate_bed_blocker_hooks,
     validate_boarding_full_hooks,
     validate_discharge_priority_hooks,
     validate_discharge_readiness_hooks,
@@ -300,6 +301,16 @@ def load_scenario(path):
             )
         except ValueError as e:
             raise ValueError("sensor_drift_hooks: %s" % e)
+    bed_blocker_hooks = None
+    if "bed_blocker_hooks" in data:
+        if not isinstance(data["bed_blocker_hooks"], dict):
+            raise ValueError("bed_blocker_hooks must be an object")
+        try:
+            bed_blocker_hooks = validate_bed_blocker_hooks(
+                data["bed_blocker_hooks"]
+            )
+        except ValueError as e:
+            raise ValueError("bed_blocker_hooks: %s" % e)
     return {
         "beds": beds,
         "rate_hz": rate,
@@ -328,6 +339,7 @@ def load_scenario(path):
         "oxygen_outage_hooks": oxygen_outage_hooks,
         "power_outage_hooks": power_outage_hooks,
         "sensor_drift_hooks": sensor_drift_hooks,
+        "bed_blocker_hooks": bed_blocker_hooks,
         "triage": triage,
         "host": data.get("host", "127.0.0.1"),
         "port": data.get("port", 8080),
@@ -364,6 +376,7 @@ def build_ward(cfg, seed=None, recorder=None):
         oxygen_outage_hooks=cfg.get("oxygen_outage_hooks"),
         power_outage_hooks=cfg.get("power_outage_hooks"),
         sensor_drift_hooks=cfg.get("sensor_drift_hooks"),
+        bed_blocker_hooks=cfg.get("bed_blocker_hooks"),
         triage=cfg.get("triage"),
         recorder=recorder,
     )

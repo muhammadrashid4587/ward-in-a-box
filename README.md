@@ -190,6 +190,12 @@ python3 -m ward.cli scenarios/staff-shortage.json --seed 42
 # frees at 20 s instead, after waiting 20 s
 python3 -m ward.cli scenarios/bed-blocker.json --seed 42
 
+# Bed-blocker hooks: the same ward, with each block starting
+# and each block ending also POSTed to a webhook (here a
+# placeholder URL — point it at your own endpoint; a dead
+# endpoint is logged, never fatal)
+python3 -m ward.cli scenarios/bed-blocker-hooks.json --seed 42
+
 # Oxygen outage: the ward's oxygen supply fails from 5 s to 35 s —
 # bed 0 (stable, on oxygen) desaturates to 82.95 and raises a
 # low_spo2 alarm at 19 s, bed 2 (hypoxic, on oxygen) sits on the
@@ -297,7 +303,8 @@ python3 -m ward.cli scenarios/example.json --seed 42
   (503 while partitioned)
 - `GET /bed-blocker` — per-bed bed-blocker state: whether each bed
   is blocked, why, and when the block ends, how many beds are
-  blocked, and how many discharges are held by a block, as JSON
+  blocked, and how many discharges are held by a block, plus the
+  block event history and the bed-blocker hook totals, as JSON
   (503 while partitioned)
 - `GET /oxygen-outage` — per-bed oxygen-outage state: whether the
   supply is down, when it returns, and how many SpO2 points each
@@ -758,6 +765,56 @@ over a seeded 40-tick run bed 1 waits for a porter from 5 s to
 and bed 3 finishes cleaning at 15 s but is blocked for an
 isolation clean until 30 s, so the waiting triage patient takes
 bed 2 when it frees at 20 s instead, after waiting 20 s.
+
+## Bed-blocker hooks
+
+A bed going out of use is the moment a ward most needs the
+outside world to hear about it — the bed cannot take a new
+admission and its patient cannot be discharged until the block
+clears, so the ward is about to hold a discharge and turn a
+patient away from a bed that looks free — so the hook makes
+sure something outside the ward hears about it before the
+block has done its worst. A ward that wants the outside world
+to hear about that moment — a dashboard, a pager, an
+escalation policy — configures bed-blocker hooks, the same
+channels as the NEWS2 hooks (webhook and/or in-process
+callback), on the same best-effort, never-fatal terms:
+
+```json
+{"bed_blocker_hooks": {"webhook_url": "http://127.0.0.1:18099/hooks"}}
+```
+
+Two events fire. `bed_blocker_started` fires once, in the
+tick the bed goes out of use, with the block window (`"at"`,
+`"ends"`, `"duration"`), the beds it targets, and the block
+reason. `bed_blocker_ended` fires once, in the tick the bed
+comes back, with the same window. A bed blocked for twenty
+ticks fires once, not twenty times, and a second block fires
+again — the start and end are per event, not per run. An
+in-process callback gets the same payloads in the tick the
+event fires (Python API only — a scenario file cannot hold a
+callable), so scenario code can log or escalate on the block
+starting directly. Each event records whether the hook was
+invoked (`"hook_invoked"`, False with no hooks) and any
+synchronous error (`"hook_errors"`), and the bed-blocker
+summary carries the event totals (`"event_count"`, the full
+`"events"` history) and the ward bed-blocker-hook totals
+(`"bed_blocker_hooks"`: whether any hook is configured, how
+many deliveries were invoked, how many failed, how many
+retries were spent, and how many deliveries eventually landed)
+— in `GET /bed-blocker`, every snapshot and WebSocket frame,
+and the run summary (`--summary`). The same retry rules as the
+NEWS2 hooks apply — a failed webhook POST is retried with
+backoff up to `"max_retries"` times, and the event records
+`"hook_retries"` and `"hook_final_status"` alongside
+`"hook_invoked"`. Hooks are off by default, so a ward with none
+configured behaves exactly as before. See
+`scenarios/bed-blocker-hooks.json` for a runnable example:
+over a seeded 40-tick run the same ward as
+`bed-blocker.json` blocks bed 1 at 5 s and bed 3 at 12 s,
+and unblocks them at 25 s and 30 s — POSTed to the
+configured webhook, with 4 hook deliveries invoked and 0
+failed against a stub server.
 
 ## Oxygen outage
 
@@ -2905,3 +2962,16 @@ the hook totals.
   a `GET /sensor-drift` endpoint, and the run summary; off by
   default, configured per ward with `sensor_drift_hooks` in
   the scenario) — done in v0.52.0
+- Bed-blocker hooks (when a bed-blocker event starts or ends —
+  a configured webhook URL gets a `bed_blocker_started` /
+  `bed_blocker_ended` event payload POSTed to it, or an
+  in-process callback is called with the same payload in the
+  firing tick, so a hook can escalate on the bed going out of
+  use; one start and one end per block, re-armed for a second
+  block; reusing the NEWS2 hook machinery, best effort and
+  never fatal; each event records whether the hook was invoked,
+  and the bed-blocker summary carries the event history and
+  the bed-blocker-hook totals, in every snapshot, WebSocket
+  frame, a `GET /bed-blocker` endpoint, and the run summary;
+  off by default, configured per ward with
+  `bed_blocker_hooks` in the scenario) — done in v0.53.0
