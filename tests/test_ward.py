@@ -2742,6 +2742,144 @@ class TestDischargeReadiness(unittest.TestCase):
             os.unlink(path)
 
 
+class TestDischargePriority(unittest.TestCase):
+    def _priority_ward(self):
+        # Stable, tachycardic, hypoxic, febrile: the same mix as
+        # scenarios/discharge-priority.json, with a 5 s window.
+        ward = Ward(
+            beds=4,
+            profiles=["stable", "tachycardic", "hypoxic", "febrile"],
+            discharge_readiness={"stable_window_s": 5},
+            seed=42,
+        )
+        for _ in range(60):
+            ward.tick()
+        return ward
+
+    def test_ready_beds_rank_lowest_news2_first(self):
+        ward = self._priority_ward()
+        priority = ward.discharge_priority_summary()
+        # Bed 0 flipped ready at NEWS2 1, bed 1 at 3, bed 2 at 6;
+        # bed 3 (febrile) is not ready. The order is by NEWS2 at
+        # the flip, not by flip time: beds 0 and 1 flipped on the
+        # same tick, and bed 2 flipped last but ranks last on
+        # score, not on time.
+        self.assertEqual(priority["ready"], 3)
+        self.assertEqual(
+            [b["bed"] for b in priority["beds"]], [0, 1, 2]
+        )
+        self.assertEqual(
+            [b["news2_at_flip"] for b in priority["beds"]], [1, 3, 6]
+        )
+        self.assertEqual(
+            [b["ready_t"] for b in priority["beds"]], [5.0, 5.0, 59.0]
+        )
+        self.assertEqual(
+            [b["time_ready_s"] for b in priority["beds"]], [55.0, 55.0, 1.0]
+        )
+
+    def test_no_news2_gate_on_readiness(self):
+        # Bed 2 flagged ready at NEWS2 6 — readiness has no NEWS2
+        # gate, and neither does the priority view: the hypoxic
+        # bed still appears, ranked last, not excluded.
+        ward = self._priority_ward()
+        entry = ward.discharge_priority_summary()["beds"][-1]
+        self.assertEqual(entry["bed"], 2)
+        self.assertEqual(entry["news2_at_flip"], 6)
+        self.assertEqual(entry["risk_at_flip"], "medium")
+
+    def test_not_ready_beds_are_excluded(self):
+        ward = self._priority_ward()
+        beds = [b["bed"] for b in ward.discharge_priority_summary()["beds"]]
+        self.assertNotIn(3, beds)
+        self.assertEqual(ward.discharge_priority_summary()["ready"], 3)
+
+    def test_bed_drops_out_when_it_stops_being_ready(self):
+        ward = Ward(
+            beds=2,
+            profiles=["stable", "stable"],
+            discharge_readiness={"stable_window_s": 5},
+            chaos=[ChaosEvent("alarm_storm", 10, 5, bed=0)],
+            seed=42,
+        )
+        for _ in range(10):
+            ward.tick()
+        self.assertEqual(
+            [b["bed"] for b in ward.discharge_priority_summary()["beds"]],
+            [0, 1],
+        )
+        for _ in range(5):
+            ward.tick()  # t=11..15: storm on bed 0.
+        self.assertEqual(
+            [b["bed"] for b in ward.discharge_priority_summary()["beds"]],
+            [1],
+        )
+
+    def test_priority_in_snapshot_endpoint_and_recorder_summary(self):
+        ward = self._priority_ward()
+        snap = ward.snapshot()
+        self.assertEqual(
+            [b["bed"] for b in snap["discharge_priority"]["beds"]],
+            [0, 1, 2],
+        )
+        server, port = serve_in_thread(ward)
+        try:
+            status, body = get(port, "/discharge-priority")
+            self.assertEqual(status, 200)
+            priority = json.loads(body)
+            self.assertEqual(
+                [b["bed"] for b in priority["beds"]], [0, 1, 2]
+            )
+            self.assertEqual(priority["ready"], 3)
+            ward.partitioned = True
+            status, _ = get(port, "/discharge-priority")
+            self.assertEqual(status, 503)
+            ward.partitioned = False
+        finally:
+            server.shutdown()
+            server.server_close()
+        cfg = load_scenario(
+            os.path.join(HERE, "..", "scenarios", "discharge-priority.json")
+        )
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".jsonl", delete=False
+        ) as f:
+            path = f.name
+        try:
+            with Recorder(path, cfg["beds"], cfg["rate_hz"], seed=42) as rec:
+                ward = build_ward(cfg, seed=42, recorder=rec)
+                for _ in range(60):
+                    ward.tick()
+            summary = summarize(path)
+            self.assertEqual(
+                [b["bed"] for b in summary["discharge_priority"]["beds"]],
+                [0, 1, 2],
+            )
+            self.assertEqual(
+                [b["news2_at_flip"] for b in
+                 summary["discharge_priority"]["beds"]],
+                [1, 3, 6],
+            )
+            self.assertEqual(summary["discharge_priority"]["ready"], 3)
+        finally:
+            os.unlink(path)
+
+    def test_scenario_discharge_priority(self):
+        cfg = load_scenario(
+            os.path.join(HERE, "..", "scenarios", "discharge-priority.json")
+        )
+        ward = build_ward(cfg, seed=42)
+        for _ in range(60):
+            ward.tick()
+        priority = ward.discharge_priority_summary()
+        self.assertEqual(
+            [b["bed"] for b in priority["beds"]], [0, 1, 2]
+        )
+        self.assertEqual(
+            [b["news2_at_flip"] for b in priority["beds"]], [1, 3, 6]
+        )
+
+
 class TestDischargeReadinessHooks(unittest.TestCase):
     def _ward(self, hooks=None, **kw):
         kwargs = {

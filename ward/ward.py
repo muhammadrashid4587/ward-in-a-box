@@ -376,7 +376,7 @@ class Ward:
                     self.discharge_planner.cancel_auto_orders(
                         m.bed_id, self.elapsed
                     )
-        snap = {"t": self.elapsed, "beds": readings, "staffing": self.staffing_summary(), "turnover": self.turnover_summary(), "meds": self.meds_summary(), "triage": self.triage_summary(), "arrivals": self.arrivals_summary(), "discharge": self.discharge_summary(), "discharge_readiness": self.readiness_summary(), "early_warning": self.early_warning_summary()}
+        snap = {"t": self.elapsed, "beds": readings, "staffing": self.staffing_summary(), "turnover": self.turnover_summary(), "meds": self.meds_summary(), "triage": self.triage_summary(), "arrivals": self.arrivals_summary(), "discharge": self.discharge_summary(), "discharge_readiness": self.readiness_summary(), "discharge_priority": self.discharge_priority_summary(), "early_warning": self.early_warning_summary()}
         with self._lock:
             self.latest = snap
         if self.recorder is not None:
@@ -512,6 +512,79 @@ class Ward:
             "discharge_readiness_hooks": (
                 self.discharge_readiness_hooks.summary()
             ),
+        }
+
+    def discharge_priority_summary(self):
+        """Discharge-ready beds ranked by NEWS2, safest first.
+
+        Only beds currently flagged discharge-ready appear, in
+        the order the ward should work through them: lowest NEWS2
+        first, so the safest patient to send home is at the top.
+        The ranking uses the NEWS2 score recorded at the flip
+        that made the bed ready (``news2_at_flip``) — the stable,
+        recorded value, not the score drifting tick by tick — so
+        a bed that flagged ready at NEWS2 6 still ranks, last,
+        exactly as the readiness flag says it should: readiness
+        itself has no NEWS2 gate, and this view does not add one.
+        Ties break by the earliest flip, then bed number. Each
+        entry also carries the current NEWS2 score (``news2``),
+        when the bed flagged ready (``ready_t``), and how long
+        it has been ready (``time_ready_s``). A bed with no score
+        at its flip — no reading yet — sorts last.
+        """
+        entries = []
+        for m in self.monitors:
+            if not m.discharge_ready(
+                self.elapsed, self.readiness.stable_window_s
+            ):
+                continue
+            flips = [e for e in m.readiness_history if e["ready"]]
+            flip = flips[-1] if flips else None
+            flip_news2 = flip["news2"] if flip is not None else None
+            current = (
+                m.last_reading.get("news2")
+                if m.last_reading is not None and m.admitted
+                else None
+            )
+            entries.append(
+                {
+                    "bed": m.bed_id,
+                    "news2_at_flip": (
+                        flip_news2["score"]
+                        if flip_news2 is not None
+                        else None
+                    ),
+                    "risk_at_flip": (
+                        flip_news2["risk"]
+                        if flip_news2 is not None
+                        else None
+                    ),
+                    "news2": (
+                        current["score"] if current is not None else None
+                    ),
+                    "ready_t": flip["ready_t"] if flip is not None else None,
+                    "time_ready_s": (
+                        round(self.elapsed - flip["ready_t"], 3)
+                        if flip is not None
+                        else None
+                    ),
+                }
+            )
+        entries.sort(
+            key=lambda e: (
+                (
+                    e["news2_at_flip"]
+                    if e["news2_at_flip"] is not None
+                    else 1e9
+                ),
+                e["ready_t"] if e["ready_t"] is not None else 1e9,
+                e["bed"],
+            )
+        )
+        return {
+            "t": self.elapsed,
+            "beds": entries,
+            "ready": len(entries),
         }
 
     def early_warning_summary(self):

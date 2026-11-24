@@ -96,6 +96,11 @@ def make_handler(ward):
                     self._send_json(503, {"error": "partitioned"})
                     return
                 self._send_json(200, ward.readiness_summary())
+            elif path == "/discharge-priority":
+                if ward.partitioned:
+                    self._send_json(503, {"error": "partitioned"})
+                    return
+                self._send_json(200, ward.discharge_priority_summary())
             elif path == "/news2":
                 if ward.partitioned:
                     self._send_json(503, {"error": "partitioned"})
@@ -217,6 +222,9 @@ def make_handler(ward):
                         "arrivals": ward.arrivals_summary(),
                         "discharge": ward.discharge_summary(),
                         "discharge_readiness": ward.readiness_summary(),
+                        "discharge_priority": (
+                            ward.discharge_priority_summary()
+                        ),
                         "early_warning": ward.early_warning_summary(),
                     }
                     send(OP_TEXT, json.dumps(msg))

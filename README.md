@@ -205,6 +205,9 @@ python3 -m ward.cli scenarios/example.json --seed 42
   awaiting a slot, as JSON (503 while partitioned)
 - `GET /discharge-readiness` — per-patient discharge-readiness
   flags (see below), as JSON (503 while partitioned)
+- `GET /discharge-priority` — discharge-ready beds ranked by
+  NEWS2, safest first (see below), as JSON (503 while
+  partitioned)
 - `GET /news2` — per-patient NEWS2 early-warning scores and
   deterioration episodes (see below), as JSON (503 while
   partitioned)
@@ -244,7 +247,8 @@ summary from `/alarms`, the staffing summary from `/staffing`, the
 medication summary from `/meds`, the triage summary from
 `/triage`, the live arrivals view from `/arrivals`, the
 discharge summary from `/discharge`, the discharge-readiness
-summary from `/discharge-readiness`, and the early-warning
+summary from `/discharge-readiness`, the discharge-priority
+summary from `/discharge-priority`, and the early-warning
 summary from `/news2`, so a client gets bed occupancy, vitals, alarms, staffing,
 medication, and the intake queue in one message. Ping frames are answered with pong, close frames
 are echoed and the connection is then closed; text frames from the
@@ -1043,6 +1047,36 @@ bed 1 ready at 30 s, bed 3 ready again at 39 s — POSTed to the
 configured webhook, with 5 hook deliveries invoked and 0 failed
 against a stub server.
 
+## NEWS2 discharge priority
+
+A ward with several patients flagged discharge-ready still has to
+decide who goes home first. The discharge-priority view ranks the
+ready beds by NEWS2, lowest first, so the safest patient to send
+home is at the top: each entry carries the bed, the NEWS2 score at
+the flip that made it ready (`"news2_at_flip"`, with the risk at
+the flip), the current NEWS2 score (`"news2"`), when the bed
+flagged ready (`"ready_t"`), and how long it has been ready
+(`"time_ready_s"`). The ranking uses the score at the flip — the
+stable, recorded value — not the score drifting tick by tick, and
+ties break by the earliest flip, then bed number. Beds that are
+not ready do not appear at all, and a bed drops out of the list
+the moment it stops being ready.
+
+This view ranks; it does not gate. Readiness is judged on quiet
+vitals and complete orders, not on the score, so a patient can
+flag ready at NEWS2 6 — and the priority view still lists them,
+ranked last, not excluded: the score orders the queue, it never
+decides who is in it. The view is served by
+`GET /discharge-priority` (503 while partitioned), carried in
+every snapshot and WebSocket frame, and the run summary
+(`--summary`) reports the same order from the last tick. See
+`scenarios/discharge-priority.json` for a runnable example: over
+a seeded 60-tick run with a 5-second window, bed 0 (stable)
+flags ready at 5 s at NEWS2 1, bed 1 (tachycardic) at 5 s at
+NEWS2 3, and bed 2 (hypoxic) at 59 s at NEWS2 6, while bed 3
+(febrile) never flags ready — the priority order is beds 0, 1,
+2, ready 55 s, 55 s, and 1 s respectively.
+
 ## NEWS2 early-warning scoring
 
 Every reading carries a NEWS2 score — the Royal College of
@@ -1544,7 +1578,7 @@ endpoints returned 503 while it lasted, the ticks did not stop.
 make test
 ```
 
-326 tests: vitals stay inside plausible ranges, dropout actually stops a
+345 tests: vitals stay inside plausible ranges, dropout actually stops a
 monitor's stream, an alarm storm produces alarms, stale readings freeze,
 a partition blocks the snapshot endpoint, the HTTP endpoints serve valid
 JSON, the stream serves JSON lines, scenario files validate, alarm
@@ -2080,3 +2114,12 @@ run.
   ready again; every order now also records when and why it was
   cancelled when the patient already left, `cancel_reason`
   `"patient_left"`) — done in v0.38.0
+- NEWS2 discharge priority (a view ranking the discharge-ready
+  beds by NEWS2, lowest first, so the safest patient to send home
+  is at the top, ranked by the score at the flip that made the bed
+  ready with ties by earliest flip, each entry carrying the NEWS2
+  at the flip and the current score, when it flipped, and how long
+  it has been ready; it ranks only — a bed ready at NEWS2 6 still
+  lists, last, because readiness has no NEWS2 gate; in every
+  snapshot, WebSocket frame, a `GET /discharge-priority` endpoint,
+  and the run summary) — done in v0.39.0

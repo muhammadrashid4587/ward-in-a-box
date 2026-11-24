@@ -85,7 +85,10 @@ def summarize(path):
     how many occupied beds are flagged ready and how many are not,
     how many times the readiness flag flipped this run, and whether
     the discharge-readiness hooks are configured and how many hook
-    deliveries were invoked and failed — and early-warning totals from the last tick: how many beds are
+    deliveries were invoked and failed — and the discharge-priority
+    order from the last tick: the ready beds ranked by their NEWS2
+    at the flip that made them ready, with when each flipped and
+    how long it has been ready — and early-warning totals from the last tick: how many beds are
     at high, medium, and low NEWS2 risk, how many deterioration
     episodes are open, and how many have raised, and how many
     NEWS2 trend alerts are open and have raised — and whether the
@@ -116,6 +119,7 @@ def summarize(path):
     last_triage = None
     last_discharge = None
     last_readiness = None
+    last_priority = None
     last_early_warning = None
     last_meds = None
     last_staffing = None
@@ -143,6 +147,8 @@ def summarize(path):
                 last_discharge = obj["discharge"]
             if isinstance(obj.get("discharge_readiness"), dict):
                 last_readiness = obj["discharge_readiness"]
+            if isinstance(obj.get("discharge_priority"), dict):
+                last_priority = obj["discharge_priority"]
             if isinstance(obj.get("early_warning"), dict):
                 last_early_warning = obj["early_warning"]
             if isinstance(obj.get("staffing"), dict):
@@ -348,6 +354,19 @@ def summarize(path):
                 ),
             }
             if last_readiness is not None
+            else None
+        ),
+        # Discharge-priority totals from the last tick: how many
+        # beds are flagged ready, in NEWS2 order — bed, NEWS2 at
+        # the flip that made it ready, when it flipped, and how
+        # long it has been ready — so the run's discharge order is
+        # visible without replaying every tick.
+        "discharge_priority": (
+            {
+                "ready": last_priority["ready"],
+                "beds": last_priority["beds"],
+            }
+            if last_priority is not None
             else None
         ),
         # Early-warning totals from the last tick: beds at each
