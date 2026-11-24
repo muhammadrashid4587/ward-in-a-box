@@ -117,6 +117,12 @@ python3 -m ward.cli scenarios/news2-trend.json --seed 42
 # your own endpoint; a dead endpoint is logged, never fatal)
 python3 -m ward.cli scenarios/news2-trend-hooks.json --seed 42
 
+# NEWS2 trend alert hooks with retries: the same ward, but a
+# failed webhook POST is retried twice with backoff (0.5 s, then
+# 1 s) before it counts as failed — against the dead placeholder
+# URL each of the 3 alerts takes 3 attempts, 6 retries in total
+python3 -m ward.cli scenarios/news2-trend-hooks-retry.json --seed 42
+
 # NEWS2 escalation hooks: the same ward, with each deterioration
 # episode also POSTed to a webhook when it opens
 python3 -m ward.cli scenarios/news2-escalation-hooks.json --seed 42
@@ -1125,17 +1131,47 @@ endpoint (`GET /news2/history`), every snapshot and WebSocket
 frame, and the run summary (`--summary`). The early-warning
 summary also carries the ward hook totals (`"trend_alert_hooks"`:
 whether any hook is configured, how many deliveries were invoked,
-how many failed).
+how many failed, how many retries were spent, and how many
+deliveries eventually landed).
+
+A failed webhook POST is retried with exponential backoff: up to
+`"max_retries"` retries (2 by default, so 3 attempts in total),
+waiting `"retry_backoff_s"` seconds before the first retry (1.0
+by default) and doubling after each failed attempt. A 2xx
+response counts as delivered; a connection error, a timeout, or
+any other status counts as a failed attempt. The retries run in
+the same daemon thread as the first attempt, so a slow or dead
+endpoint still never blocks the ward tick. Each alert records
+how many retries its delivery took (`"hook_retries"`) and the
+final outcome (`"hook_final_status"`: `"delivered"`,
+`"failed"`, `"pending"` while a delivery is still in flight, or
+`"not_invoked"` when no hook is configured) — the status is
+updated when the delivery thread settles, so an alert read in
+the very tick it raises may still say `"pending"`. A callback
+that raises is not retried: a callback is in-process code, so a
+failure there is a bug, not a transient network fault, and it
+counts as failed at once.
+
+```json
+{"trend_alert_hooks": {"webhook_url": "http://127.0.0.1:18099/hooks",
+                       "max_retries": 2, "retry_backoff_s": 0.5}}
+```
 
 One honest limitation: a webhook delivery is best effort, not
-guaranteed. The ward records that the hook was invoked, not that
-the far end received it — a POST that times out or is refused is
-counted as failed in the totals, but the alert itself only says
-it was dispatched. See `scenarios/news2-trend-hooks.json` for a
+guaranteed. The ward records the final outcome once the retries
+are spent, but nothing is persisted or re-queued across runs —
+a delivery that gives up is gone, and a ward restarted mid-retry
+loses the attempt. See `scenarios/news2-trend-hooks.json` for a
 runnable example: over a seeded 40-tick run the same 3 trend
 alerts raise as in `news2-trend.json`, each one POSTed to the
 configured webhook, with 3 hook deliveries invoked and 0 failed
-against a stub server.
+against a stub server. See
+`scenarios/news2-trend-hooks-retry.json` for the retry half:
+against a stub server that 500s twice before answering 200,
+each of the 3 alerts lands on its third attempt — 9 POSTs, 6
+retries, 3 delivered — and against the dead placeholder URL in
+the file each alert takes 3 attempts and ends `"failed"` with
+2 retries.
 
 ## NEWS2 escalation hooks
 
@@ -1159,9 +1195,13 @@ was invoked (`"hook_invoked"`, False with no hooks) and any
 synchronous error (`"hook_errors"`), and the early-warning
 summary carries the ward escalation-hook totals
 (`"escalation_hooks"`: whether any hook is configured, how many
-deliveries were invoked, how many failed) — in `GET /news2`,
+deliveries were invoked, how many failed, how many retries were
+spent, and how many deliveries eventually landed) — in `GET /news2`,
 every snapshot and WebSocket frame, and the run summary
-(`--summary`). Later ticks while the episode stays open fire
+(`--summary`). The same retry rules as the trend-alert hooks
+apply — a failed webhook POST is retried with backoff up to
+`"max_retries"` times, and the episode records `"hook_retries"`
+and `"hook_final_status"` alongside `"hook_invoked"`. Later ticks while the episode stays open fire
 nothing: one escalation, one notification. Hooks are off by
 default, so a ward with none configured behaves exactly as
 before, and like every other NEWS2 feature they never touch the
@@ -1239,7 +1279,7 @@ endpoints returned 503 while it lasted, the ticks did not stop.
 make test
 ```
 
-279 tests: vitals stay inside plausible ranges, dropout actually stops a
+289 tests: vitals stay inside plausible ranges, dropout actually stops a
 monitor's stream, an alarm storm produces alarms, stale readings freeze,
 a partition blocks the snapshot endpoint, the HTTP endpoints serve valid
 JSON, the stream serves JSON lines, scenario files validate, alarm
@@ -1475,7 +1515,16 @@ local stub server with the alert payload as JSON, a webhook to a dead
 port failing without stopping the ward and being counted, a slow
 webhook never blocking the tick, and the `news2-trend-hooks.json`
 scenario POSTing all 3 alerts to a stub server with the run summary
-carrying the hook totals. Escalation-hook tests cover validation
+carrying the hook totals. Webhook-retry tests cover validation of
+the retry config, a webhook that 500s twice landing on the third
+attempt with 2 retries recorded and the alert ending delivered, a
+webhook that 500s forever giving up after 3 attempts with the
+alert ending failed, a connection error retried once, retries
+never blocking the tick, an escalation webhook retried the same
+way, a failing callback not retried, no hooks recording
+not-invoked, and the `news2-trend-hooks-retry.json` scenario
+delivering all 3 alerts after 2 retries each with the run summary
+carrying the retry totals. Escalation-hook tests cover validation
 of the hook config, hooks off by default with the episode
 recording no invocation, a callback receiving the escalation
 payload exactly once when the episode opens, a callback that
@@ -1642,3 +1691,12 @@ to a stub server with the run summary carrying the hook totals.
   WebSocket frame, `GET /news2`, and the run summary carry the
   escalation-hook totals; off by default, configured per ward
   with `escalation_hooks` in the scenario) — done in v0.31.0
+- Webhook delivery retries (a failed webhook POST is retried with
+  exponential backoff, up to `max_retries` retries with a
+  `retry_backoff_s` base delay that doubles after each failed
+  attempt, in the same daemon thread so the ward tick is never
+  blocked; a 2xx response counts as delivered, anything else as
+  a failed attempt; each alert and episode records `hook_retries`
+  and `hook_final_status`, and the ward hook totals carry retries
+  and deliveries; callbacks that raise are not retried) — done
+  in v0.32.0

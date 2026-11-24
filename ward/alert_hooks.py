@@ -28,11 +28,27 @@ carries the ward totals — configured, invoked, failed — so a run
 summary can say how many alerts reached the outside world. Hooks
 never touch the vital-sign alarm list, and a ward with no hooks
 configured behaves exactly as before.
+
+A failed webhook POST is retried with exponential backoff, up to
+``max_retries`` retries (2 by default, so 3 attempts in total),
+in the same daemon thread — a slow or dead endpoint still never
+blocks the ward tick. A 2xx response counts as delivered; a
+connection error, a timeout, or any other status counts as a
+failed attempt. Each fired event records how many retries its
+delivery took (``"hook_retries"``) and the final outcome
+(``"hook_final_status"``: ``"delivered"``, ``"failed"``,
+``"pending"`` while a delivery is still in flight, or
+``"not_invoked"`` when no hook is configured), and the ward
+totals carry the retry count and how many deliveries eventually
+landed. A callback that raises is not retried — a callback is
+in-process code, so a failure there is a bug, not a transient
+network fault — and it is counted as failed at once.
 """
 
 import json
 import logging
 import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -43,6 +59,13 @@ log = logging.getLogger("ward.alert_hooks")
 # bounds how long the delivery thread lingers.
 DEFAULT_WEBHOOK_TIMEOUT_S = 5.0
 
+# How many times a failed webhook POST is retried, and the base
+# delay before the first retry. The delay doubles after each
+# failed attempt (base, 2x base, 4x base, ...), so the defaults
+# retry at 1 s and 2 s after the first failure.
+DEFAULT_MAX_RETRIES = 2
+DEFAULT_RETRY_BACKOFF_S = 1.0
+
 
 def _validate_hooks(value, kind, label):
     """Normalize a hook config for one event kind.
@@ -50,9 +73,12 @@ def _validate_hooks(value, kind, label):
     None means no hooks (off); an ``AlertHooks`` passes through;
     a dict may set ``webhook_url`` (an http(s) URL to POST the
     alert payload to), ``callback`` (an in-process callable,
-    Python API only — a scenario file cannot hold one), and
+    Python API only — a scenario file cannot hold one),
     ``timeout_s`` (a number above 0, how long a webhook POST may
-    take). Returns an ``AlertHooks``.
+    take), ``max_retries`` (an integer 0 or above, how many times
+    a failed webhook POST is retried), and ``retry_backoff_s``
+    (a number above 0, the delay before the first retry, doubling
+    after each failed attempt). Returns an ``AlertHooks``.
     """
     if value is None:
         return AlertHooks(kind=kind)
@@ -60,7 +86,16 @@ def _validate_hooks(value, kind, label):
         return value
     if not isinstance(value, dict):
         raise ValueError("%s must be a dict, got %r" % (label, value))
-    unknown = sorted(set(value) - {"webhook_url", "callback", "timeout_s"})
+    unknown = sorted(
+        set(value)
+        - {
+            "webhook_url",
+            "callback",
+            "timeout_s",
+            "max_retries",
+            "retry_backoff_s",
+        }
+    )
     if unknown:
         raise ValueError(
             "%s has unknown keys: %s" % (label, ", ".join(unknown))
@@ -69,6 +104,10 @@ def _validate_hooks(value, kind, label):
         webhook_url=value.get("webhook_url"),
         callback=value.get("callback"),
         timeout_s=value.get("timeout_s", DEFAULT_WEBHOOK_TIMEOUT_S),
+        max_retries=value.get("max_retries", DEFAULT_MAX_RETRIES),
+        retry_backoff_s=value.get(
+            "retry_backoff_s", DEFAULT_RETRY_BACKOFF_S
+        ),
         kind=kind,
     )
 
@@ -95,7 +134,10 @@ class AlertHooks:
     """
 
     def __init__(self, webhook_url=None, callback=None,
-                 timeout_s=DEFAULT_WEBHOOK_TIMEOUT_S, kind="trend-alert"):
+                 timeout_s=DEFAULT_WEBHOOK_TIMEOUT_S,
+                 max_retries=DEFAULT_MAX_RETRIES,
+                 retry_backoff_s=DEFAULT_RETRY_BACKOFF_S,
+                 kind="trend-alert"):
         if webhook_url is not None:
             if not isinstance(webhook_url, str) or not webhook_url.startswith(
                 ("http://", "https://")
@@ -118,16 +160,41 @@ class AlertHooks:
                 "alert hooks timeout_s must be a number > 0, got %r"
                 % (timeout_s,)
             )
+        if (
+            isinstance(max_retries, bool)
+            or not isinstance(max_retries, int)
+            or max_retries < 0
+        ):
+            raise ValueError(
+                "alert hooks max_retries must be an integer >= 0, "
+                "got %r" % (max_retries,)
+            )
+        if (
+            isinstance(retry_backoff_s, bool)
+            or not isinstance(retry_backoff_s, (int, float))
+            or retry_backoff_s <= 0
+        ):
+            raise ValueError(
+                "alert hooks retry_backoff_s must be a number > 0, "
+                "got %r" % (retry_backoff_s,)
+            )
         self.webhook_url = webhook_url
         self.callback = callback
         self.timeout_s = float(timeout_s)
+        self.max_retries = max_retries
+        self.retry_backoff_s = float(retry_backoff_s)
         self.kind = kind
         self._lock = threading.Lock()
         # Deliveries attempted and deliveries that failed, counted
         # per channel: one alert with both a webhook and a callback
-        # counts as two invocations.
+        # counts as two invocations. ``failed`` counts channels
+        # that never delivered after all their retries; ``retries``
+        # counts every re-attempt; ``delivered`` counts channels
+        # that eventually landed, including after a retry.
         self.invoked = 0
         self.failed = 0
+        self.retries = 0
+        self.delivered = 0
         self._threads = []
 
     @property
@@ -135,20 +202,48 @@ class AlertHooks:
         """True when at least one hook channel is set."""
         return self.webhook_url is not None or self.callback is not None
 
-    def fire(self, payload):
+    def fire(self, payload, record=None):
         """Invoke the configured hooks for one fired alert.
 
         ``payload`` is the alert as a plain dict (bed, raised time,
-        rule, scores). Returns ``{"invoked": bool, "errors": [...]}``:
-        ``invoked`` is True when at least one channel was attempted,
-        ``errors`` lists synchronous failures — a callback that
-        raised. A webhook is dispatched in a daemon thread, so its
-        failure is not known yet at return time: it is logged and
-        counted in :meth:`summary` when the thread finishes. Never
-        raises.
+        rule, scores). ``record`` is the alert or episode dict the
+        delivery outcome is recorded on, when given: it gets
+        ``"hook_retries"`` (retry attempts so far for this event)
+        and ``"hook_final_status"`` (``"delivered"`` when every
+        invoked channel landed, ``"failed"`` when any channel
+        gave up, ``"pending"`` while a webhook delivery is still
+        in flight, ``"not_invoked"`` when no hook is configured).
+        The record is updated in place as the delivery settles,
+        so a snapshot taken later shows the final outcome.
+        Returns ``{"invoked": bool, "errors": [...], "retries": int,
+        "final_status": str}``: ``invoked`` is True when at least
+        one channel was attempted, ``errors`` lists synchronous
+        failures — a callback that raised. A webhook is dispatched
+        in a daemon thread, so its failure is not known yet at
+        return time: it is logged and counted in :meth:`summary`
+        when the thread finishes, and the record is updated then.
+        Never raises.
         """
         if not self.configured:
-            return {"invoked": False, "errors": []}
+            if record is not None:
+                record["hook_retries"] = 0
+                record["hook_final_status"] = "not_invoked"
+            return {
+                "invoked": False,
+                "errors": [],
+                "retries": 0,
+                "final_status": "not_invoked",
+            }
+        # Per-delivery state, shared with the webhook thread:
+        # each channel's outcome so far, and the retries spent.
+        # ``webhook``/``callback`` are None (not configured),
+        # "pending" (in flight), "delivered", or "failed".
+        state = {
+            "record": record,
+            "webhook": None,
+            "callback": None,
+            "retries": 0,
+        }
         invoked = False
         errors = []
         if self.callback is not None:
@@ -157,8 +252,12 @@ class AlertHooks:
                 self.invoked += 1
             try:
                 self.callback(dict(payload))
+                state["callback"] = "delivered"
+                with self._lock:
+                    self.delivered += 1
             except Exception as e:  # noqa: BLE001 - a hook must not kill a tick
                 errors.append(str(e))
+                state["callback"] = "failed"
                 with self._lock:
                     self.failed += 1
                 log.warning("%s callback failed: %s", self.kind, e)
@@ -166,38 +265,129 @@ class AlertHooks:
             invoked = True
             with self._lock:
                 self.invoked += 1
+            state["webhook"] = "pending"
             thread = threading.Thread(
                 target=self._post_webhook,
-                args=(dict(payload),),
+                args=(dict(payload), state),
                 daemon=True,
             )
             with self._lock:
                 self._threads.append(thread)
             thread.start()
-        return {"invoked": invoked, "errors": errors}
+        final = self._settle(state)
+        return {
+            "invoked": invoked,
+            "errors": errors,
+            "retries": state["retries"],
+            "final_status": final,
+        }
 
-    def _post_webhook(self, payload):
-        """POST one alert payload; log and count a failure."""
+    def _settle(self, state):
+        """Recompute one delivery's final status and record it.
+
+        ``"pending"`` while any channel is still in flight,
+        ``"failed"`` when any channel gave up, ``"delivered"``
+        when every invoked channel landed. Writes
+        ``hook_retries`` and ``hook_final_status`` onto the
+        delivery's record, when there is one. Returns the status.
+        """
+        with self._lock:
+            statuses = [
+                s
+                for s in (state["webhook"], state["callback"])
+                if s is not None
+            ]
+            if "pending" in statuses:
+                final = "pending"
+            elif "failed" in statuses:
+                final = "failed"
+            elif statuses:
+                final = "delivered"
+            else:
+                final = "not_invoked"
+            record = state["record"]
+            if record is not None:
+                record["hook_retries"] = state["retries"]
+                record["hook_final_status"] = final
+            return final
+
+    def _post_webhook(self, payload, state):
+        """POST one alert payload, retrying failures with backoff.
+
+        A 2xx response counts as delivered; a connection error, a
+        timeout, or any other status counts as a failed attempt,
+        retried after ``retry_backoff_s`` seconds, doubling after
+        each failed attempt, up to ``max_retries`` retries. Runs
+        in a daemon thread, so the backoff sleeps never stall a
+        ward tick. Each retry and the final outcome are counted
+        in :meth:`summary` and recorded on the delivery's record
+        via :meth:`_settle`.
+        """
         try:
-            request = urllib.request.Request(
-                self.webhook_url,
-                data=json.dumps(payload).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(request, timeout=self.timeout_s) as resp:
-                resp.read()
-        except Exception as e:  # noqa: BLE001 - best effort, never fatal
-            with self._lock:
-                self.failed += 1
-            log.warning(
-                "%s webhook to %s failed: %s", self.kind, self.webhook_url, e
-            )
+            self._post_webhook_with_retries(payload, state)
         finally:
             with self._lock:
                 self._threads = [
                     t for t in self._threads if t.is_alive()
                 ]
+
+    def _post_webhook_with_retries(self, payload, state):
+        """The retry loop for one webhook delivery (see
+        :meth:`_post_webhook`). Returns when the payload is
+        delivered or the retries are exhausted."""
+        attempts = 0
+        while True:
+            attempts += 1
+            error = None
+            try:
+                request = urllib.request.Request(
+                    self.webhook_url,
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(
+                    request, timeout=self.timeout_s
+                ) as resp:
+                    resp.read()
+                    if 200 <= resp.status < 300:
+                        with self._lock:
+                            self.delivered += 1
+                        state["webhook"] = "delivered"
+                        self._settle(state)
+                        return
+                    error = "webhook returned HTTP %d" % resp.status
+            except Exception as e:  # noqa: BLE001 - best effort, never fatal
+                error = str(e)
+            if attempts > self.max_retries:
+                with self._lock:
+                    self.failed += 1
+                log.warning(
+                    "%s webhook to %s failed after %d attempts: %s",
+                    self.kind,
+                    self.webhook_url,
+                    attempts,
+                    error,
+                )
+                state["webhook"] = "failed"
+                self._settle(state)
+                return
+            with self._lock:
+                self.retries += 1
+                state["retries"] += 1
+            delay = self.retry_backoff_s * (2 ** (attempts - 1))
+            log.warning(
+                "%s webhook to %s failed (%s); retry %d/%d in %.1fs",
+                self.kind,
+                self.webhook_url,
+                error,
+                attempts,
+                self.max_retries,
+                delay,
+            )
+            time.sleep(delay)
+        # Unreachable: the loop returns on delivery or on giving up.
+
 
     def wait(self, timeout=None):
         """Wait for pending webhook deliveries to finish.
@@ -210,8 +400,6 @@ class AlertHooks:
             threads = list(self._threads)
         deadline = None
         if timeout is not None:
-            import time
-
             deadline = time.monotonic() + timeout
         for thread in threads:
             remaining = None
@@ -228,6 +416,8 @@ class AlertHooks:
                 "configured": self.configured,
                 "invoked": self.invoked,
                 "failed": self.failed,
+                "retries": self.retries,
+                "delivered": self.delivered,
             }
 
 

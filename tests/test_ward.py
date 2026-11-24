@@ -5235,7 +5235,7 @@ class TestTrendAlertHooks(unittest.TestCase):
         self.assertEqual(alert["hook_errors"], [])
         summary = ward.early_warning_summary()["trend_alert_hooks"]
         self.assertEqual(
-            summary, {"configured": False, "invoked": 0, "failed": 0}
+            summary, {"configured": False, "invoked": 0, "failed": 0, "retries": 0, "delivered": 0}
         )
         self.assertEqual(
             ward.snapshot()["early_warning"]["trend_alert_hooks"],
@@ -5264,7 +5264,7 @@ class TestTrendAlertHooks(unittest.TestCase):
         # One invocation, no failure, in the ward totals.
         summary = ward.early_warning_summary()["trend_alert_hooks"]
         self.assertEqual(
-            summary, {"configured": True, "invoked": 1, "failed": 0}
+            summary, {"configured": True, "invoked": 1, "failed": 0, "retries": 0, "delivered": 1}
         )
         # The alert fires once: later ticks while it stays open do
         # not invoke the hook again.
@@ -5317,7 +5317,7 @@ class TestTrendAlertHooks(unittest.TestCase):
             self.assertEqual(alert["hook_errors"], [])
             summary = ward.early_warning_summary()["trend_alert_hooks"]
             self.assertEqual(
-                summary, {"configured": True, "invoked": 1, "failed": 0}
+                summary, {"configured": True, "invoked": 1, "failed": 0, "retries": 0, "delivered": 1}
             )
         finally:
             server.shutdown()
@@ -5429,9 +5429,12 @@ class TestTrendAlertHooks(unittest.TestCase):
             for bed in history["beds"]:
                 for alert in bed["trend_alerts"]:
                     self.assertTrue(alert["hook_invoked"])
+            # The totals are read from a fresh summary after the
+            # wait: the snapshot from the last tick was taken
+            # before the last delivery settled.
             self.assertEqual(
-                snap["early_warning"]["trend_alert_hooks"],
-                {"configured": True, "invoked": 3, "failed": 0},
+                ward.early_warning_summary()["trend_alert_hooks"],
+                {"configured": True, "invoked": 3, "failed": 0, "retries": 0, "delivered": 3},
             )
             self.assertEqual(
                 snap["early_warning"]["trend_alerts_raised"], 3
@@ -5463,7 +5466,7 @@ class TestTrendAlertHooks(unittest.TestCase):
             summary = summarize(path)
             hooks = summary["early_warning"]["trend_alert_hooks"]
             self.assertEqual(
-                hooks, {"configured": True, "invoked": 3, "failed": 0}
+                hooks, {"configured": True, "invoked": 3, "failed": 0, "retries": 0, "delivered": 3}
             )
         finally:
             os.unlink(path)
@@ -5521,7 +5524,7 @@ class TestEscalationHooks(unittest.TestCase):
         self.assertEqual(episode["hook_errors"], [])
         summary = ward.early_warning_summary()["escalation_hooks"]
         self.assertEqual(
-            summary, {"configured": False, "invoked": 0, "failed": 0}
+            summary, {"configured": False, "invoked": 0, "failed": 0, "retries": 0, "delivered": 0}
         )
         self.assertEqual(
             ward.snapshot()["early_warning"]["escalation_hooks"],
@@ -5551,7 +5554,7 @@ class TestEscalationHooks(unittest.TestCase):
         # One invocation, no failure, in the ward totals.
         summary = ward.early_warning_summary()["escalation_hooks"]
         self.assertEqual(
-            summary, {"configured": True, "invoked": 1, "failed": 0}
+            summary, {"configured": True, "invoked": 1, "failed": 0, "retries": 0, "delivered": 1}
         )
         # The hook fires once, when the episode opens: later ticks
         # while it stays open do not invoke it again.
@@ -5601,7 +5604,7 @@ class TestEscalationHooks(unittest.TestCase):
             self.assertEqual(episode["hook_errors"], [])
             summary = ward.early_warning_summary()["escalation_hooks"]
             self.assertEqual(
-                summary, {"configured": True, "invoked": 1, "failed": 0}
+                summary, {"configured": True, "invoked": 1, "failed": 0, "retries": 0, "delivered": 1}
             )
         finally:
             server.shutdown()
@@ -5658,9 +5661,12 @@ class TestEscalationHooks(unittest.TestCase):
             for bed in snap["early_warning"]["beds"]:
                 for episode in bed["episodes"]:
                     self.assertTrue(episode["hook_invoked"])
+            # The totals are read from a fresh summary after the
+            # wait: the snapshot from the last tick was taken
+            # before the last delivery settled.
             self.assertEqual(
-                snap["early_warning"]["escalation_hooks"],
-                {"configured": True, "invoked": 2, "failed": 0},
+                ward.early_warning_summary()["escalation_hooks"],
+                {"configured": True, "invoked": 2, "failed": 0, "retries": 0, "delivered": 2},
             )
             self.assertEqual(
                 snap["early_warning"]["escalations_raised"], 2
@@ -5692,10 +5698,430 @@ class TestEscalationHooks(unittest.TestCase):
             summary = summarize(path)
             hooks = summary["early_warning"]["escalation_hooks"]
             self.assertEqual(
-                hooks, {"configured": True, "invoked": 2, "failed": 0}
+                hooks, {"configured": True, "invoked": 2, "failed": 0, "retries": 0, "delivered": 2}
             )
         finally:
             os.unlink(path)
+
+
+class TestHookRetries(unittest.TestCase):
+    def _storm_ward(self, hooks=None):
+        # Febrile bed under an alarm storm: the score jumps 7 to
+        # 11, so a trend alert opens on the jump rule at t=2.
+        return Ward(
+            beds=1,
+            profiles=["febrile"],
+            chaos=[ChaosEvent("alarm_storm", at=1, duration=10, bed=0)],
+            seed=3,
+            trend_alert_hooks=hooks,
+        )
+
+    def _escalation_ward(self, hooks=None):
+        # Febrile bed under an alarm storm: the score is 7 at the
+        # first tick, so a deterioration episode opens at t=1.
+        return Ward(
+            beds=1,
+            profiles=["febrile"],
+            chaos=[ChaosEvent("alarm_storm", at=1, duration=10, bed=0)],
+            seed=3,
+            escalation_hooks=hooks,
+        )
+
+    def _flaky_server(self, fail_first=2, status=500):
+        """A stub server that fails the first ``fail_first``
+        attempts for each distinct payload with ``status``, then
+        answers 200. Returns ``(server, port, received)``:
+        ``received`` is a list of ``(path, content_type,
+        body_bytes)`` in arrival order. The caller shuts the
+        server down."""
+        received = []
+        attempts = {}
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length)
+                received.append(
+                    (self.path, self.headers.get("Content-Type"), body)
+                )
+                seen = attempts.get(body, 0)
+                attempts[body] = seen + 1
+                code = status if seen < fail_first else 200
+                self.send_response(code)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(
+            target=server.serve_forever, daemon=True
+        )
+        thread.start()
+        return server, server.server_address[1], received
+
+    def test_validate_retry_config(self):
+        hooks = validate_trend_alert_hooks(None)
+        self.assertEqual(hooks.max_retries, 2)
+        self.assertEqual(hooks.retry_backoff_s, 1.0)
+        custom = validate_trend_alert_hooks(
+            {
+                "webhook_url": "https://example.invalid/hooks",
+                "max_retries": 0,
+                "retry_backoff_s": 0.25,
+            }
+        )
+        self.assertEqual(custom.max_retries, 0)
+        self.assertEqual(custom.retry_backoff_s, 0.25)
+        # max_retries 0 means one attempt, no retries — still valid.
+        same = TrendAlertHooks(max_retries=5, retry_backoff_s=2)
+        self.assertIs(validate_trend_alert_hooks(same), same)
+        with self.assertRaises(ValueError):
+            validate_trend_alert_hooks({"max_retries": -1})
+        with self.assertRaises(ValueError):
+            validate_trend_alert_hooks({"max_retries": 1.5})
+        with self.assertRaises(ValueError):
+            validate_trend_alert_hooks({"max_retries": True})
+        with self.assertRaises(ValueError):
+            validate_trend_alert_hooks({"max_retries": "2"})
+        with self.assertRaises(ValueError):
+            validate_trend_alert_hooks({"retry_backoff_s": 0})
+        with self.assertRaises(ValueError):
+            validate_trend_alert_hooks({"retry_backoff_s": -1})
+        with self.assertRaises(ValueError):
+            validate_trend_alert_hooks({"retry_backoff_s": "fast"})
+        with self.assertRaises(ValueError):
+            validate_trend_alert_hooks({"retry_backoff_s": True})
+        with self.assertRaises(ValueError):
+            validate_escalation_hooks({"backoff": 1.0})
+
+    def test_webhook_retries_then_delivers(self):
+        # The endpoint 500s twice, then answers 200: the delivery
+        # lands on the third attempt.
+        server, port, received = self._flaky_server(fail_first=2)
+        try:
+            ward = self._storm_ward(
+                {
+                    "webhook_url": "http://127.0.0.1:%d/hooks" % port,
+                    "max_retries": 2,
+                    "retry_backoff_s": 0.05,
+                }
+            )
+            ward.tick()
+            ward.tick()
+            alert = ward.monitors[0]._trend_alert
+            self.assertIsNotNone(alert)
+            self.assertTrue(alert["hook_invoked"])
+            # The delivery is still in flight: the first attempt
+            # failed and the retries have not landed yet.
+            self.assertEqual(alert["hook_final_status"], "pending")
+            self.assertTrue(ward.trend_alert_hooks.wait(timeout=5))
+            self.assertEqual(len(received), 3)
+            for _, _, body in received:
+                self.assertEqual(
+                    json.loads(body)["event"], "trend_alert"
+                )
+            # Two retries spent, and the alert now says delivered.
+            self.assertEqual(alert["hook_retries"], 2)
+            self.assertEqual(alert["hook_final_status"], "delivered")
+            summary = ward.early_warning_summary()["trend_alert_hooks"]
+            self.assertEqual(
+                summary,
+                {
+                    "configured": True,
+                    "invoked": 1,
+                    "failed": 0,
+                    "retries": 2,
+                    "delivered": 1,
+                },
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_webhook_gives_up_after_max_retries(self):
+        # The endpoint 500s forever: three attempts, then it
+        # gives up and the delivery counts as failed.
+        server, port, received = self._flaky_server(fail_first=10)
+        try:
+            ward = self._storm_ward(
+                {
+                    "webhook_url": "http://127.0.0.1:%d/hooks" % port,
+                    "max_retries": 2,
+                    "retry_backoff_s": 0.05,
+                }
+            )
+            ward.tick()
+            ward.tick()
+            alert = ward.monitors[0]._trend_alert
+            self.assertTrue(ward.trend_alert_hooks.wait(timeout=5))
+            self.assertEqual(len(received), 3)
+            self.assertEqual(alert["hook_retries"], 2)
+            self.assertEqual(alert["hook_final_status"], "failed")
+            summary = ward.early_warning_summary()["trend_alert_hooks"]
+            self.assertEqual(summary["invoked"], 1)
+            self.assertEqual(summary["failed"], 1)
+            self.assertEqual(summary["retries"], 2)
+            self.assertEqual(summary["delivered"], 0)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_webhook_connection_error_is_retried(self):
+        # A port with nothing listening: the POST fails, is
+        # retried once, and then counts as failed.
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        ward = self._storm_ward(
+            {
+                "webhook_url": "http://127.0.0.1:%d/hooks" % port,
+                "max_retries": 1,
+                "retry_backoff_s": 0.05,
+                "timeout_s": 2,
+            }
+        )
+        ward.tick()
+        ward.tick()
+        alert = ward.monitors[0]._trend_alert
+        self.assertTrue(ward.trend_alert_hooks.wait(timeout=5))
+        self.assertEqual(alert["hook_retries"], 1)
+        self.assertEqual(alert["hook_final_status"], "failed")
+        summary = ward.early_warning_summary()["trend_alert_hooks"]
+        self.assertEqual(summary["invoked"], 1)
+        self.assertEqual(summary["failed"], 1)
+        self.assertEqual(summary["retries"], 1)
+        self.assertEqual(summary["delivered"], 0)
+
+    def test_retry_does_not_block_the_tick(self):
+        # An endpoint that takes 0.3 s to answer 500, with a
+        # 0.5 s backoff: the delivery takes seconds in its thread,
+        # but the tick still returns at once.
+        import time
+
+        received = []
+
+        class SlowHandler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                import time as _time
+
+                length = int(self.headers.get("Content-Length", 0))
+                received.append(
+                    (
+                        self.path,
+                        self.headers.get("Content-Type"),
+                        self.rfile.read(length),
+                    )
+                )
+                _time.sleep(0.3)
+                self.send_response(500)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), SlowHandler)
+        thread = threading.Thread(
+            target=server.serve_forever, daemon=True
+        )
+        thread.start()
+        try:
+            ward = self._storm_ward(
+                {
+                    "webhook_url": "http://127.0.0.1:%d/hooks"
+                    % server.server_address[1],
+                    "max_retries": 2,
+                    "retry_backoff_s": 0.5,
+                }
+            )
+            start = time.monotonic()
+            ward.tick()
+            ward.tick()
+            elapsed = time.monotonic() - start
+            self.assertLess(elapsed, 2.0)
+            # The slow endpoint never answers 200, so this
+            # delivery gives up — but the tick was not held up
+            # by any of it.
+            self.assertTrue(ward.trend_alert_hooks.wait(timeout=10))
+            alert = ward.monitors[0]._trend_alert
+            self.assertEqual(alert["hook_retries"], 2)
+            self.assertEqual(alert["hook_final_status"], "failed")
+            self.assertEqual(len(received), 3)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_escalation_webhook_retries_then_delivers(self):
+        # Retries are shared machinery: an escalation webhook
+        # that 500s once lands on the second attempt.
+        server, port, received = self._flaky_server(fail_first=1)
+        try:
+            ward = self._escalation_ward(
+                {
+                    "webhook_url": "http://127.0.0.1:%d/hooks" % port,
+                    "max_retries": 2,
+                    "retry_backoff_s": 0.05,
+                }
+            )
+            ward.tick()
+            episode = ward.monitors[0]._escalation
+            self.assertIsNotNone(episode)
+            self.assertTrue(ward.escalation_hooks.wait(timeout=5))
+            self.assertEqual(len(received), 2)
+            self.assertEqual(episode["hook_retries"], 1)
+            self.assertEqual(episode["hook_final_status"], "delivered")
+            summary = ward.early_warning_summary()["escalation_hooks"]
+            self.assertEqual(summary["invoked"], 1)
+            self.assertEqual(summary["failed"], 0)
+            self.assertEqual(summary["retries"], 1)
+            self.assertEqual(summary["delivered"], 1)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_callback_failure_is_not_retried(self):
+        # A callback that raises is a bug, not a transient
+        # network fault: it fails at once, with no retries.
+        def boom(payload):
+            raise ValueError("pager is down")
+
+        ward = self._storm_ward({"callback": boom})
+        ward.tick()
+        ward.tick()
+        alert = ward.monitors[0]._trend_alert
+        self.assertEqual(alert["hook_errors"], ["pager is down"])
+        self.assertEqual(alert["hook_retries"], 0)
+        self.assertEqual(alert["hook_final_status"], "failed")
+        summary = ward.early_warning_summary()["trend_alert_hooks"]
+        self.assertEqual(summary["invoked"], 1)
+        self.assertEqual(summary["failed"], 1)
+        self.assertEqual(summary["retries"], 0)
+        self.assertEqual(summary["delivered"], 0)
+
+    def test_no_hooks_records_not_invoked(self):
+        ward = self._storm_ward()
+        ward.tick()
+        ward.tick()
+        alert = ward.monitors[0]._trend_alert
+        self.assertEqual(alert["hook_retries"], 0)
+        self.assertEqual(alert["hook_final_status"], "not_invoked")
+        summary = ward.early_warning_summary()["trend_alert_hooks"]
+        self.assertEqual(
+            summary,
+            {
+                "configured": False,
+                "invoked": 0,
+                "failed": 0,
+                "retries": 0,
+                "delivered": 0,
+            },
+        )
+
+    def test_scenario_news2_trend_hooks_retry(self):
+        cfg = load_scenario(
+            os.path.join(
+                HERE, "..", "scenarios", "news2-trend-hooks-retry.json"
+            )
+        )
+        self.assertTrue(cfg["trend_alert_hooks"].configured)
+        self.assertEqual(cfg["trend_alert_hooks"].max_retries, 2)
+        server, port, received = self._flaky_server(fail_first=2)
+        try:
+            # The scenario's URL is a placeholder; point it at
+            # the stub server for this run. The scenario's 0.5 s
+            # backoff is shortened so the test stays fast; the
+            # 2-retry bound from the file is what is exercised.
+            cfg["trend_alert_hooks"].webhook_url = (
+                "http://127.0.0.1:%d/hooks" % port
+            )
+            cfg["trend_alert_hooks"].retry_backoff_s = 0.05
+            ward = build_ward(cfg, seed=42)
+            for _ in range(40):
+                snap = ward.tick()
+            self.assertTrue(ward.trend_alert_hooks.wait(timeout=5))
+            # Three trend alerts over the run, each delivered on
+            # its third attempt: 9 POSTs, 6 retries. The totals
+            # are read from a fresh summary after the wait: the
+            # snapshot from the last tick was taken before the
+            # last delivery settled.
+            self.assertEqual(len(received), 9)
+            history = ward.news2_history_summary()
+            for bed in history["beds"]:
+                for alert in bed["trend_alerts"]:
+                    self.assertEqual(alert["hook_retries"], 2)
+                    self.assertEqual(
+                        alert["hook_final_status"], "delivered"
+                    )
+            self.assertEqual(
+                ward.early_warning_summary()["trend_alert_hooks"],
+                {
+                    "configured": True,
+                    "invoked": 3,
+                    "failed": 0,
+                    "retries": 6,
+                    "delivered": 3,
+                },
+            )
+            self.assertEqual(
+                snap["early_warning"]["trend_alerts_raised"], 3
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_recorder_summary_carries_retry_totals(self):
+        cfg = load_scenario(
+            os.path.join(
+                HERE, "..", "scenarios", "news2-trend-hooks-retry.json"
+            )
+        )
+        server, port, received = self._flaky_server(fail_first=2)
+        try:
+            cfg["trend_alert_hooks"].webhook_url = (
+                "http://127.0.0.1:%d/hooks" % port
+            )
+            cfg["trend_alert_hooks"].retry_backoff_s = 0.05
+            with tempfile.NamedTemporaryFile(
+                "w", suffix=".jsonl", delete=False
+            ) as f:
+                path = f.name
+            try:
+                with Recorder(
+                    path, cfg["beds"], cfg["rate_hz"], seed=42
+                ) as rec:
+                    ward = build_ward(cfg, seed=42, recorder=rec)
+                    for _ in range(40):
+                        ward.tick()
+                    # The last alert raises near the end of the
+                    # run; let its retries land, then tick once
+                    # more so the recording's last snapshot
+                    # carries the settled totals.
+                    self.assertTrue(
+                        ward.trend_alert_hooks.wait(timeout=5)
+                    )
+                    ward.tick()
+                summary = summarize(path)
+                hooks = summary["early_warning"]["trend_alert_hooks"]
+                self.assertEqual(
+                    hooks,
+                    {
+                        "configured": True,
+                        "invoked": 3,
+                        "failed": 0,
+                        "retries": 6,
+                        "delivered": 3,
+                    },
+                )
+            finally:
+                os.unlink(path)
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 if __name__ == "__main__":

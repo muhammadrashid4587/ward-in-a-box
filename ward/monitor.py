@@ -514,13 +514,20 @@ class Monitor:
             # the hook was invoked, so a snapshot, a recording, or
             # the run summary can say whether the escalation
             # reached the outside world. A hook failure is logged
-            # and counted, never fatal to the tick.
+            # and counted, never fatal to the tick. A failed
+            # webhook POST is retried with backoff in the delivery
+            # thread, and the episode records the retries and the
+            # final delivery outcome (``hook_retries``,
+            # ``hook_final_status``), updated when the delivery
+            # settles — so an episode read right after it opens
+            # may still say "pending".
             result = self.escalation_hooks.fire(
                 {
                     "event": "escalation",
                     "bed": self.bed_id,
                     **self._escalation,
-                }
+                },
+                record=self._escalation,
             )
             self._escalation["hook_invoked"] = result["invoked"]
             self._escalation["hook_errors"] = result["errors"]
@@ -591,13 +598,21 @@ class Monitor:
                 # whether the hook was invoked, so a snapshot, a
                 # recording, or the run summary can say whether the
                 # alert reached the outside world. A hook failure is
-                # logged and counted, never fatal to the tick.
+                # logged and counted, never fatal to the tick. A
+                # failed webhook POST is retried with backoff in
+                # the delivery thread, and the alert records the
+                # retries and the final delivery outcome
+                # (``hook_retries``, ``hook_final_status``),
+                # updated when the delivery settles — so an alert
+                # read right after it raises may still say
+                # "pending".
                 result = self.trend_alert_hooks.fire(
                     {
                         "event": "trend_alert",
                         "bed": self.bed_id,
                         **self._trend_alert,
-                    }
+                    },
+                    record=self._trend_alert,
                 )
                 self._trend_alert["hook_invoked"] = result["invoked"]
                 self._trend_alert["hook_errors"] = result["errors"]
@@ -636,12 +651,16 @@ class Monitor:
         was due and when it landed, and how long it took, or nulls
         when the episode closed before anyone responded — and
         whether the ward's escalation hooks were invoked for it
-        (``hook_invoked``). ``trend``
+        (``hook_invoked``) and the retries and final delivery
+        outcome (``hook_retries``, ``hook_final_status``).
+        ``trend``
         is the current rate of change of the score (see
         :func:`ward.news2.trend_for`), and ``trend_alerts`` lists
         every trend alert this stay with raised/cleared times and
         peak score and rise, and whether the ward's hooks were
-        invoked for it (``hook_invoked``).
+        invoked for it (``hook_invoked``) and the retries and
+        final delivery outcome (``hook_retries``,
+        ``hook_final_status``).
         """
         reading = self.last_reading
         offline = (

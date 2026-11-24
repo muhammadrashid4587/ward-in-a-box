@@ -402,8 +402,10 @@ class Ward:
         landing (null before the first response).
         ``trend_alert_hooks`` carries the trend-alert hook totals:
         whether any hook is configured, how many hook deliveries
-        were invoked, and how many failed. ``escalation_hooks``
-        carries the same totals for the escalation hooks.
+        were invoked, how many failed, how many retries were spent,
+        and how many deliveries eventually landed.
+        ``escalation_hooks`` carries the same totals for the
+        escalation hooks.
         """
         beds = [m.news2_detail(self.elapsed) for m in self.monitors]
         scored = [b for b in beds if b["news2"] is not None]

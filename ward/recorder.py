@@ -305,6 +305,8 @@ def summarize(path):
                         "configured": False,
                         "invoked": 0,
                         "failed": 0,
+                        "retries": 0,
+                        "delivered": 0,
                     },
                 ),
                 "escalation_hooks": last_early_warning.get(
@@ -313,6 +315,8 @@ def summarize(path):
                         "configured": False,
                         "invoked": 0,
                         "failed": 0,
+                        "retries": 0,
+                        "delivered": 0,
                     },
                 ),
                 "not_alert": last_early_warning.get("not_alert", 0),
