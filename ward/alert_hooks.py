@@ -32,7 +32,8 @@ leaving, or the ranking reordering) fires the ward's
 ``discharge_priority_hooks``; an oxygen outage starting, ending,
 or pushing a patient onto the SpO2 floor fires the ward's
 ``oxygen_outage_hooks``; a power outage starting or ending fires
-the ward's ``power_outage_hooks``. All nine share
+the ward's ``power_outage_hooks``; a sensor-drift event starting
+or ending fires the ward's ``sensor_drift_hooks``. All ten share
 the same ``AlertHooks`` machinery — the same webhook and
 callback channels, the same best-effort delivery — just a
 different event payload.
@@ -225,14 +226,27 @@ def validate_power_outage_hooks(value):
     )
 
 
+def validate_sensor_drift_hooks(value):
+    """Normalize a sensor-drift hook config (see
+    :func:`_validate_hooks`).
+
+    Fires when a sensor-drift event starts or ends — when a
+    bed's sensor starts miscalibrating and when the drift
+    window closes — rather than when a NEWS2 event fires.
+    """
+    return _validate_hooks(
+        value, "sensor-drift", "sensor_drift_hooks"
+    )
+
+
 class AlertHooks:
     """The configured hooks for one ward event, shared by its monitors.
 
     ``kind`` labels the event in log messages (``"trend-alert"``,
     ``"escalation"``, ``"boarding-full"``, ``"wait-time"``,
     ``"missed-dose"``, ``"discharge-readiness"``,
-    ``"discharge-priority"``, ``"oxygen-outage"``, or
-    ``"power-outage"``); it changes
+    ``"discharge-priority"``, ``"oxygen-outage"``,
+    ``"power-outage"``, or ``"sensor-drift"``); it changes
     nothing about delivery.
     """
 

@@ -171,6 +171,12 @@ python3 -m ward.cli scenarios/news2-trend.json --seed 42
 # while bed 1 stays at NEWS2 0
 python3 -m ward.cli scenarios/sensor-drift.json --seed 42
 
+# Sensor-drift hooks: the same ward, with the drift starting
+# and the drift window closing also POSTed to a webhook (here a
+# placeholder URL — point it at your own endpoint; a dead
+# endpoint is logged, never fatal)
+python3 -m ward.cli scenarios/sensor-drift-hooks.json --seed 42
+
 # Staff shortage: one nurse calls in sick at 10 s for 30 s, during
 # an alarm storm on beds 0-2 — the ratio goes 1:4 to 1:6, the load
 # factor 1.0 to 1.5, and all 15 storm alarms are acked in 45.0 s
@@ -286,7 +292,8 @@ python3 -m ward.cli scenarios/example.json --seed 42
   an integer), as JSON (503 while partitioned)
 - `GET /sensor-drift` — per-bed sensor-drift state: the accumulated
   bias per vital on each bed, how many beds have a drifted sensor,
-  and the largest absolute bias per vital, as JSON
+  and the largest absolute bias per vital, plus the drift event
+  history and the sensor-drift hook totals, as JSON
   (503 while partitioned)
 - `GET /bed-blocker` — per-bed bed-blocker state: whether each bed
   is blocked, why, and when the block ends, how many beds are
@@ -944,6 +951,54 @@ configured behaves exactly as before. See
 over a seeded 70-tick run the same ward as
 `power-outage.json` loses its mains at 5 s and gets it back at
 35 s — POSTed to the configured webhook, with 2 hook
+deliveries invoked and 0 failed against a stub server.
+
+## Sensor-drift hooks
+
+A sensor starting to drift is the moment a ward most needs the
+outside world to hear about it — the readings are about to creep
+away from the patient's true vitals, and the NEWS2 score will
+climb one point at a time instead of jumping — so the hook makes
+sure something outside the ward hears about it before the drift
+has done its worst. A ward that wants the outside world to hear
+about that moment — a dashboard, a pager, an escalation policy —
+configures sensor-drift hooks, the same channels as the NEWS2
+hooks (webhook and/or in-process callback), on the same
+best-effort, never-fatal terms:
+
+```json
+{"sensor_drift_hooks": {"webhook_url": "http://127.0.0.1:18099/hooks"}}
+```
+
+Two events fire. `sensor_drift_started` fires once, in the
+tick the sensor starts miscalibrating, with the drift window
+(`"at"`, `"ends"`, `"duration"`), the beds it targets, and the
+drift rates per vital. `sensor_drift_ended` fires once, in the
+tick the drift window closes, with the same window. A sensor
+that drifts for sixty ticks fires once, not sixty times, and
+a second drift fires again — the start and end are per event,
+not per run. An in-process callback gets the same payloads in
+the tick the event fires (Python API only — a scenario file
+cannot hold a callable), so scenario code can log or escalate
+on the drift starting directly. Each event records whether the
+hook was invoked (`"hook_invoked"`, False with no hooks) and
+any synchronous error (`"hook_errors"`), and the sensor-drift
+summary carries the event totals (`"event_count"`, the full
+`"events"` history) and the ward sensor-drift-hook totals
+(`"sensor_drift_hooks"`: whether any hook is configured, how
+many deliveries were invoked, how many failed, how many
+retries were spent, and how many deliveries eventually landed)
+— in `GET /sensor-drift`, every snapshot and WebSocket frame,
+and the run summary (`--summary`). The same retry rules as the
+NEWS2 hooks apply — a failed webhook POST is retried with
+backoff up to `"max_retries"` times, and the event records
+`"hook_retries"` and `"hook_final_status"` alongside
+`"hook_invoked"`. Hooks are off by default, so a ward with none
+configured behaves exactly as before. See
+`scenarios/sensor-drift-hooks.json` for a runnable example:
+over a seeded 70-tick run the same ward as
+`sensor-drift.json` starts drifting at 5 s and the drift window
+closes at 65 s — POSTed to the configured webhook, with 2 hook
 deliveries invoked and 0 failed against a stub server.
 
 ## Triage / ED intake queue
@@ -2837,3 +2892,16 @@ the hook totals.
   a `GET /power-outage` endpoint, and the run summary; off by
   default, configured per ward with `power_outage_hooks` in
   the scenario) — done in v0.51.0
+- Sensor-drift hooks (when a sensor-drift event starts or ends —
+  a configured webhook URL gets a `sensor_drift_started` /
+  `sensor_drift_ended` event payload POSTed to it, or an
+  in-process callback is called with the same payload in the
+  firing tick, so a hook can escalate on the drift starting; one
+  start and one end per drift, re-armed for a second drift;
+  reusing the NEWS2 hook machinery, best effort and never
+  fatal; each event records whether the hook was invoked, and
+  the sensor-drift summary carries the event history and the
+  sensor-drift-hook totals, in every snapshot, WebSocket frame,
+  a `GET /sensor-drift` endpoint, and the run summary; off by
+  default, configured per ward with `sensor_drift_hooks` in
+  the scenario) — done in v0.52.0

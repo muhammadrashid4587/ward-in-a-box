@@ -334,6 +334,12 @@ class ChaosEngine:
         # same beds is a new event, so it fires again.
         self._power_started = set()
         self._power_ended = set()
+        # Sensor-drift events fire their start hook once, on the
+        # first tick inside the window, and their end hook once,
+        # on the first tick after it — a second drift on the
+        # same beds is a new event, so it fires again.
+        self._sensor_drift_started = set()
+        self._sensor_drift_ended = set()
 
     def stockouts(self, ward, now):
         """Active pharmacy stockouts: ``{bed_id: {med, ...}}``.
@@ -419,6 +425,25 @@ class ChaosEngine:
                 ):
                     self._power_ended.add(id(ev))
                     ward._power_outage_ended(ev, now)
+            # Sensor drift: the start hook fires once, on the
+            # first tick inside the window, and the end hook
+            # once, on the first tick after it — so scenario
+            # code hears the sensor start miscalibrating and
+            # the drift window close exactly once per event,
+            # even across a run that ticks past the end. The
+            # check runs before the active gate below, so an
+            # end is caught on the tick the window closes.
+            if ev.type == "sensor_drift":
+                if ev.active(now):
+                    if id(ev) not in self._sensor_drift_started:
+                        self._sensor_drift_started.add(id(ev))
+                        ward._sensor_drift_started(ev, now)
+                elif (
+                    id(ev) in self._sensor_drift_started
+                    and id(ev) not in self._sensor_drift_ended
+                ):
+                    self._sensor_drift_ended.add(id(ev))
+                    ward._sensor_drift_ended(ev, now)
             if not ev.active(now):
                 continue
             if ev.type == "sensor_drift":

@@ -1,0 +1,1 @@
+{"beds":2,"chaos":[{"at":5,"bed":0,"drift":{"heart_rate":0.5,"spo2":-0.15},"duration":60,"type":"sensor_drift"}],"discharge_readiness":{"stable_window_s":5},"patients":[{"bed":0,"profile":"stable"},{"bed":1,"profile":"stable"}],"rate_hz":1.0,"sensor_drift_hooks":{"webhook_url":"http://127.0.0.1:18099/hooks"}}

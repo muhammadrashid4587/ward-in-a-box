@@ -27,6 +27,7 @@ from ward.alert_hooks import (
     validate_missed_dose_hooks,
     validate_oxygen_outage_hooks,
     validate_power_outage_hooks,
+    validate_sensor_drift_hooks,
     validate_trend_alert_hooks,
     validate_wait_time_hooks,
 )
@@ -10614,6 +10615,313 @@ class TestPowerOutageHooks(unittest.TestCase):
             )
             self.assertEqual(
                 run["power_outage"]["power_outage_hooks"]["invoked"], 2
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+class TestSensorDriftHooks(unittest.TestCase):
+    # Sensor-drift hooks: a drift event starting or ending fires
+    # the ward's sensor_drift_hooks — the same webhook/callback
+    # machinery as the NEWS2 hooks — so something outside the
+    # ward hears a sensor start miscalibrating and the drift
+    # window close. A callback can use the start to escalate:
+    # the readings are about to creep away from the patient's
+    # true vitals, and the NEWS2 score will climb one point at
+    # a time instead of jumping.
+    DRIFT = {"spo2": -0.15, "heart_rate": 0.5}
+
+    def _drift_ward(self, hooks=None):
+        return Ward(
+            beds=2,
+            profiles=["stable", "stable"],
+            chaos=[
+                ChaosEvent(
+                    "sensor_drift",
+                    at=5,
+                    duration=60,
+                    bed=0,
+                    drift=self.DRIFT,
+                )
+            ],
+            seed=42,
+            discharge_readiness={"stable_window_s": 5},
+            sensor_drift_hooks=hooks,
+        )
+
+    def test_validate_sensor_drift_hooks(self):
+        hooks = validate_sensor_drift_hooks(None)
+        self.assertIsInstance(hooks, TrendAlertHooks)
+        self.assertFalse(hooks.configured)
+        self.assertEqual(hooks.kind, "sensor-drift")
+        custom = validate_sensor_drift_hooks(
+            {"webhook_url": "https://example.invalid/hooks", "timeout_s": 2}
+        )
+        self.assertTrue(custom.configured)
+        self.assertEqual(custom.kind, "sensor-drift")
+        self.assertEqual(custom.timeout_s, 2.0)
+        seen = []
+        append = seen.append
+        cb = validate_sensor_drift_hooks({"callback": append})
+        self.assertTrue(cb.configured)
+        self.assertIs(cb.callback, append)
+        with self.assertRaises(ValueError):
+            validate_sensor_drift_hooks(
+                {"webhook_url": "ftp://x/hooks"}
+            )
+        with self.assertRaises(ValueError):
+            validate_sensor_drift_hooks({"callback": "not callable"})
+        with self.assertRaises(ValueError):
+            validate_sensor_drift_hooks({"timeout_s": 0})
+        with self.assertRaises(ValueError):
+            validate_sensor_drift_hooks({"url": "http://x/hooks"})
+        with self.assertRaises(ValueError):
+            validate_sensor_drift_hooks("http://x/hooks")
+
+    def test_hooks_off_by_default(self):
+        # No hooks configured: the drift still starts and ends,
+        # and each event is recorded with no hook invoked.
+        ward = self._drift_ward()
+        self.assertFalse(ward.sensor_drift_hooks.configured)
+        for _ in range(70):
+            ward.tick()
+        summary = ward.sensor_drift_summary()
+        self.assertEqual(summary["event_count"], 2)
+        self.assertEqual(
+            [
+                (e["event"], e["t"])
+                for e in summary["events"]
+            ],
+            [
+                ("sensor_drift_started", 5.0),
+                ("sensor_drift_ended", 65.0),
+            ],
+        )
+        for event in summary["events"]:
+            self.assertFalse(event["hook_invoked"])
+            self.assertEqual(event["hook_errors"], [])
+            self.assertEqual(event["hook_retries"], 0)
+            self.assertEqual(
+                event["hook_final_status"], "not_invoked"
+            )
+        self.assertEqual(
+            summary["sensor_drift_hooks"],
+            {"configured": False, "invoked": 0, "failed": 0, "retries": 0, "delivered": 0},
+        )
+        self.assertEqual(
+            ward.snapshot()["sensor_drift"]["event_count"], 2
+        )
+
+    def test_callback_hook_fires_for_start_and_end(self):
+        seen = []
+        ward = self._drift_ward({"callback": seen.append})
+        self.assertTrue(ward.sensor_drift_hooks.configured)
+        for _ in range(70):
+            ward.tick()
+        # Two events over the run: the sensor starts drifting
+        # at 5 s and the drift window closes at 65 s. The bias
+        # keeps growing for the whole window, but the drift
+        # itself fires once on start and once on end, not once
+        # a tick.
+        self.assertEqual(
+            [(p["event"], p["t"]) for p in seen],
+            [
+                ("sensor_drift_started", 5.0),
+                ("sensor_drift_ended", 65.0),
+            ],
+        )
+        start, end = seen
+        self.assertEqual(
+            {k: v for k, v in start.items() if k != "hook_retries"
+             and k != "hook_final_status"},
+            {
+                "event": "sensor_drift_started",
+                "t": 5.0,
+                "at": 5.0,
+                "ends": 65.0,
+                "duration": 60,
+                "beds": [0],
+                "drift": self.DRIFT,
+            },
+        )
+        self.assertEqual(end["event"], "sensor_drift_ended")
+        self.assertEqual(end["t"], 65.0)
+        self.assertEqual(end["beds"], [0])
+        # Every event records the invocation.
+        summary = ward.sensor_drift_summary()
+        self.assertEqual(summary["event_count"], 2)
+        for event in summary["events"]:
+            self.assertTrue(event["hook_invoked"])
+            self.assertEqual(event["hook_errors"], [])
+            self.assertEqual(event["hook_final_status"], "delivered")
+        self.assertEqual(
+            summary["sensor_drift_hooks"],
+            {"configured": True, "invoked": 2, "failed": 0, "retries": 0, "delivered": 2},
+        )
+
+    def test_start_and_end_fire_again_for_a_second_drift(self):
+        # Two drifts on the same bed: the start and the end
+        # fire once per drift — the engine tracks each event
+        # separately, so the second drift fires again.
+        seen = []
+        ward = Ward(
+            beds=1,
+            profiles=["stable"],
+            chaos=[
+                ChaosEvent(
+                    "sensor_drift",
+                    at=5,
+                    duration=10,
+                    bed=0,
+                    drift=self.DRIFT,
+                ),
+                ChaosEvent(
+                    "sensor_drift",
+                    at=30,
+                    duration=10,
+                    bed=0,
+                    drift=self.DRIFT,
+                ),
+            ],
+            seed=42,
+            sensor_drift_hooks={"callback": seen.append},
+        )
+        for _ in range(45):
+            ward.tick()
+        self.assertEqual(
+            [(p["event"], p["t"]) for p in seen],
+            [
+                ("sensor_drift_started", 5.0),
+                ("sensor_drift_ended", 15.0),
+                ("sensor_drift_started", 30.0),
+                ("sensor_drift_ended", 40.0),
+            ],
+        )
+        self.assertEqual(
+            ward.sensor_drift_summary()["sensor_drift_hooks"],
+            {"configured": True, "invoked": 4, "failed": 0, "retries": 0, "delivered": 4},
+        )
+
+    def test_callback_failure_is_not_fatal(self):
+        def boom(payload):
+            raise ValueError("pager is down")
+
+        ward = self._drift_ward({"callback": boom})
+        for _ in range(5):
+            ward.tick()  # t=5: drift starts, hook raises
+        snap = ward.tick()  # t=6: the tick still completes
+        self.assertTrue(snap["beds"][0]["online"])
+        event = ward.sensor_drift_summary()["events"][0]
+        self.assertEqual(event["event"], "sensor_drift_started")
+        self.assertTrue(event["hook_invoked"])
+        self.assertEqual(event["hook_errors"], ["pager is down"])
+        self.assertEqual(event["hook_final_status"], "failed")
+        summary = ward.sensor_drift_summary()["sensor_drift_hooks"]
+        self.assertEqual(summary["invoked"], 1)
+        self.assertEqual(summary["failed"], 1)
+
+    def test_webhook_posts_to_stub_server(self):
+        server, port, received = capture_server()
+        try:
+            ward = self._drift_ward(
+                {"webhook_url": "http://127.0.0.1:%d/hooks" % port}
+            )
+            for _ in range(70):
+                ward.tick()
+            self.assertTrue(ward.sensor_drift_hooks.wait(timeout=5))
+            self.assertEqual(len(received), 2)
+            payloads = sorted(
+                (json.loads(r[2]) for r in received),
+                key=lambda p: p["t"],
+            )
+            self.assertEqual(
+                [(p["event"], p["t"]) for p in payloads],
+                [
+                    ("sensor_drift_started", 5.0),
+                    ("sensor_drift_ended", 65.0),
+                ],
+            )
+            path, content_type, body = received[0]
+            self.assertEqual(path, "/hooks")
+            self.assertEqual(content_type, "application/json")
+            start = [p for p in payloads if p["event"] == "sensor_drift_started"][0]
+            self.assertEqual(start["drift"], self.DRIFT)
+            self.assertEqual(start["beds"], [0])
+            summary = ward.sensor_drift_summary()
+            self.assertEqual(
+                summary["sensor_drift_hooks"],
+                {"configured": True, "invoked": 2, "failed": 0, "retries": 0, "delivered": 2},
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_scenario_sensor_drift_hooks(self):
+        cfg = load_scenario(
+            os.path.join(
+                HERE, "..", "scenarios", "sensor-drift-hooks.json"
+            )
+        )
+        self.assertTrue(cfg["sensor_drift_hooks"].configured)
+        server, port, received = capture_server()
+        path = os.path.join(tempfile.mkdtemp(), "run.jsonl")
+        try:
+            # The scenario's URL is a placeholder; point it at
+            # the stub server for this run.
+            cfg["sensor_drift_hooks"] = (
+                validate_sensor_drift_hooks(
+                    {"webhook_url": "http://127.0.0.1:%d/hooks" % port}
+                )
+            )
+            ward = build_ward(cfg, seed=42)
+            with Recorder(path, ward.beds, ward.rate_hz, seed=42) as rec:
+                ward.recorder = rec
+                for _ in range(70):
+                    snap = ward.tick()
+            self.assertTrue(ward.sensor_drift_hooks.wait(timeout=5))
+            # Two events over the run: the sensor starts
+            # drifting at 5 s and the drift window closes at
+            # 65 s. The deliveries run in separate daemon
+            # threads, so their arrival order at the stub is
+            # not guaranteed — sort by event time before
+            # asserting.
+            self.assertEqual(len(received), 2)
+            payloads = sorted(
+                (json.loads(r[2]) for r in received),
+                key=lambda p: p["t"],
+            )
+            self.assertEqual(
+                [
+                    (p["event"], p["t"], p.get("bed"))
+                    for p in payloads
+                ],
+                [
+                    ("sensor_drift_started", 5.0, None),
+                    ("sensor_drift_ended", 65.0, None),
+                ],
+            )
+            # Every event records that its hook was invoked.
+            for event in snap["sensor_drift"]["events"]:
+                self.assertTrue(event["hook_invoked"])
+            summary = ward.sensor_drift_summary()
+            self.assertEqual(summary["event_count"], 2)
+            self.assertEqual(
+                summary["sensor_drift_hooks"],
+                {"configured": True, "invoked": 2, "failed": 0, "retries": 0, "delivered": 2},
+            )
+            # The run summary carries the event count and the
+            # hook totals from the last tick — but only as of
+            # that tick: the snapshot in the file was recorded
+            # before the last delivery settled, so delivered is
+            # read from the live summary above, not from here.
+            run = summarize(path)
+            self.assertEqual(run["sensor_drift"]["event_count"], 2)
+            self.assertTrue(
+                run["sensor_drift"]["sensor_drift_hooks"]["configured"]
+            )
+            self.assertEqual(
+                run["sensor_drift"]["sensor_drift_hooks"]["invoked"], 2
             )
         finally:
             server.shutdown()

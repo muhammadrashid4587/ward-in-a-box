@@ -102,7 +102,9 @@ def summarize(path):
     each risk level — and sensor-drift totals from the last tick:
     how many beds have a drifted sensor, each drifting bed's
     accumulated bias per vital, and the largest absolute bias per
-    vital — and bed-blocker totals from the last tick: how many
+    vital — plus how many sensor-drift hook events fired this run,
+    and whether the sensor-drift hooks are configured and how many
+    hook deliveries were invoked — and bed-blocker totals from the last tick: how many
     beds are blocked and why, how many discharges are still held
     by a block, and how many discharges the run has held this
     way — and oxygen-outage totals from the last tick: how many
@@ -488,6 +490,15 @@ def summarize(path):
         # vital, and the largest absolute bias per vital — so a
         # run's slow miscalibration is visible without replaying
         # every tick.
+        # Sensor-drift totals from the last tick: how many beds
+        # have a drifted sensor, each drifting bed's accumulated
+        # bias per vital, and the largest absolute bias per
+        # vital — so a run's sensor miscalibration is visible
+        # without replaying every tick — plus how many
+        # sensor-drift hook events fired this run, and whether
+        # the sensor-drift hooks are configured and how many
+        # hook deliveries were invoked, failed, retried, and
+        # delivered.
         "sensor_drift": (
             {
                 "beds_drifting": last_sensor_drift["beds_drifting"],
@@ -497,6 +508,19 @@ def summarize(path):
                     if b["drifting"]
                 },
                 "max_bias": last_sensor_drift.get("max_bias", {}),
+                "event_count": last_sensor_drift.get(
+                    "event_count", 0
+                ),
+                "sensor_drift_hooks": last_sensor_drift.get(
+                    "sensor_drift_hooks",
+                    {
+                        "configured": False,
+                        "invoked": 0,
+                        "failed": 0,
+                        "retries": 0,
+                        "delivered": 0,
+                    },
+                ),
             }
             if last_sensor_drift is not None
             else None
