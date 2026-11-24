@@ -269,7 +269,7 @@ class Ward:
     def tick(self, dt=None):
         dt = dt if dt is not None else 1.0 / self.rate_hz
         self.elapsed = round(self.elapsed + dt, 3)
-        self.chaos.apply(self, self.elapsed)
+        self.chaos.apply(self, self.elapsed, dt)
         # Discharge planning: orders due now are placed, and orders
         # whose expected time has arrived are discharged — or queued
         # behind a full cleaning roster until a slot frees up.
@@ -432,7 +432,7 @@ class Ward:
         # in, and before the snapshot, so the event is in it.
         # A tick where the order is unchanged fires nothing.
         self._check_priority_order()
-        snap = {"t": self.elapsed, "beds": readings, "staffing": self.staffing_summary(), "turnover": self.turnover_summary(), "meds": self.meds_summary(), "triage": self.triage_summary(), "arrivals": self.arrivals_summary(), "discharge": self.discharge_summary(), "discharge_readiness": self.readiness_summary(), "discharge_priority": self.discharge_priority_summary(), "early_warning": self.early_warning_summary()}
+        snap = {"t": self.elapsed, "beds": readings, "staffing": self.staffing_summary(), "turnover": self.turnover_summary(), "meds": self.meds_summary(), "triage": self.triage_summary(), "arrivals": self.arrivals_summary(), "discharge": self.discharge_summary(), "discharge_readiness": self.readiness_summary(), "discharge_priority": self.discharge_priority_summary(), "early_warning": self.early_warning_summary(), "sensor_drift": self.sensor_drift_summary()}
         with self._lock:
             self.latest = snap
         if self.recorder is not None:
@@ -443,6 +443,31 @@ class Ward:
         """Most recent snapshot, or None before the first tick."""
         with self._lock:
             return self.latest
+
+    def sensor_drift_summary(self):
+        """Per-bed sensor-drift state and ward totals.
+
+        ``beds`` carries each bed's accumulated bias per vital
+        (empty while its sensor is clean); ``beds_drifting``
+        counts the beds with any bias, and ``max_bias`` is the
+        largest absolute bias on any bed per vital, so a client
+        can see at a glance how far the ward's sensors have
+        wandered. The bias is a property of the sensor, not the
+        patient: it stays after the drift event ends and is
+        cleared only when a new patient is admitted to the bed.
+        """
+        beds = [m.sensor_drift_detail() for m in self.monitors]
+        max_bias = {}
+        for b in beds:
+            for vital, bias in b["drift"].items():
+                if abs(bias) > abs(max_bias.get(vital, 0.0)):
+                    max_bias[vital] = bias
+        return {
+            "t": self.elapsed,
+            "beds": beds,
+            "beds_drifting": sum(1 for b in beds if b["drifting"]),
+            "max_bias": max_bias,
+        }
 
     def alarm_summary(self, window_s=60.0):
         """Per-bed alarm history and rate metrics for the whole ward."""

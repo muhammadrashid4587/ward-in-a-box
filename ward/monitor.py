@@ -20,7 +20,7 @@ from .news2 import (
     validate_consciousness_dynamics,
     validate_news2_trend,
 )
-from .vitals import alarms_for, initial_signs, step, validate_acuity
+from .vitals import PLAUSIBLE, alarms_for, initial_signs, step, validate_acuity
 
 # Where an alarm storm drags each vital. All of them trip an alarm.
 ALARM_TARGETS = {
@@ -104,6 +104,17 @@ class Monitor:
         )
         self.rng = rng if rng is not None else random.Random()
         self.signs = initial_signs(profile, self.rng, self.acuity)
+        # Slow sensor drift: the accumulated bias per vital, in the
+        # vital's own units, grown by the chaos engine while a
+        # sensor_drift event is active (see :meth:`apply_drift`).
+        # Only vitals with a non-zero bias are listed. The bias is
+        # a property of the sensor, not the patient: it is added to
+        # the reading the monitor reports, so the NEWS2 score and
+        # the alarms see the drifted values, while ``self.signs``
+        # keeps the patient's true vitals and the random walk is
+        # never fed the drift — a miscalibrated sensor does not
+        # change the patient, only what the ward sees.
+        self.sensor_drift = {}
         self.seq = 0
         # False until the ward admits this bed (scenario timeline); an
         # unadmitted bed emits no readings at all.
@@ -303,6 +314,10 @@ class Monitor:
         # A new patient starts with no NEWS2 history either: the
         # previous patient's scores do not carry over.
         self.news2_history.clear()
+        # A new admission recalibrates the sensor: the drifted
+        # bias belonged to the previous patient's stay, and the
+        # new patient starts from a clean sensor.
+        self.sensor_drift = {}
         self.signs = initial_signs(self.profile, self.rng, self.acuity)
         self.seq = 0
         self.last_reading = None
@@ -315,6 +330,56 @@ class Monitor:
         """Advance the medication schedule (no-op while unadmitted)."""
         if self.admitted:
             self.meds.tick(now, load_factor, stockout_meds)
+
+    def apply_drift(self, rates, dt=1.0):
+        """Grow the sensor bias by ``rate * dt`` per vital.
+
+        Called by the chaos engine once per tick while a
+        sensor_drift event is active. The bias is pure
+        arithmetic — no RNG — so a seeded run reproduces it
+        exactly, and it is stored per vital in that vital's own
+        units (beats per minute, percent SpO2, and so on). A
+        vital whose accumulated bias returns to exactly zero
+        drops out of the map, so ``sensor_drift`` only ever
+        lists vitals that are actually off. The bias persists
+        after the event ends: a drifted sensor stays drifted
+        until the bed is re-admitted.
+        """
+        for vital, rate in rates.items():
+            bias = round(self.sensor_drift.get(vital, 0.0) + rate * dt, 3)
+            if bias == 0:
+                self.sensor_drift.pop(vital, None)
+            else:
+                self.sensor_drift[vital] = bias
+
+    def reported_signs(self):
+        """The vitals as the sensor reports them: true vitals
+        plus the accumulated drift bias, clamped inside the
+        plausible envelope so a runaway drift saturates at the
+        edge of what a real monitor would ever show."""
+        out = {}
+        for key, value in self.signs.items():
+            lo, hi = PLAUSIBLE[key]
+            out[key] = round(
+                max(lo, min(hi, value + self.sensor_drift.get(key, 0.0))),
+                2,
+            )
+        return out
+
+    def sensor_drift_detail(self):
+        """Per-bed sensor-drift state as plain JSON data.
+
+        ``drift`` is the accumulated bias per vital (empty while
+        the sensor is clean), ``drifting`` is True while any
+        vital is off — so a client can tell a clean sensor from
+        a drifted one at a glance.
+        """
+        return {
+            "bed": self.bed_id,
+            "admitted": self.admitted,
+            "drift": dict(self.sensor_drift),
+            "drifting": bool(self.sensor_drift),
+        }
 
     def turnover_summary(self, now):
         """Per-bed turnover state and totals as plain JSON data."""
@@ -368,6 +433,17 @@ class Monitor:
         self._step_consciousness(now, dt)
 
         self.seq += 1
+        # The reading reports the drifted values: the sensor bias
+        # is added to the true vitals and clamped inside the
+        # plausible envelope, so a runaway drift saturates at the
+        # edge of what a real monitor would ever show instead of
+        # reporting something impossible. The alarms and the NEWS2
+        # score are computed from these reported values — that is
+        # the point of the drift: the ward reacts to what the
+        # sensor says, and a slowly drifting sensor makes the
+        # score creep and the readiness flag flip gradually,
+        # exactly as a real miscalibration would.
+        reported = self.reported_signs()
         reading = {
             "bed": self.bed_id,
             "seq": self.seq,
@@ -377,9 +453,10 @@ class Monitor:
             "on_oxygen": self.on_oxygen,
             "consciousness": self.consciousness,
             "stale": False,
-            **self.signs,
+            "sensor_drift": dict(self.sensor_drift),
+            **reported,
         }
-        reading["alarms"] = alarms_for(self.signs)
+        reading["alarms"] = alarms_for(reported)
         if self.meds.missed_active:
             # A missed dose raises an alarm until that medication's
             # next dose is given.
@@ -390,7 +467,7 @@ class Monitor:
         # are exactly as before — it only records how sick the
         # patient looks on the NEWS2 scale.
         reading["news2"] = score_signs(
-            self.signs, self.on_oxygen, self.consciousness
+            reported, self.on_oxygen, self.consciousness
         )
         self._track_escalation(reading["news2"], now, load_factor)
         # This tick's score joins the bed's history, so a client can

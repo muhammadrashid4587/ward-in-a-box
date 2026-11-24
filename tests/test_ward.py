@@ -8886,5 +8886,257 @@ class TestNEWS2StaffingEscalation(unittest.TestCase):
             os.unlink(path)
 
 
+class TestSensorDrift(unittest.TestCase):
+    # A slow sensor drift: one bed's SpO2 sensor reads 0.15 lower
+    # every second and its heart-rate sensor 0.5 higher, for 60 s
+    # from t=5 — so the bias ramps to -9.0 SpO2 / +30.0 bpm, the
+    # NEWS2 score creeps from 0 to medium, a low_spo2 alarm raises
+    # once the reported SpO2 crosses 90, and the bed stops being
+    # discharge-ready. The other bed is the control: same profile,
+    # no drift, NEWS2 0 throughout.
+    DRIFT = {"heart_rate": 0.5, "spo2": -0.15}
+
+    def _drift_ward(self):
+        return Ward(
+            beds=2,
+            profiles=["stable", "stable"],
+            chaos=[
+                ChaosEvent(
+                    "sensor_drift",
+                    at=5,
+                    duration=60,
+                    bed=0,
+                    drift=self.DRIFT,
+                )
+            ],
+            seed=42,
+            discharge_readiness={"stable_window_s": 5},
+        )
+
+    def test_drift_config_validation(self):
+        # A drift event needs a drift map.
+        with self.assertRaises(ValueError):
+            ChaosEvent("sensor_drift", at=0, duration=10, bed=0)
+        with self.assertRaises(ValueError):
+            ChaosEvent(
+                "sensor_drift", at=0, duration=10, bed=0, drift={}
+            )
+        # Unknown vitals, non-numeric rates, and all-zero rates
+        # are all scenario bugs.
+        with self.assertRaises(ValueError):
+            ChaosEvent(
+                "sensor_drift",
+                at=0,
+                duration=10,
+                bed=0,
+                drift={"blood_sugar": 0.1},
+            )
+        with self.assertRaises(ValueError):
+            ChaosEvent(
+                "sensor_drift",
+                at=0,
+                duration=10,
+                bed=0,
+                drift={"spo2": "fast"},
+            )
+        with self.assertRaises(ValueError):
+            ChaosEvent(
+                "sensor_drift",
+                at=0,
+                duration=10,
+                bed=0,
+                drift={"spo2": 0.0},
+            )
+        # Zero rates are dropped, non-zero ones kept as floats.
+        ev = ChaosEvent(
+            "sensor_drift",
+            at=0,
+            duration=10,
+            bed=0,
+            drift={"spo2": -0.1, "heart_rate": 0},
+        )
+        self.assertEqual(ev.drift, {"spo2": -0.1})
+
+    def test_drift_accumulates_linearly_and_reports_drifted_values(self):
+        monitor = Monitor(0, "stable", rng=random.Random(1))
+        monitor.signs = {
+            "heart_rate": 80.0,
+            "spo2": 97.0,
+            "systolic": 120.0,
+            "diastolic": 80.0,
+            "temperature": 37.0,
+            "resp_rate": 16.0,
+        }
+        monitor.apply_drift({"spo2": -0.1, "heart_rate": 0.5}, dt=1.0)
+        monitor.apply_drift({"spo2": -0.1, "heart_rate": 0.5}, dt=1.0)
+        # The bias is exactly rate * ticks, and only the drifted
+        # vitals are listed.
+        self.assertEqual(
+            monitor.sensor_drift, {"spo2": -0.2, "heart_rate": 1.0}
+        )
+        # The true vitals are untouched: the drift is a sensor
+        # error, not a change in the patient.
+        self.assertEqual(monitor.signs["spo2"], 97.0)
+        self.assertEqual(monitor.signs["heart_rate"], 80.0)
+        # The reported values carry the bias.
+        reported = monitor.reported_signs()
+        self.assertEqual(reported["spo2"], 96.8)
+        self.assertEqual(reported["heart_rate"], 81.0)
+        self.assertEqual(reported["systolic"], 120.0)
+
+    def test_drift_clamps_to_plausible_envelope(self):
+        monitor = Monitor(0, "stable", rng=random.Random(1))
+        monitor.signs = {
+            "heart_rate": 80.0,
+            "spo2": 97.0,
+            "systolic": 120.0,
+            "diastolic": 80.0,
+            "temperature": 37.0,
+            "resp_rate": 16.0,
+        }
+        # A runaway drift saturates at the edge of what a real
+        # monitor would ever show instead of reporting the
+        # impossible.
+        monitor.apply_drift({"spo2": 1.0}, dt=100.0)
+        self.assertEqual(monitor.reported_signs()["spo2"], 100.0)
+        monitor.apply_drift({"heart_rate": -1.0}, dt=100.0)
+        self.assertEqual(monitor.reported_signs()["heart_rate"], 30.0)
+
+    def test_drift_creeps_news2_and_flips_readiness(self):
+        ward = self._drift_ward()
+        snaps = [ward.tick() for _ in range(70)]
+        first = snaps[0]["beds"][0]
+        self.assertEqual(first["news2"]["score"], 0)
+        self.assertEqual(first["news2"]["risk"], "low")
+        self.assertEqual(first["sensor_drift"], {})
+        # The bias ramps exactly: 60 ticks of drift from t=5.
+        at_65 = snaps[64]["beds"][0]
+        self.assertEqual(
+            at_65["sensor_drift"], {"heart_rate": 30.0, "spo2": -9.0}
+        )
+        # The score creeps up with the bias instead of jumping.
+        scores = [
+            snaps[i]["beds"][0]["news2"]["score"]
+            for i in (0, 9, 29, 49, 69)
+        ]
+        self.assertEqual(scores, [0, 1, 2, 4, 5])
+        last = snaps[69]["beds"][0]
+        self.assertEqual(last["news2"]["score"], 5)
+        self.assertEqual(last["news2"]["risk"], "medium")
+        # The bias stays once the event ends: a drifted sensor
+        # does not heal itself.
+        self.assertEqual(
+            last["sensor_drift"], {"heart_rate": 30.0, "spo2": -9.0}
+        )
+        # The reported SpO2 crossed 90 at 47 s, raising a
+        # low_spo2 alarm — and the bed stopped being
+        # discharge-ready on the same tick, after flagging ready
+        # at 5 s.
+        monitor = ward.monitors[0]
+        self.assertEqual(
+            [(e["alarm"], e["raised_t"]) for e in monitor.alarm_history],
+            [("low_spo2", 47.0)],
+        )
+        self.assertEqual(
+            [(e["ready"], e["ready_t"]) for e in monitor.readiness_history],
+            [(True, 5.0), (False, 47.0)],
+        )
+        # The control bed never drifted and never scored.
+        control = snaps[69]["beds"][1]
+        self.assertEqual(control["sensor_drift"], {})
+        self.assertEqual(control["news2"]["score"], 0)
+
+    def test_drift_is_deterministic(self):
+        snaps_a = [self._drift_ward().tick() for _ in range(70)]
+        snaps_b = [self._drift_ward().tick() for _ in range(70)]
+        self.assertEqual(snaps_a, snaps_b)
+
+    def test_drift_resets_on_new_admission(self):
+        ward = Ward(
+            beds=2,
+            profiles=["stable", "stable"],
+            chaos=[
+                ChaosEvent(
+                    "sensor_drift",
+                    at=5,
+                    duration=60,
+                    bed=0,
+                    drift=self.DRIFT,
+                )
+            ],
+            seed=42,
+            cleaning_s=1.0,
+        )
+        for _ in range(20):
+            ward.tick()
+        self.assertTrue(ward.monitors[0].sensor_drift)
+        ward.discharge(0)
+        ward.tick()
+        # A new patient in the bed starts from a clean sensor.
+        ward.admit(0, profile="stable")
+        self.assertEqual(ward.monitors[0].sensor_drift, {})
+        # The drift event is still active, so the new patient's
+        # sensor starts drifting again from zero on the next tick
+        # — the sensor is still broken, only the patient changed.
+        self.assertEqual(
+            ward.tick()["beds"][0]["sensor_drift"],
+            {"heart_rate": 0.5, "spo2": -0.15},
+        )
+
+    def test_sensor_drift_summary_and_endpoint(self):
+        ward = self._drift_ward()
+        for _ in range(70):
+            snap = ward.tick()
+        summary = snap["sensor_drift"]
+        self.assertEqual(summary["beds_drifting"], 1)
+        self.assertEqual(
+            summary["max_bias"], {"heart_rate": 30.0, "spo2": -9.0}
+        )
+        self.assertEqual(
+            summary["beds"][0]["drift"],
+            {"heart_rate": 30.0, "spo2": -9.0},
+        )
+        self.assertFalse(summary["beds"][1]["drifting"])
+        server, port = serve_in_thread(ward)
+        try:
+            status, body = get(port, "/sensor-drift")
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                json.loads(body)["beds_drifting"], 1
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_summary_reports_drift(self):
+        ward = self._drift_ward()
+        path = os.path.join(tempfile.mkdtemp(), "run.jsonl")
+        with Recorder(path, ward.beds, ward.rate_hz, seed=42) as rec:
+            ward.recorder = rec
+            for _ in range(70):
+                ward.tick()
+        summary = summarize(path)
+        self.assertEqual(summary["sensor_drift"]["beds_drifting"], 1)
+        self.assertEqual(
+            summary["sensor_drift"]["beds"],
+            {"0": {"heart_rate": 30.0, "spo2": -9.0}},
+        )
+        self.assertEqual(
+            summary["sensor_drift"]["max_bias"],
+            {"heart_rate": 30.0, "spo2": -9.0},
+        )
+
+    def test_scenario_file_loads_and_runs(self):
+        cfg = load_scenario("scenarios/sensor-drift.json")
+        self.assertEqual(len(cfg["chaos"]), 1)
+        self.assertEqual(cfg["chaos"][0].type, "sensor_drift")
+        self.assertEqual(cfg["chaos"][0].drift, self.DRIFT)
+        ward = build_ward(cfg, seed=42)
+        snaps = [ward.tick() for _ in range(70)]
+        self.assertEqual(snaps[69]["beds"][0]["news2"]["score"], 5)
+        self.assertEqual(snaps[69]["beds"][0]["news2"]["risk"], "medium")
+        self.assertEqual(snaps[69]["beds"][1]["news2"]["score"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

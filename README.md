@@ -164,6 +164,13 @@ python3 -m ward.cli scenarios/news2-acvpu.json --seed 42
 # quiet — 3 trend alerts raised, 1 still open at the end
 python3 -m ward.cli scenarios/news2-trend.json --seed 42
 
+# Slow sensor drift: bed 0's SpO2 sensor reads 0.15 lower every
+# second and its heart-rate sensor 0.5 higher, for 60 s from 5 s —
+# its NEWS2 creeps from 0 to 5 (medium), a low_spo2 alarm raises
+# at 47 s, and it stops being discharge-ready on the same tick,
+# while bed 1 stays at NEWS2 0
+python3 -m ward.cli scenarios/sensor-drift.json --seed 42
+
 # NEWS2 trend alert hooks: the same ward, with each trend alert
 # also POSTed to a webhook (here a placeholder URL — point it at
 # your own endpoint; a dead endpoint is logged, never fatal)
@@ -246,6 +253,10 @@ python3 -m ward.cli scenarios/example.json --seed 42
   (see below); `?bed=N` returns one bed
   (404 for a bed the ward does not have, 400 for a bed that is not
   an integer), as JSON (503 while partitioned)
+- `GET /sensor-drift` — per-bed sensor-drift state: the accumulated
+  bias per vital on each bed, how many beds have a drifted sensor,
+  and the largest absolute bias per vital, as JSON
+  (503 while partitioned)
 
 A reading looks like:
 
@@ -277,8 +288,9 @@ medication summary from `/meds`, the triage summary from
 `/triage`, the live arrivals view from `/arrivals`, the
 discharge summary from `/discharge`, the discharge-readiness
 summary from `/discharge-readiness`, the discharge-priority
-summary from `/discharge-priority`, and the early-warning
-summary from `/news2`, so a client gets bed occupancy, vitals, alarms, staffing,
+summary from `/discharge-priority`, the early-warning
+summary from `/news2`, and the sensor-drift summary from
+`/sensor-drift`, so a client gets bed occupancy, vitals, alarms, staffing,
 medication, and the intake queue in one message. Ping frames are answered with pong, close frames
 are echoed and the connection is then closed; text frames from the
 client are accepted and ignored — the ward pushes ticks, it takes no
@@ -367,6 +379,14 @@ Chaos types:
   medication metrics, and flagged with a `missed_dose` alarm; see
   Pharmacy stockouts below. Without `bed`/`beds` it applies to every
   bed that has the medication prescribed.
+- `sensor_drift` — a bed's sensor slowly miscalibrates for `duration`
+  seconds; needs `"drift"`, a map of vital to drift rate per second
+  (for example `{"spo2": -0.15, "heart_rate": 0.5}`). While the event
+  is active the bias grows by `rate * dt` every tick, so the reported
+  reading creeps away from the patient's true vitals instead of
+  jumping — a ramp, not a step. The bias stays once the event ends
+  (a drifted sensor does not heal itself) and is cleared only when a
+  new patient is admitted to the bed; see Slow sensor drift below.
 
 `bed` targets one bed, `beds` targets several, neither targets all beds
 (`partition` is always ward-wide). Times are elapsed seconds from start.
@@ -532,6 +552,48 @@ runnable example: over a seeded 3700-tick run the insulin doses due
 at 1200 s and 2400 s are skipped while the pharmacy is out, the
 doses due at 0 s and 3600 s are given, and the metoprolol on the
 other bed is unaffected.
+
+## Slow sensor drift
+
+A `sensor_drift` chaos event makes one or more beds' sensors
+slowly miscalibrate:
+
+```json
+{"type": "sensor_drift", "bed": 0, "at": 5, "duration": 60,
+ "drift": {"spo2": -0.15, "heart_rate": 0.5}}
+```
+
+While the event is active, each target bed's bias for those vitals
+grows by `rate * dt` every tick — SpO2 reading 0.15 lower every
+second, heart rate 0.5 higher — so the reported reading creeps
+away from the patient's true vitals. The bias is a property of
+the sensor, not the patient: the monitor's stored vitals stay
+true, and only the reading it reports — and the alarms and NEWS2
+score computed from it — see the drift. A runaway drift saturates
+at the edge of the plausible envelope (SpO2 never reports above
+100, heart rate never below 30), so the ward never shows a reading
+a real monitor could not. The bias persists after the event ends,
+and a new admission recalibrates the sensor, so a fresh patient
+starts clean — though a still-active drift event starts drifting
+them again from zero on the next tick.
+
+The point is the creep: a step change trips alarms at once, but a
+drift makes the NEWS2 score climb one point at a time and flips
+discharge-readiness off only when the reported vitals finally cross
+a band — the failure mode a ward's early-warning and discharge
+software has to catch gradually, not at once. Every reading
+carries its bed's current bias (`"sensor_drift"`, empty while the
+sensor is clean), every snapshot carries a `"sensor_drift"` object
+with the per-bed biases, how many beds are drifting, and the
+largest absolute bias per vital, served on its own by
+`GET /sensor-drift` and carried in every WebSocket frame, and the
+run summary (`--summary`) reports the same totals from the last
+tick. See `scenarios/sensor-drift.json` for a runnable example:
+over a seeded 70-tick run bed 0's SpO2 bias reaches -9.0 and its
+heart-rate bias +30.0, its NEWS2 creeps 0, 1, 2, 4, 5 to medium
+risk, a `low_spo2` alarm raises at 47 s, and it stops being
+discharge-ready on the same tick after flagging ready at 5 s,
+while bed 1 stays at NEWS2 0.
 
 ## Triage / ED intake queue
 
@@ -2322,3 +2384,21 @@ run.
   within a tick only, scheduled and manual orders are untouched,
   and queued discharges still start cleaning in expected-time
   order) — done in v0.43.0
+- Queued cleaning in NEWS2 priority order (a discharge waiting
+  for a cleaning slot starts cleaning in discharge-priority
+  order — safest first, by NEWS2 at the flip that made the bed
+  ready — not in expected-time order, so among patients delayed
+  by the same backlog the safest patient gets the next slot even
+  when their discharge was due later; a bed that never flagged
+  ready waits behind every ready bed; the queue is visible in
+  the discharge summary as `cleaning_queue` and in the run
+  summary) — done in v0.44.0
+- Slow sensor drift (a `sensor_drift` chaos event grows a
+  per-vital bias by `rate * dt` every tick it is active, so the
+  reported reading creeps away from the patient's true vitals
+  and the NEWS2 score climbs gradually instead of jumping, with
+  the bias persisting after the event ends and cleared only on a
+  new admission; the bias rides in every reading, a
+  `"sensor_drift"` object in every snapshot, WebSocket frame, a
+  `GET /sensor-drift` endpoint, and the run summary) — done in
+  v0.45.0

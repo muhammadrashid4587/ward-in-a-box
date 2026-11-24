@@ -125,6 +125,11 @@ def make_handler(ward):
                     )
                 except ValueError:
                     self._send_json(404, {"error": "no bed %s" % raw})
+            elif path == "/sensor-drift":
+                if ward.partitioned:
+                    self._send_json(503, {"error": "partitioned"})
+                    return
+                self._send_json(200, ward.sensor_drift_summary())
             elif path == "/stream":
                 if ward.partitioned:
                     self._send_json(503, {"error": "partitioned"})
@@ -226,6 +231,7 @@ def make_handler(ward):
                             ward.discharge_priority_summary()
                         ),
                         "early_warning": ward.early_warning_summary(),
+                        "sensor_drift": ward.sensor_drift_summary(),
                     }
                     send(OP_TEXT, json.dumps(msg))
                     stop.wait(1.0 / ward.rate_hz)
