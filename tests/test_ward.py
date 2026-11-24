@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from ward.alert_hooks import (
     TrendAlertHooks,
     validate_boarding_full_hooks,
+    validate_discharge_priority_hooks,
     validate_discharge_readiness_hooks,
     validate_escalation_hooks,
     validate_missed_dose_hooks,
@@ -3210,6 +3211,451 @@ class TestDischargeReadinessHooks(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+
+class TestDischargePriorityHooks(unittest.TestCase):
+    def _ward(self, hooks=None, **kw):
+        kwargs = {
+            "beds": 1,
+            "profiles": ["stable"],
+            "discharge_readiness": {"stable_window_s": 5},
+            "discharge_priority_hooks": hooks,
+            "seed": 42,
+        }
+        kwargs.update(kw)
+        return Ward(**kwargs)
+
+    def _priority_ward(self, hooks=None):
+        # Stable, tachycardic, hypoxic, febrile: the same mix as
+        # scenarios/discharge-priority.json, with a 5 s window.
+        return Ward(
+            beds=4,
+            profiles=["stable", "tachycardic", "hypoxic", "febrile"],
+            discharge_readiness={"stable_window_s": 5},
+            discharge_priority_hooks=hooks,
+            seed=42,
+        )
+
+    def _flaky_server(self, fail_first=2, status=500):
+        """A stub server that fails the first ``fail_first``
+        attempts for each distinct payload with ``status``, then
+        answers 200. Returns ``(server, port, received)``:
+        ``received`` is a list of ``(path, content_type,
+        body_bytes)`` in arrival order. The caller shuts the
+        server down."""
+        received = []
+        attempts = {}
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length)
+                received.append(
+                    (self.path, self.headers.get("Content-Type"), body)
+                )
+                seen = attempts.get(body, 0)
+                attempts[body] = seen + 1
+                code = status if seen < fail_first else 200
+                self.send_response(code)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(
+            target=server.serve_forever, daemon=True
+        )
+        thread.start()
+        return server, server.server_address[1], received
+
+    def test_validate_discharge_priority_hooks(self):
+        hooks = validate_discharge_priority_hooks(None)
+        self.assertIsInstance(hooks, TrendAlertHooks)
+        self.assertFalse(hooks.configured)
+        self.assertEqual(hooks.kind, "discharge-priority")
+        custom = validate_discharge_priority_hooks(
+            {"webhook_url": "https://example.invalid/hooks", "timeout_s": 2}
+        )
+        self.assertTrue(custom.configured)
+        self.assertEqual(custom.kind, "discharge-priority")
+        self.assertEqual(custom.timeout_s, 2.0)
+        seen = []
+        append = seen.append
+        cb = validate_discharge_priority_hooks({"callback": append})
+        self.assertTrue(cb.configured)
+        self.assertIs(cb.callback, append)
+        with self.assertRaises(ValueError):
+            validate_discharge_priority_hooks(
+                {"webhook_url": "ftp://x/hooks"}
+            )
+        with self.assertRaises(ValueError):
+            validate_discharge_priority_hooks({"callback": "not callable"})
+        with self.assertRaises(ValueError):
+            validate_discharge_priority_hooks({"timeout_s": 0})
+        with self.assertRaises(ValueError):
+            validate_discharge_priority_hooks({"url": "http://x/hooks"})
+        with self.assertRaises(ValueError):
+            validate_discharge_priority_hooks("http://x/hooks")
+
+    def test_hooks_off_by_default(self):
+        # No hooks configured: the order still changes, and each
+        # change is recorded with no hook invoked.
+        ward = self._ward()
+        self.assertFalse(ward.discharge_priority_hooks.configured)
+        for _ in range(5):
+            ward.tick()  # t=5: ready, order [] -> [0]
+        summary = ward.discharge_priority_summary()
+        self.assertEqual(summary["ready"], 1)
+        self.assertEqual(summary["priority_changes"], 1)
+        self.assertEqual(
+            summary["discharge_priority_hooks"],
+            {"configured": False, "invoked": 0, "failed": 0, "retries": 0, "delivered": 0},
+        )
+        event = summary["changes"][0]
+        self.assertEqual(event["event"], "discharge_priority_changed")
+        self.assertEqual(event["t"], 5.0)
+        self.assertEqual(event["previous_beds"], [])
+        self.assertFalse(event["hook_invoked"])
+        self.assertEqual(event["hook_errors"], [])
+        self.assertEqual(event["hook_retries"], 0)
+        self.assertEqual(event["hook_final_status"], "not_invoked")
+        self.assertEqual(
+            ward.snapshot()["discharge_priority"]["priority_changes"], 1
+        )
+
+    def test_callback_hook_fires_when_order_changes(self):
+        seen = []
+        ward = self._priority_ward({"callback": seen.append})
+        self.assertTrue(ward.discharge_priority_hooks.configured)
+        for _ in range(60):
+            ward.tick()
+        # Seven order changes over the run: beds 0, 1 and 3 flag
+        # ready at 5 s, bed 3 drops out at 8 s, bed 3 flags ready
+        # again at 39 s (and slots in ahead of bed 1 on NEWS2),
+        # bed 2 joins at 49 s and drops out at 50 s, bed 3 drops
+        # out at 51 s, and bed 2 flags ready again at 59 s.
+        self.assertEqual(
+            [
+                (p["t"], [b["bed"] for b in p["beds"]])
+                for p in seen
+            ],
+            [
+                (5.0, [0, 1, 3]),
+                (8.0, [0, 1]),
+                (39.0, [0, 3, 1]),
+                (49.0, [0, 3, 1, 2]),
+                (50.0, [0, 3, 1]),
+                (51.0, [0, 1]),
+                (59.0, [0, 1, 2]),
+            ],
+        )
+        # The payload carries the ordered bed list in the same
+        # shape as GET /discharge-priority serves it.
+        first = seen[0]
+        self.assertEqual(first["event"], "discharge_priority_changed")
+        self.assertEqual(first["previous_beds"], [])
+        self.assertEqual(
+            first["beds"][0],
+            {
+                "bed": 0,
+                "news2_at_flip": 1,
+                "risk_at_flip": "low",
+                "news2": 1,
+                "ready_t": 5.0,
+                "time_ready_s": 0.0,
+            },
+        )
+        endpoint = ward.discharge_priority_summary()["beds"]
+        self.assertEqual(
+            [b["bed"] for b in endpoint], [0, 1, 2]
+        )
+        self.assertEqual(
+            [b["news2_at_flip"] for b in endpoint], [1, 3, 6]
+        )
+        # Every change event records the invocation.
+        summary = ward.discharge_priority_summary()
+        self.assertEqual(summary["priority_changes"], 7)
+        for event in summary["changes"]:
+            self.assertTrue(event["hook_invoked"])
+            self.assertEqual(event["hook_errors"], [])
+            self.assertEqual(event["hook_final_status"], "delivered")
+        self.assertEqual(
+            summary["discharge_priority_hooks"],
+            {"configured": True, "invoked": 7, "failed": 0, "retries": 0, "delivered": 7},
+        )
+
+    def test_unchanged_tick_does_not_fire(self):
+        seen = []
+        ward = self._priority_ward({"callback": seen.append})
+        for _ in range(10):
+            ward.tick()  # t=10: two changes so far, at 5 s and 8 s
+        self.assertEqual(len(seen), 2)
+        for _ in range(28):
+            ward.tick()  # t=38: the order sits at [0, 1], unchanged
+        self.assertEqual(len(seen), 2)
+        for _ in range(22):
+            ward.tick()  # t=60: five more changes
+        self.assertEqual(len(seen), 7)
+
+    def test_ready_bed_leaving_fires_empty_order(self):
+        # Bed 0 discharges at 10 s, so the order goes [0, 1] ->
+        # [1]; bed 1 discharges at 20 s, so it goes [1] -> [].
+        seen = []
+        ward = self._ward(
+            {"callback": seen.append},
+            beds=2,
+            profiles=["stable", "stable"],
+            chaos=[
+                ChaosEvent("discharge", at=10, duration=0, bed=0),
+                ChaosEvent("discharge", at=20, duration=0, bed=1),
+            ],
+        )
+        for _ in range(25):
+            ward.tick()
+        self.assertEqual(
+            [
+                (p["t"], [b["bed"] for b in p["beds"]])
+                for p in seen
+            ],
+            [(5.0, [0, 1]), (10.0, [1]), (20.0, [])],
+        )
+        self.assertEqual(seen[2]["previous_beds"], [1])
+        self.assertEqual(
+            ward.discharge_priority_summary()["priority_changes"], 3
+        )
+
+    def test_callback_failure_is_not_fatal(self):
+        def boom(payload):
+            raise ValueError("pager is down")
+
+        ward = self._ward({"callback": boom})
+        for _ in range(5):
+            ward.tick()  # t=5: ready, hook raises
+        snap = ward.tick()  # t=6: the tick still completes
+        self.assertTrue(snap["beds"][0]["online"])
+        event = ward.discharge_priority_summary()["changes"][0]
+        self.assertTrue(event["hook_invoked"])
+        self.assertEqual(event["hook_errors"], ["pager is down"])
+        self.assertEqual(event["hook_final_status"], "failed")
+        summary = ward.discharge_priority_summary()[
+            "discharge_priority_hooks"
+        ]
+        self.assertEqual(summary["invoked"], 1)
+        self.assertEqual(summary["failed"], 1)
+
+    def test_webhook_hook_posts_to_stub_server(self):
+        server, port, received = capture_server()
+        try:
+            ward = self._ward(
+                {"webhook_url": "http://127.0.0.1:%d/hooks" % port}
+            )
+            for _ in range(5):
+                ward.tick()  # t=5: ready, order [] -> [0]
+            self.assertTrue(ward.discharge_priority_hooks.wait(timeout=5))
+            self.assertEqual(len(received), 1)
+            path, content_type, body = received[0]
+            self.assertEqual(path, "/hooks")
+            self.assertEqual(content_type, "application/json")
+            payload = json.loads(body)
+            self.assertEqual(payload["event"], "discharge_priority_changed")
+            self.assertEqual(payload["t"], 5.0)
+            self.assertEqual(payload["previous_beds"], [])
+            self.assertEqual(
+                payload["beds"],
+                [
+                    {
+                        "bed": 0,
+                        "news2_at_flip": 2,
+                        "risk_at_flip": "low",
+                        "news2": 2,
+                        "ready_t": 5.0,
+                        "time_ready_s": 0.0,
+                    }
+                ],
+            )
+            event = ward.discharge_priority_summary()["changes"][0]
+            self.assertTrue(event["hook_invoked"])
+            self.assertEqual(event["hook_errors"], [])
+            self.assertEqual(event["hook_final_status"], "delivered")
+            summary = ward.discharge_priority_summary()[
+                "discharge_priority_hooks"
+            ]
+            self.assertEqual(
+                summary, {"configured": True, "invoked": 1, "failed": 0, "retries": 0, "delivered": 1}
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_webhook_failure_retries_then_delivers(self):
+        # The endpoint 500s twice, then answers 200: the delivery
+        # lands on the third attempt.
+        server, port, received = self._flaky_server(fail_first=2)
+        try:
+            ward = self._ward(
+                {
+                    "webhook_url": "http://127.0.0.1:%d/hooks" % port,
+                    "max_retries": 2,
+                    "retry_backoff_s": 0.05,
+                }
+            )
+            for _ in range(5):
+                ward.tick()  # t=5: ready, order [] -> [0]
+            self.assertTrue(ward.discharge_priority_hooks.wait(timeout=5))
+            self.assertEqual(len(received), 3)
+            event = ward.discharge_priority_summary()["changes"][0]
+            self.assertEqual(event["hook_retries"], 2)
+            self.assertEqual(event["hook_final_status"], "delivered")
+            summary = ward.discharge_priority_summary()[
+                "discharge_priority_hooks"
+            ]
+            self.assertEqual(summary["invoked"], 1)
+            self.assertEqual(summary["failed"], 0)
+            self.assertEqual(summary["retries"], 2)
+            self.assertEqual(summary["delivered"], 1)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_scenario_discharge_priority_hooks(self):
+        cfg = load_scenario(
+            os.path.join(
+                HERE, "..", "scenarios", "discharge-priority-hooks.json"
+            )
+        )
+        self.assertTrue(cfg["discharge_priority_hooks"].configured)
+        server, port, received = capture_server()
+        try:
+            # The scenario's URL is a placeholder; point it at
+            # the stub server for this run.
+            cfg["discharge_priority_hooks"] = (
+                validate_discharge_priority_hooks(
+                    {"webhook_url": "http://127.0.0.1:%d/hooks" % port}
+                )
+            )
+            ward = build_ward(cfg, seed=42)
+            for _ in range(60):
+                snap = ward.tick()
+            self.assertTrue(ward.discharge_priority_hooks.wait(timeout=5))
+            # Seven order changes over the run, as in the
+            # callback test: the deliveries run in separate
+            # daemon threads, so their arrival order at the stub
+            # is not guaranteed — sort by change time before
+            # asserting.
+            self.assertEqual(len(received), 7)
+            payloads = sorted(
+                (json.loads(r[2]) for r in received),
+                key=lambda p: p["t"],
+            )
+            self.assertEqual(
+                [p["event"] for p in payloads],
+                ["discharge_priority_changed"] * 7,
+            )
+            self.assertEqual(
+                [
+                    (p["t"], [b["bed"] for b in p["beds"]])
+                    for p in payloads
+                ],
+                [
+                    (5.0, [0, 1, 3]),
+                    (8.0, [0, 1]),
+                    (39.0, [0, 3, 1]),
+                    (49.0, [0, 3, 1, 2]),
+                    (50.0, [0, 3, 1]),
+                    (51.0, [0, 1]),
+                    (59.0, [0, 1, 2]),
+                ],
+            )
+            # Every change event records that its hook was invoked.
+            for event in snap["discharge_priority"]["changes"]:
+                self.assertTrue(event["hook_invoked"])
+            # The totals are read from a fresh summary after the
+            # wait: the snapshot from the last tick was taken
+            # before the last delivery settled.
+            summary = ward.discharge_priority_summary()
+            self.assertEqual(summary["priority_changes"], 7)
+            self.assertEqual(
+                summary["discharge_priority_hooks"],
+                {"configured": True, "invoked": 7, "failed": 0, "retries": 0, "delivered": 7},
+            )
+            self.assertEqual(summary["ready"], 3)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_priority_hooks_in_endpoint_snapshot_and_ws(self):
+        ward = self._ward()
+        for _ in range(5):
+            ward.tick()  # t=5: ready, one order change recorded
+        snap = ward.snapshot()
+        self.assertEqual(snap["discharge_priority"]["priority_changes"], 1)
+        self.assertEqual(
+            snap["discharge_priority"]["discharge_priority_hooks"],
+            {"configured": False, "invoked": 0, "failed": 0, "retries": 0, "delivered": 0},
+        )
+        server, port = serve_in_thread(ward)
+        try:
+            status, body = get(port, "/discharge-priority")
+            self.assertEqual(status, 200)
+            priority = json.loads(body)
+            self.assertEqual(priority["priority_changes"], 1)
+            self.assertEqual(
+                priority["discharge_priority_hooks"],
+                {"configured": False, "invoked": 0, "failed": 0, "retries": 0, "delivered": 0},
+            )
+            self.assertEqual(
+                [b["bed"] for b in priority["beds"]], [0]
+            )
+            ws = WsClient(port)
+            try:
+                msg = json.loads(ws.read_until_opcode(1))
+                self.assertIn("discharge_priority", msg)
+                self.assertEqual(
+                    msg["discharge_priority"]["priority_changes"], 1
+                )
+                self.assertEqual(
+                    msg["discharge_priority"]["discharge_priority_hooks"],
+                    {"configured": False, "invoked": 0, "failed": 0, "retries": 0, "delivered": 0},
+                )
+            finally:
+                ws.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_recorder_summary_carries_hook_totals(self):
+        seen = []
+        ward = self._ward({"callback": seen.append})
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".jsonl", delete=False
+        ) as f:
+            path = f.name
+        try:
+            with Recorder(path, ward.beds, ward.rate_hz, seed=42) as rec:
+                ward.recorder = rec
+                for _ in range(5):
+                    ward.tick()
+            self.assertEqual(len(seen), 1)
+            summary = summarize(path)
+            self.assertEqual(summary["discharge_priority"]["ready"], 1)
+            self.assertEqual(
+                [b["bed"] for b in summary["discharge_priority"]["beds"]],
+                [0],
+            )
+            self.assertEqual(
+                summary["discharge_priority"]["priority_changes"], 1
+            )
+            hooks = summary["discharge_priority"][
+                "discharge_priority_hooks"
+            ]
+            self.assertEqual(
+                hooks, {"configured": True, "invoked": 1, "failed": 0, "retries": 0, "delivered": 1}
+            )
+        finally:
+            os.unlink(path)
 
 
 class TestAutoDischargeOrders(unittest.TestCase):

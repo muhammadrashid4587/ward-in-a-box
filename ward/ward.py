@@ -6,6 +6,7 @@ import time
 
 from .alert_hooks import (
     validate_boarding_full_hooks,
+    validate_discharge_priority_hooks,
     validate_discharge_readiness_hooks,
     validate_escalation_hooks,
     validate_missed_dose_hooks,
@@ -45,7 +46,7 @@ class Ward:
     snapshot to a JSONL file.
     """
 
-    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None, cleaning_s=30.0, meds=None, triage=None, discharge_planning=None, cleaning_capacity=None, discharge_readiness=None, oxygen=None, consciousness=None, consciousness_dynamics=None, news2_trend=None, trend_alert_hooks=None, escalation_hooks=None, boarding_full_hooks=None, wait_time_hooks=None, missed_dose_hooks=None, discharge_readiness_hooks=None, news2_staffing_escalation=None):
+    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None, cleaning_s=30.0, meds=None, triage=None, discharge_planning=None, cleaning_capacity=None, discharge_readiness=None, oxygen=None, consciousness=None, consciousness_dynamics=None, news2_trend=None, trend_alert_hooks=None, escalation_hooks=None, boarding_full_hooks=None, wait_time_hooks=None, missed_dose_hooks=None, discharge_readiness_hooks=None, discharge_priority_hooks=None, news2_staffing_escalation=None):
         if not 1 <= beds <= 64:
             raise ValueError("beds must be 1..64")
         if rate_hz <= 0:
@@ -126,6 +127,21 @@ class Ward:
         self.discharge_readiness_hooks = (
             validate_discharge_readiness_hooks(discharge_readiness_hooks)
         )
+        # Discharge-priority hooks: one shared object for the
+        # whole ward (a webhook URL and/or an in-process
+        # callback), invoked when the discharge-priority order
+        # changes — a bed becoming ready, a ready bed leaving,
+        # or the ranking reordering. Off by default. The ward
+        # owns the object: the order is a ward-level view, not
+        # a per-bed one.
+        self.discharge_priority_hooks = (
+            validate_discharge_priority_hooks(discharge_priority_hooks)
+        )
+        # The priority order last sent to the hooks (empty
+        # before the first ready bed), and every order change
+        # this run — the audit trail for the priority hooks.
+        self._last_priority_order = []
+        self.priority_events = []
         if discharge_planning is None:
             self.discharge_planner = DischargePlanner()
         elif isinstance(discharge_planning, DischargePlanner):
@@ -376,6 +392,15 @@ class Ward:
                     self.discharge_planner.cancel_auto_orders(
                         m.bed_id, self.elapsed
                     )
+        # Discharge-priority order: a change since the last
+        # emitted order — a bed becoming ready, a ready bed
+        # leaving, or the ranking reordering — fires the
+        # priority hooks once, with the new order. Checked
+        # after the monitor loop and the auto-order workflow,
+        # so this tick's readiness and discharges are already
+        # in, and before the snapshot, so the event is in it.
+        # A tick where the order is unchanged fires nothing.
+        self._check_priority_order()
         snap = {"t": self.elapsed, "beds": readings, "staffing": self.staffing_summary(), "turnover": self.turnover_summary(), "meds": self.meds_summary(), "triage": self.triage_summary(), "arrivals": self.arrivals_summary(), "discharge": self.discharge_summary(), "discharge_readiness": self.readiness_summary(), "discharge_priority": self.discharge_priority_summary(), "early_warning": self.early_warning_summary()}
         with self._lock:
             self.latest = snap
@@ -514,23 +539,12 @@ class Ward:
             ),
         }
 
-    def discharge_priority_summary(self):
-        """Discharge-ready beds ranked by NEWS2, safest first.
+    def _priority_entries(self):
+        """The discharge-priority entries: ready beds ranked by
+        NEWS2 at the flip that made them ready, lowest first.
 
-        Only beds currently flagged discharge-ready appear, in
-        the order the ward should work through them: lowest NEWS2
-        first, so the safest patient to send home is at the top.
-        The ranking uses the NEWS2 score recorded at the flip
-        that made the bed ready (``news2_at_flip``) — the stable,
-        recorded value, not the score drifting tick by tick — so
-        a bed that flagged ready at NEWS2 6 still ranks, last,
-        exactly as the readiness flag says it should: readiness
-        itself has no NEWS2 gate, and this view does not add one.
-        Ties break by the earliest flip, then bed number. Each
-        entry also carries the current NEWS2 score (``news2``),
-        when the bed flagged ready (``ready_t``), and how long
-        it has been ready (``time_ready_s``). A bed with no score
-        at its flip — no reading yet — sorts last.
+        See :meth:`discharge_priority_summary` for the ranking
+        rules. Returned as plain dicts, in rank order.
         """
         entries = []
         for m in self.monitors:
@@ -581,10 +595,87 @@ class Ward:
                 e["bed"],
             )
         )
+        return entries
+
+    def _check_priority_order(self):
+        """Fire the discharge-priority hooks when the ranked
+        order changed since the last emitted one.
+
+        A bed becoming ready, a ready bed leaving, or the
+        NEWS2-at-flip ranking reordering the list all change
+        the order; a tick where the order is unchanged fires
+        nothing, so a ward that stays ready for an hour sends
+        one notification, not one a tick. The event records the
+        new order — the same entries ``GET /discharge-priority``
+        serves — and the order it replaces, whether the hook
+        was invoked (``hook_invoked``, False with no hooks) and
+        any synchronous error (``hook_errors``), with the
+        retries and final delivery outcome (``hook_retries``,
+        ``hook_final_status``) updated when a webhook delivery
+        settles — the same convention as the other hooks. A
+        hook failure is logged and counted, never fatal to the
+        tick. Called from :meth:`tick` only: a summary read
+        (the endpoint, a snapshot) never fires a hook.
+        """
+        entries = self._priority_entries()
+        order = [e["bed"] for e in entries]
+        if order == self._last_priority_order:
+            return
+        now = round(self.elapsed, 3)
+        event = {
+            "event": "discharge_priority_changed",
+            "t": now,
+            "beds": [dict(e) for e in entries],
+            "previous_beds": list(self._last_priority_order),
+        }
+        self._last_priority_order = order
+        self.priority_events.append(event)
+        result = self.discharge_priority_hooks.fire(
+            dict(event),
+            record=event,
+        )
+        event["hook_invoked"] = result["invoked"]
+        event["hook_errors"] = result["errors"]
+
+    def discharge_priority_summary(self):
+        """Discharge-ready beds ranked by NEWS2, safest first.
+
+        Only beds currently flagged discharge-ready appear, in
+        the order the ward should work through them: lowest NEWS2
+        first, so the safest patient to send home is at the top.
+        The ranking uses the NEWS2 score recorded at the flip
+        that made the bed ready (``news2_at_flip``) — the stable,
+        recorded value, not the score drifting tick by tick — so
+        a bed that flagged ready at NEWS2 6 still ranks, last,
+        exactly as the readiness flag says it should: readiness
+        itself has no NEWS2 gate, and this view does not add one.
+        Ties break by the earliest flip, then bed number. Each
+        entry also carries the current NEWS2 score (``news2``),
+        when the bed flagged ready (``ready_t``), and how long
+        it has been ready (``time_ready_s``). A bed with no score
+        at its flip — no reading yet — sorts last.
+
+        ``priority_changes`` counts every order change this run
+        and ``changes`` lists them, each with the new order, the
+        order it replaced, and whether the ward's hooks were
+        invoked for it (``hook_invoked``) and the retries and
+        final delivery outcome (``hook_retries``,
+        ``hook_final_status``); ``discharge_priority_hooks``
+        carries the hook totals: whether any hook is configured,
+        how many hook deliveries were invoked, how many failed,
+        how many retries were spent, and how many deliveries
+        eventually landed.
+        """
+        entries = self._priority_entries()
         return {
             "t": self.elapsed,
             "beds": entries,
             "ready": len(entries),
+            "priority_changes": len(self.priority_events),
+            "changes": [dict(e) for e in self.priority_events],
+            "discharge_priority_hooks": (
+                self.discharge_priority_hooks.summary()
+            ),
         }
 
     def early_warning_summary(self):

@@ -13,7 +13,7 @@ A hook is configured per ward, off by default, in one of two ways:
   raises is caught, logged, and counted as a failure — the tick
   still completes.
 
-Three events use hooks. A trend alert (a NEWS2 score rising fast
+Seven events use hooks. A trend alert (a NEWS2 score rising fast
 enough to trip the jump or creep rule) fires the ward's
 ``trend_alert_hooks``; a deterioration episode opening (a
 patient's NEWS2 risk leaving low) fires the ward's
@@ -26,7 +26,10 @@ was too thin to give it inside its grace window, or skipped
 because the pharmacy was out of that medication — fires the
 ward's ``missed_dose_hooks``; a discharge-readiness flip (a
 patient becoming discharge-ready, or stopping being ready)
-fires the ward's ``discharge_readiness_hooks``. All six share
+fires the ward's ``discharge_readiness_hooks``; a change in the
+discharge-priority order (a bed becoming ready, a ready bed
+leaving, or the ranking reordering) fires the ward's
+``discharge_priority_hooks``. All seven share
 the same ``AlertHooks`` machinery — the same webhook and
 callback channels, the same best-effort delivery — just a
 different event payload.
@@ -180,12 +183,26 @@ def validate_discharge_readiness_hooks(value):
     )
 
 
+def validate_discharge_priority_hooks(value):
+    """Normalize a discharge-priority hook config (see
+    :func:`_validate_hooks`).
+
+    Fires when the discharge-priority order changes — a bed
+    becoming ready, a ready bed leaving, or the ranking
+    reordering — rather than when a NEWS2 event fires.
+    """
+    return _validate_hooks(
+        value, "discharge-priority", "discharge_priority_hooks"
+    )
+
+
 class AlertHooks:
     """The configured hooks for one ward event, shared by its monitors.
 
     ``kind`` labels the event in log messages (``"trend-alert"``,
     ``"escalation"``, ``"boarding-full"``, ``"wait-time"``,
-    ``"missed-dose"``, or ``"discharge-readiness"``); it changes
+    ``"missed-dose"``, ``"discharge-readiness"``, or
+    ``"discharge-priority"``); it changes
     nothing about delivery.
     """
 

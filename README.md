@@ -107,6 +107,12 @@ python3 -m ward.cli scenarios/discharge-ready.json --seed 42
 # at your own endpoint; a dead endpoint is logged, never fatal)
 python3 -m ward.cli scenarios/discharge-readiness-hooks.json --seed 42
 
+# Discharge-priority hooks: the same ward as discharge-priority,
+# with every change to the ranked discharge order also POSTed to
+# a webhook (here a placeholder URL — point it at your own
+# endpoint; a dead endpoint is logged, never fatal)
+python3 -m ward.cli scenarios/discharge-priority-hooks.json --seed 42
+
 # Auto discharge orders: beds flagged ready get a discharge order
 # raised for them at once, and discharge an hour later by default
 python3 -m ward.cli scenarios/discharge-auto-order.json --seed 42
@@ -206,7 +212,8 @@ python3 -m ward.cli scenarios/example.json --seed 42
 - `GET /discharge-readiness` — per-patient discharge-readiness
   flags (see below), as JSON (503 while partitioned)
 - `GET /discharge-priority` — discharge-ready beds ranked by
-  NEWS2, safest first (see below), as JSON (503 while
+  NEWS2, safest first, plus the order-change history and the
+  discharge-priority hook totals (see below), as JSON (503 while
   partitioned)
 - `GET /news2` — per-patient NEWS2 early-warning scores and
   deterioration episodes (see below), as JSON (503 while
@@ -1076,6 +1083,54 @@ flags ready at 5 s at NEWS2 1, bed 1 (tachycardic) at 5 s at
 NEWS2 3, and bed 2 (hypoxic) at 59 s at NEWS2 6, while bed 3
 (febrile) never flags ready — the priority order is beds 0, 1,
 2, ready 55 s, 55 s, and 1 s respectively.
+
+## Discharge-priority hooks
+
+The priority order is a queue a bed manager works through, so
+when it changes — a bed becomes ready, a ready bed leaves, or
+the ranking reorders — the hook makes sure something outside
+the ward hears about it. A ward that wants the outside world to
+hear about that moment — a bed manager, a dashboard, a discharge
+coordinator — configures discharge-priority hooks, the same
+channels as the NEWS2 hooks (webhook and/or in-process
+callback), on the same best-effort, never-fatal terms:
+
+```json
+{"discharge_priority_hooks": {"webhook_url": "http://127.0.0.1:18099/hooks"}}
+```
+
+The hook fires once per order change, in the tick the order
+changes, with a `discharge_priority_changed` event payload: the
+new ordered bed list — the same entries `GET /discharge-priority`
+serves, each with the NEWS2 at the flip, the current score, when
+the bed flagged ready, and how long it has been ready — and the
+order it replaces (`"previous_beds"`). A tick where the order is
+unchanged fires nothing: a bed that stays ready for an hour sends
+one notification, not one a tick. Each change event records
+whether the hook was invoked (`"hook_invoked"`, False with no
+hooks) and any synchronous error (`"hook_errors"`), and the
+priority summary carries the change totals
+(`"priority_changes"`, the full `"changes"` history) and the ward
+discharge-priority-hook totals
+(`"discharge_priority_hooks"`: whether any hook is configured,
+how many deliveries were invoked, how many failed, how many
+retries were spent, and how many deliveries eventually landed)
+— in `GET /discharge-priority`, every snapshot and WebSocket
+frame, and the run summary (`--summary`). The same retry rules
+as the NEWS2 hooks apply — a failed webhook POST is retried with
+backoff up to `"max_retries"` times, and the event records
+`"hook_retries"` and `"hook_final_status"` alongside
+`"hook_invoked"`. Hooks are off by default, so a ward with none
+configured behaves exactly as before. See
+`scenarios/discharge-priority-hooks.json` for a runnable example:
+over a seeded 60-tick run the same ward as
+`discharge-priority.json` changes its order 7 times — beds 0, 1
+and 3 flag ready at 5 s, bed 3 drops out at 8 s, flags ready
+again at 39 s and slots in ahead of bed 1 on NEWS2, bed 2 joins
+at 49 s and drops out at 50 s, bed 3 drops out at 51 s, and bed 2
+flags ready again at 59 s — POSTed to the configured webhook,
+with 7 hook deliveries invoked and 0 failed against a stub
+server.
 
 ## NEWS2 early-warning scoring
 
@@ -2123,3 +2178,18 @@ run.
   lists, last, because readiness has no NEWS2 gate; in every
   snapshot, WebSocket frame, a `GET /discharge-priority` endpoint,
   and the run summary) — done in v0.39.0
+- Discharge-priority hooks (when the discharge-priority order
+  changes — a bed becoming ready, a ready bed leaving, or the
+  ranking reordering — the ward's configured webhook URL gets a
+  `discharge_priority_changed` event payload POSTed to it in a
+  daemon thread and/or an in-process Python callback is called in
+  the changing tick, reusing the NEWS2 hook machinery, best effort
+  and never fatal; the payload carries the new ordered bed list in
+  the same shape as `GET /discharge-priority` serves it, plus the
+  order it replaces; a tick where the order is unchanged fires
+  nothing; each change event records whether the hook was invoked,
+  and the priority summary, every snapshot, WebSocket frame,
+  `GET /discharge-priority`, and the run summary carry the change
+  totals and the hook totals; off by default, configured per ward
+  with `discharge_priority_hooks` in the scenario) — done in
+  v0.40.0

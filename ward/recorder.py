@@ -360,11 +360,28 @@ def summarize(path):
         # beds are flagged ready, in NEWS2 order — bed, NEWS2 at
         # the flip that made it ready, when it flipped, and how
         # long it has been ready — so the run's discharge order is
-        # visible without replaying every tick.
+        # visible without replaying every tick — plus how many
+        # times the order changed this run, and whether the
+        # discharge-priority hooks are configured and how many
+        # hook deliveries were invoked, failed, retried, and
+        # delivered.
         "discharge_priority": (
             {
                 "ready": last_priority["ready"],
                 "beds": last_priority["beds"],
+                "priority_changes": last_priority.get(
+                    "priority_changes", 0
+                ),
+                "discharge_priority_hooks": last_priority.get(
+                    "discharge_priority_hooks",
+                    {
+                        "configured": False,
+                        "invoked": 0,
+                        "failed": 0,
+                        "retries": 0,
+                        "delivered": 0,
+                    },
+                ),
             }
             if last_priority is not None
             else None

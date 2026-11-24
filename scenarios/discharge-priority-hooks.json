@@ -1,0 +1,1 @@
+{"beds":4,"discharge_priority_hooks":{"webhook_url":"http://127.0.0.1:18099/hooks"},"discharge_readiness":{"stable_window_s":5},"patients":[{"bed":0,"profile":"stable"},{"bed":1,"profile":"tachycardic"},{"bed":2,"profile":"hypoxic"},{"bed":3,"profile":"febrile"}],"rate_hz":1.0}
