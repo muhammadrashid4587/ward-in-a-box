@@ -184,6 +184,12 @@ python3 -m ward.cli scenarios/staff-shortage.json --seed 42
 # frees at 20 s instead, after waiting 20 s
 python3 -m ward.cli scenarios/bed-blocker.json --seed 42
 
+# Oxygen outage: the ward's oxygen supply fails from 5 s to 35 s —
+# bed 0 (stable, on oxygen) desaturates to 82.95 and raises a
+# low_spo2 alarm at 19 s, bed 2 (hypoxic, on oxygen) sits on the
+# 82.0 floor with NEWS2 6, and bed 1 (not on oxygen) is untouched
+python3 -m ward.cli scenarios/oxygen-outage.json --seed 42
+
 # NEWS2 trend alert hooks: the same ward, with each trend alert
 # also POSTed to a webhook (here a placeholder URL — point it at
 # your own endpoint; a dead endpoint is logged, never fatal)
@@ -274,6 +280,10 @@ python3 -m ward.cli scenarios/example.json --seed 42
   is blocked, why, and when the block ends, how many beds are
   blocked, and how many discharges are held by a block, as JSON
   (503 while partitioned)
+- `GET /oxygen-outage` — per-bed oxygen-outage state: whether the
+  supply is down, when it returns, and how many SpO2 points each
+  patient on oxygen has lost to it, as JSON
+  (503 while partitioned)
 
 A reading looks like:
 
@@ -307,8 +317,9 @@ discharge summary from `/discharge`, the discharge-readiness
 summary from `/discharge-readiness`, the discharge-priority
 summary from `/discharge-priority`, the early-warning
 summary from `/news2`, and the sensor-drift summary from
-`/sensor-drift`, and the bed-blocker summary from
-`/bed-blocker`, so a client gets bed occupancy, vitals, alarms, staffing,
+`/sensor-drift`, the bed-blocker summary from
+`/bed-blocker`, and the oxygen-outage summary from
+`/oxygen-outage`, so a client gets bed occupancy, vitals, alarms, staffing,
 medication, and the intake queue in one message. Ping frames are answered with pong, close frames
 are echoed and the connection is then closed; text frames from the
 client are accepted and ignored — the ward pushes ticks, it takes no
@@ -421,6 +432,16 @@ Chaos types:
   block clears; a discharge attempted while blocked is held and
   goes through the moment the block ends, with the wait recorded
   as a discharge delay; see Bed blocker below.
+- `oxygen_outage` — the ward's oxygen supply fails for `duration`
+  seconds; needs `"oxygen"`, a map with `"rate"` (SpO2 points lost
+  per second, required), `"floor"` (the lowest SpO2 the outage can
+  push a patient to, default 82.0), and `"recovery_rate"` (points
+  regained per second once the supply returns, default the fall
+  rate). While it is active a patient on oxygen really desaturates
+  — the low_spo2 alarm, the NEWS2 score, trend alerts, and
+  escalations all respond — while a patient not on oxygen is
+  untouched, because the outage is a supply failure and only the
+  patients the supply was feeding feel it; see Oxygen outage below.
 
 `bed` targets one bed, `beds` targets several, neither targets all beds
 (`partition` is always ward-wide). Times are elapsed seconds from start.
@@ -702,6 +723,49 @@ over a seeded 40-tick run bed 1 waits for a porter from 5 s to
 and bed 3 finishes cleaning at 15 s but is blocked for an
 isolation clean until 30 s, so the waiting triage patient takes
 bed 2 when it frees at 20 s instead, after waiting 20 s.
+
+## Oxygen outage
+
+An `oxygen_outage` chaos event fails the ward's oxygen supply for a
+window — a manifold fault, an empty bulk tank, a cut line — so the
+patients on oxygen lose the gas that was keeping them saturated:
+
+```json
+{"type": "oxygen_outage", "at": 5, "duration": 30,
+ "oxygen": {"rate": 0.5, "floor": 82.0, "recovery_rate": 1.0}}
+```
+
+While the event is active, a patient on oxygen loses `rate` SpO2
+points every second, down to `floor`, and recovers at
+`recovery_rate` points a second once the supply returns. The fall
+is a real desaturation, not a sensor error: unlike `sensor_drift`,
+which lies about the reading while the patient is fine, the outage
+moves the patient's true SpO2, so the low_spo2 alarm raises, the
+NEWS2 score climbs, trend alerts fire, and deterioration episodes
+open exactly as they would for a patient genuinely deteriorating —
+and a bed stops being discharge-ready while it is desaturating. A
+patient not on oxygen is untouched: they have no supply to lose,
+so the same event leaves them at NEWS2 0 while their neighbour
+falls. Without `bed`/`beds` the outage is ward-wide, like a
+partition: the supply serves the whole ward. The deficit is
+deterministic — pure arithmetic on the tick, no RNG — so a seeded
+run reproduces it exactly, and a new admission starts fully
+saturated (an outage still running starts desaturating them again
+from zero). Every reading carries its bed's current deficit as
+`"oxygen_deficit"`, every snapshot carries an `"oxygen_outage"`
+object with the per-bed outage state — whether the supply is down,
+when it returns, and how many SpO2 points each patient has lost —
+and ward totals (how many patients are on oxygen, how many are
+desaturating, and the largest loss), served on its own by
+`GET /oxygen-outage` and carried in every WebSocket frame, and the
+run summary (`--summary`) reports the same totals from the last
+tick. See `scenarios/oxygen-outage.json` for a runnable example:
+over a seeded 70-tick run bed 0 (stable, on oxygen) falls from
+SpO2 95 to 82.95 as its deficit ramps to 13.84, raises a low_spo2
+alarm at 19 s, peaks at NEWS2 4 (medium), and is fully recovered
+by 50 s; bed 2 (hypoxic, on oxygen) sits on the 82.0 floor from
+21 s with NEWS2 6 (medium); bed 1 (stable, not on oxygen) is
+untouched by the outage — its deficit stays 0.0 throughout.
 
 ## Triage / ED intake queue
 
@@ -2534,3 +2598,14 @@ run.
   block state rides in every snapshot, WebSocket frame, a
   `GET /bed-blocker` endpoint, and the run summary) — done in
   v0.47.0
+- Oxygen outage (an `oxygen_outage` chaos event fails the ward's
+  oxygen supply for a window, so a patient on oxygen really
+  desaturates — losing `rate` SpO2 points a second down to
+  `floor`, recovering at `recovery_rate` once the supply returns
+  — with the low_spo2 alarm, the NEWS2 score, trend alerts, and
+  escalations all responding exactly as they would to a patient
+  genuinely deteriorating, while a patient not on oxygen is
+  untouched; the deficit rides in every reading as
+  `"oxygen_deficit"`, an `"oxygen_outage"` object in every
+  snapshot, WebSocket frame, a `GET /oxygen-outage` endpoint,
+  and the run summary) — done in v0.48.0

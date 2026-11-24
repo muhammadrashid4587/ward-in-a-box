@@ -9655,5 +9655,337 @@ class TestBedBlocker(unittest.TestCase):
         self.assertEqual(snaps[39]["turnover"]["total_turnovers"], 3)
 
 
+class TestOxygenOutage(unittest.TestCase):
+    # An oxygen outage: the ward's oxygen supply fails from t=5
+    # for 30 s, so the patient on oxygen loses 0.5 SpO2 points a
+    # second down to a floor of 82, while the patient not on
+    # oxygen — same profile, same ward — is untouched. The
+    # desaturation is real, not a sensor error: the low_spo2
+    # alarm raises, the NEWS2 score climbs, and the bed stops
+    # being discharge-ready. Once the supply returns the patient
+    # recovers at 1.0 points a second.
+    OXYGEN = {"rate": 0.5, "floor": 82.0, "recovery_rate": 1.0}
+
+    def _outage_ward(self):
+        return Ward(
+            beds=2,
+            profiles=["stable", "stable"],
+            oxygen=[True, False],
+            chaos=[
+                ChaosEvent(
+                    "oxygen_outage",
+                    at=5,
+                    duration=30,
+                    bed=0,
+                    oxygen=self.OXYGEN,
+                )
+            ],
+            seed=42,
+            discharge_readiness={"stable_window_s": 5},
+        )
+
+    def test_oxygen_config_validation(self):
+        # An oxygen-outage event needs an oxygen config.
+        with self.assertRaises(ValueError):
+            ChaosEvent("oxygen_outage", at=0, duration=10, bed=0)
+        with self.assertRaises(ValueError):
+            ChaosEvent(
+                "oxygen_outage",
+                at=0,
+                duration=10,
+                bed=0,
+                oxygen="fast",
+            )
+        # The fall rate is required and must be positive.
+        with self.assertRaises(ValueError):
+            ChaosEvent(
+                "oxygen_outage",
+                at=0,
+                duration=10,
+                bed=0,
+                oxygen={},
+            )
+        for bad_rate in (0, -0.5, "fast", True, float("nan"), float("inf")):
+            with self.assertRaises(ValueError):
+                ChaosEvent(
+                    "oxygen_outage",
+                    at=0,
+                    duration=10,
+                    bed=0,
+                    oxygen={"rate": bad_rate},
+                )
+        # The floor must sit inside the plausible SpO2 envelope.
+        for bad_floor in (69.9, 100.1, "low"):
+            with self.assertRaises(ValueError):
+                ChaosEvent(
+                    "oxygen_outage",
+                    at=0,
+                    duration=10,
+                    bed=0,
+                    oxygen={"rate": 0.5, "floor": bad_floor},
+                )
+        # The recovery rate must be positive too.
+        with self.assertRaises(ValueError):
+            ChaosEvent(
+                "oxygen_outage",
+                at=0,
+                duration=10,
+                bed=0,
+                oxygen={"rate": 0.5, "recovery_rate": 0},
+            )
+        # Defaults: the floor is 82.0 and recovery runs at the
+        # fall rate unless told otherwise.
+        ev = ChaosEvent(
+            "oxygen_outage",
+            at=0,
+            duration=10,
+            bed=0,
+            oxygen={"rate": 0.5},
+        )
+        self.assertEqual(
+            ev.oxygen,
+            {"rate": 0.5, "floor": 82.0, "recovery_rate": 0.5},
+        )
+        ev = ChaosEvent(
+            "oxygen_outage",
+            at=0,
+            duration=10,
+            bed=0,
+            oxygen=self.OXYGEN,
+        )
+        self.assertEqual(ev.oxygen, self.OXYGEN)
+
+    def test_only_patients_on_oxygen_desaturate(self):
+        ward = self._outage_ward()
+        snaps = [ward.tick() for _ in range(35)]
+        first = snaps[0]["beds"][0]
+        self.assertEqual(first["oxygen_deficit"], 0.0)
+        self.assertEqual(first["news2"]["score"], 2)
+        # The deficit ramps exactly: 0.5 points a tick from t=5.
+        deficits = [
+            snaps[i]["beds"][0]["oxygen_deficit"]
+            for i in (4, 9, 14, 19, 24, 29)
+        ]
+        self.assertEqual(
+            deficits, [0.5, 3.0, 5.5, 8.0, 10.5, 13.0]
+        )
+        # The reported SpO2 falls with the deficit, not the walk:
+        # at 30 s the patient reads 84.1 while the control bed
+        # reads 98.08.
+        self.assertEqual(snaps[29]["beds"][0]["spo2"], 84.1)
+        self.assertEqual(snaps[29]["beds"][1]["spo2"], 98.08)
+        # The control bed — same profile, no oxygen — never
+        # desaturates at all.
+        self.assertTrue(
+            all(
+                s["beds"][1]["oxygen_deficit"] == 0.0 for s in snaps
+            )
+        )
+        self.assertEqual(snaps[29]["beds"][1]["news2"]["score"], 0)
+
+    def test_desaturation_raises_alarm_and_news2(self):
+        ward = self._outage_ward()
+        snaps = [ward.tick() for _ in range(70)]
+        # The reported SpO2 crossed 90 at 15 s, raising a
+        # low_spo2 alarm — and the bed stopped being
+        # discharge-ready on the same tick, after flagging ready
+        # at 5 s.
+        monitor = ward.monitors[0]
+        self.assertEqual(
+            monitor.alarm_history[0]["alarm"], "low_spo2"
+        )
+        self.assertEqual(
+            monitor.alarm_history[0]["raised_t"], 15.0
+        )
+        self.assertEqual(
+            [(e["ready"], e["ready_t"]) for e in monitor.readiness_history],
+            [(True, 5.0), (False, 15.0), (True, 47.0)],
+        )
+        # The NEWS2 score climbs with the fall instead of
+        # jumping: 3 (medium) at the end of the outage.
+        self.assertEqual(snaps[33]["beds"][0]["news2"]["score"], 3)
+        self.assertEqual(snaps[33]["beds"][0]["news2"]["risk"], "medium")
+        self.assertEqual(
+            [
+                (e["raised_t"], e["peak_score"], e["peak_risk"])
+                for e in monitor.escalation_history
+                if e["raised_t"] < 40.0
+            ],
+            [(32.0, 3, "medium")],
+        )
+
+    def test_deficit_never_pushes_spo2_below_floor(self):
+        ward = Ward(
+            beds=1,
+            profiles=["hypoxic"],
+            oxygen=[True],
+            chaos=[
+                ChaosEvent(
+                    "oxygen_outage",
+                    at=0,
+                    duration=60,
+                    oxygen={
+                        "rate": 2.0,
+                        "floor": 82.0,
+                        "recovery_rate": 1.0,
+                    },
+                )
+            ],
+            seed=7,
+        )
+        snaps = [ward.tick() for _ in range(20)]
+        # A hypoxic patient starts near 89, so a 2.0/s fall
+        # reaches the floor in four ticks — and stays there,
+        # however long the outage runs.
+        self.assertEqual(
+            min(s["beds"][0]["spo2"] for s in snaps), 82.0
+        )
+        self.assertTrue(
+            all(s["beds"][0]["spo2"] >= 82.0 for s in snaps)
+        )
+        # The stored deficit is capped by the floor too: it
+        # never grows past the room between the walked SpO2 and
+        # 82.
+        self.assertEqual(
+            [s["beds"][0]["oxygen_deficit"] for s in snaps[:4]],
+            [2.0, 4.0, 6.0, 7.39],
+        )
+
+    def test_deficit_recovers_after_outage(self):
+        ward = self._outage_ward()
+        snaps = [ward.tick() for _ in range(70)]
+        # The outage ends at 35 s: the deficit peaked at 14.79
+        # (capped by the floor) and recovers at 1.0 a second.
+        self.assertEqual(
+            snaps[33]["oxygen_outage"]["max_deficit"], 14.79
+        )
+        self.assertEqual(
+            snaps[33]["oxygen_outage"]["beds_desaturating"], 1
+        )
+        deficits = [
+            snaps[i]["beds"][0]["oxygen_deficit"]
+            for i in (34, 39, 44, 49)
+        ]
+        self.assertEqual(deficits, [13.79, 8.79, 3.79, 0.0])
+        # Fully recovered by 50 s: no bed desaturating, no deficit.
+        self.assertEqual(
+            snaps[69]["oxygen_outage"]["beds_desaturating"], 0
+        )
+        self.assertEqual(snaps[69]["oxygen_outage"]["max_deficit"], 0.0)
+        self.assertFalse(
+            snaps[69]["oxygen_outage"]["beds"][0]["desaturating"]
+        )
+
+    def test_deficit_is_deterministic(self):
+        snaps_a = [self._outage_ward().tick() for _ in range(70)]
+        snaps_b = [self._outage_ward().tick() for _ in range(70)]
+        self.assertEqual(snaps_a, snaps_b)
+
+    def test_deficit_resets_on_new_admission(self):
+        ward = Ward(
+            beds=2,
+            profiles=["stable", "stable"],
+            oxygen=[True, False],
+            chaos=[
+                ChaosEvent(
+                    "oxygen_outage",
+                    at=5,
+                    duration=30,
+                    bed=0,
+                    oxygen=self.OXYGEN,
+                )
+            ],
+            seed=42,
+            cleaning_s=1.0,
+        )
+        for _ in range(20):
+            ward.tick()
+        self.assertTrue(ward.monitors[0].oxygen_deficit > 0)
+        ward.discharge(0)
+        ward.tick()
+        # A new patient in the bed starts fully saturated.
+        ward.admit(0, profile="stable", on_oxygen=True)
+        self.assertEqual(ward.monitors[0].oxygen_deficit, 0.0)
+        # The outage is still active, so the new patient starts
+        # desaturating again from zero on the next tick — the
+        # supply is still down, only the patient changed.
+        self.assertEqual(
+            ward.tick()["beds"][0]["oxygen_deficit"], 0.5
+        )
+
+    def test_oxygen_outage_summary_and_endpoint(self):
+        ward = self._outage_ward()
+        snaps = [ward.tick() for _ in range(35)]
+        summary = snaps[34]["oxygen_outage"]
+        self.assertEqual(summary["beds_on_oxygen"], 1)
+        self.assertEqual(summary["beds_desaturating"], 1)
+        self.assertEqual(summary["max_deficit"], 13.79)
+        self.assertFalse(summary["beds"][0]["outage_active"])
+        self.assertIsNone(summary["beds"][0]["outage_until"])
+        # One tick earlier the outage was still active.
+        self.assertTrue(snaps[33]["oxygen_outage"]["beds"][0]["outage_active"])
+        self.assertEqual(
+            snaps[33]["oxygen_outage"]["beds"][0]["outage_until"], 35.0
+        )
+        self.assertFalse(
+            snaps[33]["oxygen_outage"]["beds"][1]["desaturating"]
+        )
+        server, port = serve_in_thread(ward)
+        try:
+            status, body = get(port, "/oxygen-outage")
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                json.loads(body)["beds_desaturating"], 1
+            )
+            self.assertEqual(
+                json.loads(body)["max_deficit"], 13.79
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_summary_reports_oxygen_outage(self):
+        ward = self._outage_ward()
+        path = os.path.join(tempfile.mkdtemp(), "run.jsonl")
+        with Recorder(path, ward.beds, ward.rate_hz, seed=42) as rec:
+            ward.recorder = rec
+            for _ in range(35):
+                ward.tick()
+        summary = summarize(path)
+        self.assertEqual(summary["oxygen_outage"]["beds_on_oxygen"], 1)
+        self.assertEqual(
+            summary["oxygen_outage"]["beds_desaturating"], 1
+        )
+        self.assertEqual(summary["oxygen_outage"]["beds"], {"0": 13.79})
+        self.assertEqual(summary["oxygen_outage"]["max_deficit"], 13.79)
+
+    def test_scenario_file_loads_and_runs(self):
+        cfg = load_scenario("scenarios/oxygen-outage.json")
+        self.assertEqual(len(cfg["chaos"]), 1)
+        self.assertEqual(cfg["chaos"][0].type, "oxygen_outage")
+        self.assertEqual(cfg["chaos"][0].oxygen, self.OXYGEN)
+        ward = build_ward(cfg, seed=42)
+        snaps = [ward.tick() for _ in range(70)]
+        # Ward-wide, so both oxygen beds desaturate and the
+        # control bed does not; the hypoxic bed hits the floor.
+        self.assertEqual(snaps[34]["beds"][0]["oxygen_deficit"], 13.84)
+        self.assertEqual(snaps[34]["beds"][2]["oxygen_deficit"], 7.05)
+        self.assertEqual(snaps[34]["beds"][1]["oxygen_deficit"], 0.0)
+        self.assertEqual(
+            min(s["beds"][2]["spo2"] for s in snaps), 82.0
+        )
+        self.assertEqual(
+            [
+                (e["alarm"], e["raised_t"])
+                for e in ward.monitors[0].alarm_history
+            ],
+            [("low_spo2", 19.0)],
+        )
+        # Seeded, so a second run reproduces every tick.
+        ward2 = build_ward(cfg, seed=42)
+        snaps2 = [ward2.tick() for _ in range(70)]
+        self.assertEqual(snaps, snaps2)
+
+
 if __name__ == "__main__":
     unittest.main()

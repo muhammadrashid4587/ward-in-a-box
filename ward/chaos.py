@@ -1,16 +1,75 @@
 """Chaos events: device dropout, alarm storms, stale readings, partitions,
 discharges, pharmacy stockouts, slow sensor drift, staff shortages, bed
-blockers."""
+blockers, oxygen outages."""
 
 from .staffing import ROLES
-from .vitals import NORMAL
+from .vitals import NORMAL, PLAUSIBLE
 
-VALID_TYPES = ("dropout", "alarm_storm", "stale", "partition", "discharge", "stockout", "sensor_drift", "staff_shortage", "bed_blocker")
+VALID_TYPES = ("dropout", "alarm_storm", "stale", "partition", "discharge", "stockout", "sensor_drift", "staff_shortage", "bed_blocker", "oxygen_outage")
 
 # Why a bed is blocked: awaiting a porter to move the patient,
 # an isolation clean after an infectious patient, or an equipment
 # fault on the bed itself.
 BLOCK_REASONS = ("porter", "isolation_clean", "equipment_fault")
+
+
+def validate_oxygen_outage(oxygen):
+    """An oxygen-outage config: ``{"rate": ..., "floor": ..., "recovery_rate": ...}``.
+
+    ``rate`` is required: how many SpO2 points a patient on oxygen
+    loses per second while the supply is down — a positive finite
+    number. ``floor`` is the lowest SpO2 the outage can push a
+    patient to (default 82.0, inside the plausible SpO2 envelope).
+    ``recovery_rate`` is how many points per second the patient
+    regains once the supply returns (default ``rate``) — a
+    positive finite number. A config with no positive fall rate
+    does nothing at all, so it is rejected.
+    """
+    if not isinstance(oxygen, dict):
+        raise ValueError(
+            "oxygen_outage needs an oxygen config, got %r" % (oxygen,)
+        )
+    rate = oxygen.get("rate")
+    if (
+        not isinstance(rate, (int, float))
+        or isinstance(rate, bool)
+        or rate != rate
+        or rate in (float("inf"), float("-inf"))
+        or rate <= 0
+    ):
+        raise ValueError(
+            "oxygen_outage: rate must be a positive finite number, got %r"
+            % (rate,)
+        )
+    floor = oxygen.get("floor", 82.0)
+    if (
+        not isinstance(floor, (int, float))
+        or isinstance(floor, bool)
+        or floor != floor
+        or floor in (float("inf"), float("-inf"))
+        or not PLAUSIBLE["spo2"][0] <= floor <= PLAUSIBLE["spo2"][1]
+    ):
+        raise ValueError(
+            "oxygen_outage: floor must be within the plausible SpO2 "
+            "range %r, got %r" % (PLAUSIBLE["spo2"], floor)
+        )
+    recovery_rate = oxygen.get("recovery_rate", rate)
+    if (
+        not isinstance(recovery_rate, (int, float))
+        or isinstance(recovery_rate, bool)
+        or recovery_rate != recovery_rate
+        or recovery_rate in (float("inf"), float("-inf"))
+        or recovery_rate <= 0
+    ):
+        raise ValueError(
+            "oxygen_outage: recovery_rate must be a positive finite "
+            "number, got %r" % (recovery_rate,)
+        )
+    return {
+        "rate": float(rate),
+        "floor": float(floor),
+        "recovery_rate": float(recovery_rate),
+    }
 
 
 def validate_block_reason(reason):
@@ -131,10 +190,22 @@ class ChaosEvent:
     until the block clears. A discharge attempted while blocked
     is held and goes through the moment the block ends, with the
     wait recorded as a discharge delay, exactly like a discharge
-    held behind a full cleaning roster.
+    held behind a full cleaning roster. ``oxygen_outage`` needs
+    ``oxygen`` (see :func:`validate_oxygen_outage`): while it is
+    active, a patient on oxygen loses supplemental oxygen, so
+    their true SpO2 falls by ``rate`` points per second down to
+    ``floor`` — a real desaturation, not a sensor error, so the
+    low_spo2 alarm, the NEWS2 score, trend alerts, and
+    escalations all respond exactly as they would to a patient
+    genuinely deteriorating. Patients not on oxygen are
+    untouched: the outage is a supply failure, and only the
+    patients the supply was feeding feel it. When the supply
+    returns the patient recovers at ``recovery_rate`` points per
+    second. Without ``bed``/``beds`` it is ward-wide, like
+    ``partition``.
     """
 
-    def __init__(self, type, at, duration=None, bed=None, beds=None, med=None, drift=None, shortage=None, reason=None):
+    def __init__(self, type, at, duration=None, bed=None, beds=None, med=None, drift=None, shortage=None, reason=None, oxygen=None):
         if type not in VALID_TYPES:
             raise ValueError("unknown chaos type: %r" % type)
         if type == "stockout":
@@ -146,6 +217,8 @@ class ChaosEvent:
             shortage = validate_shortage(shortage)
         if type == "bed_blocker":
             reason = validate_block_reason(reason)
+        if type == "oxygen_outage":
+            oxygen = validate_oxygen_outage(oxygen)
         if type == "discharge":
             duration = 0 if duration is None else duration
             if duration < 0:
@@ -163,6 +236,7 @@ class ChaosEvent:
         self.drift = drift
         self.shortage = shortage
         self.reason = reason
+        self.oxygen = oxygen
 
     @property
     def end(self):
@@ -259,6 +333,16 @@ class ChaosEngine:
                 for b in ev.targets(ward):
                     ward.monitors[b].blocked_until = ev.end
                     ward.monitors[b].blocked_reason = ev.reason
+            elif ev.type == "oxygen_outage":
+                # The oxygen supply is down for the window. The
+                # monitor holds the outage end and the config; the
+                # deficit itself grows and recovers in the monitor
+                # tick (see Monitor._step_oxygen), so a bed that is
+                # offline or stale this tick does not desaturate
+                # on a reading nobody saw.
+                for b in ev.targets(ward):
+                    ward.monitors[b].oxygen_outage_until = ev.end
+                    ward.monitors[b].oxygen_outage_cfg = ev.oxygen
             elif ev.type == "dropout":
                 for b in ev.targets(ward):
                     ward.monitors[b].offline_until = ev.end

@@ -128,6 +128,21 @@ class Monitor:
         self.blocked_reason = None
         self.blocked_discharge_pending = False
         self.blocked_discharge_since = None
+        # Oxygen outage: how many SpO2 points this patient has
+        # lost to a failed oxygen supply, while
+        # ``oxygen_outage_until`` (elapsed seconds) has not passed
+        # and ``oxygen_outage_cfg`` carries the event's rate,
+        # floor, and recovery rate. Unlike sensor drift this is a
+        # real desaturation — the patient is genuinely losing
+        # saturation, not mis-measured — so it feeds the alarms
+        # and the NEWS2 score exactly like a falling SpO2 would,
+        # and it only ever touches a patient on oxygen: a patient
+        # not on oxygen has no supply to lose. The deficit
+        # recovers once the supply returns and is cleared on a
+        # new admission, like the drift bias.
+        self.oxygen_deficit = 0.0
+        self.oxygen_outage_until = None
+        self.oxygen_outage_cfg = None
         self.seq = 0
         # False until the ward admits this bed (scenario timeline); an
         # unadmitted bed emits no readings at all.
@@ -235,6 +250,33 @@ class Monitor:
             expected_t if expected_t is not None else now, 3
         )
         return True
+
+    def oxygen_outage_detail(self, now):
+        """Per-bed oxygen-outage state as plain JSON data.
+
+        ``outage_active`` is True while an oxygen-outage event
+        holds the ward's supply, with when it ends; ``deficit``
+        is how many SpO2 points this patient has lost to it
+        (zero for a patient not on oxygen, who has no supply to
+        lose), and ``desaturating`` is True while any deficit
+        remains — including after the outage ends, while the
+        patient is still recovering.
+        """
+        active = (
+            self.oxygen_outage_until is not None
+            and now < self.oxygen_outage_until
+        )
+        return {
+            "bed": self.bed_id,
+            "admitted": self.admitted,
+            "on_oxygen": self.on_oxygen,
+            "outage_active": active,
+            "outage_until": (
+                self.oxygen_outage_until if active else None
+            ),
+            "deficit": self.oxygen_deficit,
+            "desaturating": self.oxygen_deficit > 0,
+        }
 
     def bed_blocker_detail(self, now):
         """Per-bed bed-blocker state as plain JSON data.
@@ -407,8 +449,12 @@ class Monitor:
         self.news2_history.clear()
         # A new admission recalibrates the sensor: the drifted
         # bias belonged to the previous patient's stay, and the
-        # new patient starts from a clean sensor.
+        # new patient starts from a clean sensor. The oxygen
+        # deficit goes the same way: the new patient starts
+        # fully saturated, and an outage still running starts
+        # desaturating them again from zero on the next tick.
         self.sensor_drift = {}
+        self.oxygen_deficit = 0.0
         self.signs = initial_signs(self.profile, self.rng, self.acuity)
         self.seq = 0
         self.last_reading = None
@@ -443,18 +489,73 @@ class Monitor:
             else:
                 self.sensor_drift[vital] = bias
 
+    def _step_oxygen(self, now, dt=1.0):
+        """Grow or recover the oxygen deficit for this tick.
+
+        Only a patient on oxygen is affected: while an
+        oxygen-outage event is active their SpO2 falls by the
+        event's ``rate`` per second, down to its ``floor`` — the
+        deficit is capped so the walked SpO2 minus the deficit
+        never drops below the floor, and the floor is enforced
+        again on the reported value (see
+        :meth:`reported_signs`), so a downward wander of the
+        walk cannot push the reading under it either. Once the
+        supply returns the deficit shrinks by the event's
+        ``recovery_rate`` per second until the patient is back
+        to their walked saturation. The deficit is pure
+        arithmetic on dt — no RNG — so a seeded run reproduces
+        it exactly. A patient not on oxygen never grows a
+        deficit, and a deficit of zero stays zero.
+        """
+        if not self.on_oxygen:
+            return
+        if (
+            self.oxygen_outage_until is not None
+            and now < self.oxygen_outage_until
+            and self.oxygen_outage_cfg is not None
+        ):
+            cfg = self.oxygen_outage_cfg
+            room = max(0.0, self.signs["spo2"] - cfg["floor"])
+            self.oxygen_deficit = round(
+                min(self.oxygen_deficit + cfg["rate"] * dt, room),
+                3,
+            )
+        elif self.oxygen_deficit > 0:
+            rate = (
+                self.oxygen_outage_cfg["recovery_rate"]
+                if self.oxygen_outage_cfg is not None
+                else 1.0
+            )
+            self.oxygen_deficit = round(
+                max(0.0, self.oxygen_deficit - rate * dt), 3
+            )
+
     def reported_signs(self):
         """The vitals as the sensor reports them: true vitals
         plus the accumulated drift bias, clamped inside the
         plausible envelope so a runaway drift saturates at the
-        edge of what a real monitor would ever show."""
+        edge of what a real monitor would ever show. A patient
+        desaturating from a failed oxygen supply reports the
+        walked SpO2 minus the deficit — a real fall, not a
+        sensor error — and the deficit never pushes the reported
+        SpO2 below the outage's floor, however far the walk
+        wanders; the sensor-drift bias still shows in full
+        whenever the deficit leaves room above the floor."""
         out = {}
         for key, value in self.signs.items():
             lo, hi = PLAUSIBLE[key]
-            out[key] = round(
-                max(lo, min(hi, value + self.sensor_drift.get(key, 0.0))),
-                2,
-            )
+            v = value + self.sensor_drift.get(key, 0.0)
+            if key == "spo2" and self.oxygen_deficit > 0:
+                floor = (
+                    self.oxygen_outage_cfg["floor"]
+                    if self.oxygen_outage_cfg is not None
+                    else lo
+                )
+                deficit = min(
+                    self.oxygen_deficit, max(0.0, v - floor)
+                )
+                v -= deficit
+            out[key] = round(max(lo, min(hi, v)), 2)
         return out
 
     def sensor_drift_detail(self):
@@ -525,6 +626,13 @@ class Monitor:
             self.alarm_until = None
             self.signs = step(self.signs, self.profile, self.rng, dt, self.acuity)
 
+        # An oxygen outage desaturates a patient on oxygen before
+        # the reading is built, so this tick's reading, alarms,
+        # and NEWS2 score already carry the fall — and a patient
+        # recovering after the supply returns climbs back just
+        # as fast. A patient not on oxygen is untouched.
+        self._step_oxygen(now, dt)
+
         # Consciousness moves before the reading is built, so this
         # tick's reading, score, and snapshot already carry the new
         # level — a change is visible in the same tick it happens.
@@ -552,6 +660,7 @@ class Monitor:
             "consciousness": self.consciousness,
             "stale": False,
             "sensor_drift": dict(self.sensor_drift),
+            "oxygen_deficit": self.oxygen_deficit,
             **reported,
         }
         reading["alarms"] = alarms_for(reported)

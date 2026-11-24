@@ -105,7 +105,10 @@ def summarize(path):
     vital — and bed-blocker totals from the last tick: how many
     beds are blocked and why, how many discharges are still held
     by a block, and how many discharges the run has held this
-    way — and medication totals from the last tick:
+    way — and oxygen-outage totals from the last tick: how many
+    patients are on oxygen, how many are desaturating from a
+    failed supply, each desaturating bed's SpO2 loss, and the
+    largest loss on any bed — and medication totals from the last tick:
     doses given, late, missed, and skipped for a stockout, and
     whether the missed-dose hooks are configured and how many hook
     deliveries were invoked and failed — and staffing totals from
@@ -131,6 +134,7 @@ def summarize(path):
     last_staffing = None
     last_sensor_drift = None
     last_bed_blocker = None
+    last_oxygen_outage = None
     with open(path) as f:
         for line in f:
             line = line.strip()
@@ -194,6 +198,8 @@ def summarize(path):
                         entry["peak_score"] = n2["score"]
                         entry["peak_risk"] = n2["risk"]
                     entry["ticks_" + n2["risk"]] += 1
+            if isinstance(obj.get("oxygen_outage"), dict):
+                last_oxygen_outage = obj["oxygen_outage"]
             for bed in obj["beds"]:
                 b = bed["bed"]
                 if not bed.get("online", True):
@@ -510,6 +516,31 @@ def summarize(path):
                 ),
             }
             if last_bed_blocker is not None
+            else None
+        ),
+        # Oxygen-outage totals from the last tick: how many
+        # patients are on oxygen, how many are desaturating from
+        # a failed supply, each desaturating bed's SpO2 loss, and
+        # the largest loss on any bed — so a run's oxygen failure
+        # is visible without replaying every tick.
+        "oxygen_outage": (
+            {
+                "beds_on_oxygen": last_oxygen_outage[
+                    "beds_on_oxygen"
+                ],
+                "beds_desaturating": last_oxygen_outage[
+                    "beds_desaturating"
+                ],
+                "beds": {
+                    str(b["bed"]): b["deficit"]
+                    for b in last_oxygen_outage["beds"]
+                    if b["desaturating"]
+                },
+                "max_deficit": last_oxygen_outage.get(
+                    "max_deficit", 0.0
+                ),
+            }
+            if last_oxygen_outage is not None
             else None
         ),
         # Staffing totals from the last tick: the load factor, how

@@ -448,7 +448,7 @@ class Ward:
         # in, and before the snapshot, so the event is in it.
         # A tick where the order is unchanged fires nothing.
         self._check_priority_order()
-        snap = {"t": self.elapsed, "beds": readings, "staffing": self.staffing_summary(), "turnover": self.turnover_summary(), "meds": self.meds_summary(), "triage": self.triage_summary(), "arrivals": self.arrivals_summary(), "discharge": self.discharge_summary(), "discharge_readiness": self.readiness_summary(), "discharge_priority": self.discharge_priority_summary(), "early_warning": self.early_warning_summary(), "sensor_drift": self.sensor_drift_summary(), "bed_blocker": self.bed_blocker_summary()}
+        snap = {"t": self.elapsed, "beds": readings, "staffing": self.staffing_summary(), "turnover": self.turnover_summary(), "meds": self.meds_summary(), "triage": self.triage_summary(), "arrivals": self.arrivals_summary(), "discharge": self.discharge_summary(), "discharge_readiness": self.readiness_summary(), "discharge_priority": self.discharge_priority_summary(), "early_warning": self.early_warning_summary(), "sensor_drift": self.sensor_drift_summary(), "bed_blocker": self.bed_blocker_summary(), "oxygen_outage": self.oxygen_outage_summary()}
         with self._lock:
             self.latest = snap
         if self.recorder is not None:
@@ -483,6 +483,30 @@ class Ward:
             "beds": beds,
             "beds_drifting": sum(1 for b in beds if b["drifting"]),
             "max_bias": max_bias,
+        }
+
+    def oxygen_outage_summary(self):
+        """Per-bed oxygen-outage state and ward totals.
+
+        ``beds`` carries each bed's outage state — whether the
+        supply is down, when it returns, and how many SpO2
+        points its patient has lost to it — ``beds_on_oxygen``
+        counts the patients the supply feeds, ``beds_desaturating``
+        counts the ones currently below their walked saturation
+        (including a patient still recovering after the supply
+        returned), and ``max_deficit`` is the largest SpO2 loss
+        on any bed, so a client can see at a glance how far the
+        ward's oxygen-dependent patients have fallen.
+        """
+        beds = [m.oxygen_outage_detail(self.elapsed) for m in self.monitors]
+        return {
+            "t": self.elapsed,
+            "beds": beds,
+            "beds_on_oxygen": sum(1 for b in beds if b["on_oxygen"]),
+            "beds_desaturating": sum(
+                1 for b in beds if b["desaturating"]
+            ),
+            "max_deficit": max((b["deficit"] for b in beds), default=0.0),
         }
 
     def bed_blocker_summary(self):
