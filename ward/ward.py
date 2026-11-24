@@ -256,6 +256,11 @@ class Ward:
                 monitor.admitted = False
             self.monitors.append(monitor)
         self.chaos = ChaosEngine(chaos or [])
+        # Discharges held by a bed-blocker event this run: a
+        # discharge attempted while its bed was blocked counts
+        # once, when it is first held — a second attempt during
+        # the same block does not count again.
+        self.bed_blocker_held = 0
         for ev in self.chaos.events:
             for b in ev.targets(self):
                 if not 0 <= b < beds:
@@ -275,6 +280,12 @@ class Ward:
         # tick reads the load factor, so alarms raised and checks
         # scheduled now already feel the sick call.
         self.staffing.shortage = self.chaos.shortage(self, self.elapsed)
+        # Bed blocker: a discharge held by a block goes through
+        # the tick its block ends, so the patient leaves as soon
+        # as the bed is usable again instead of waiting for a new
+        # order. Runs before the discharge planner, so a planned
+        # order due on the same tick sees the bed unblocked.
+        self._release_blocked_discharges()
         # Discharge planning: orders due now are placed, and orders
         # whose expected time has arrived are discharged — or queued
         # behind a full cleaning roster until a slot frees up.
@@ -437,7 +448,7 @@ class Ward:
         # in, and before the snapshot, so the event is in it.
         # A tick where the order is unchanged fires nothing.
         self._check_priority_order()
-        snap = {"t": self.elapsed, "beds": readings, "staffing": self.staffing_summary(), "turnover": self.turnover_summary(), "meds": self.meds_summary(), "triage": self.triage_summary(), "arrivals": self.arrivals_summary(), "discharge": self.discharge_summary(), "discharge_readiness": self.readiness_summary(), "discharge_priority": self.discharge_priority_summary(), "early_warning": self.early_warning_summary(), "sensor_drift": self.sensor_drift_summary()}
+        snap = {"t": self.elapsed, "beds": readings, "staffing": self.staffing_summary(), "turnover": self.turnover_summary(), "meds": self.meds_summary(), "triage": self.triage_summary(), "arrivals": self.arrivals_summary(), "discharge": self.discharge_summary(), "discharge_readiness": self.readiness_summary(), "discharge_priority": self.discharge_priority_summary(), "early_warning": self.early_warning_summary(), "sensor_drift": self.sensor_drift_summary(), "bed_blocker": self.bed_blocker_summary()}
         with self._lock:
             self.latest = snap
         if self.recorder is not None:
@@ -474,6 +485,30 @@ class Ward:
             "max_bias": max_bias,
         }
 
+    def bed_blocker_summary(self):
+        """Per-bed bed-blocker state and ward totals.
+
+        ``beds`` carries each bed's block state — whether it is
+        blocked, why, and when the block ends — and whether a
+        discharge attempted during the block is still waiting
+        for it to clear; ``beds_blocked`` counts the beds
+        currently blocked, ``discharges_pending`` counts the
+        discharges still held by a block, and ``discharges_held``
+        counts every discharge the run has held this way, so a
+        client can see both the beds out of use now and how
+        often a block has held a patient back.
+        """
+        beds = [m.bed_blocker_detail(self.elapsed) for m in self.monitors]
+        return {
+            "t": self.elapsed,
+            "beds": beds,
+            "beds_blocked": sum(1 for b in beds if b["blocked"]),
+            "discharges_pending": sum(
+                1 for b in beds if b["discharge_pending"]
+            ),
+            "discharges_held": self.bed_blocker_held,
+        }
+
     def alarm_summary(self, window_s=60.0):
         """Per-bed alarm history and rate metrics for the whole ward."""
         beds = [m.alarm_summary(self.elapsed, window_s) for m in self.monitors]
@@ -488,6 +523,30 @@ class Ward:
         """Beds being cleaned at elapsed time ``now``."""
         return sum(1 for m in self.monitors if m.state(now) == "cleaning")
 
+    def _release_blocked_discharges(self):
+        """Discharge the patients whose discharge a bed blocker
+        was holding, now that their block has cleared.
+
+        A discharge attempted while its bed was blocked is held
+        until the block ends (see :meth:`discharge`); this runs
+        every tick after the chaos engine, so the patient leaves
+        on the very tick the bed becomes usable again, through
+        the normal discharge path — including a full cleaning
+        roster, which queues the discharge like any other. A
+        delayed discharge-planning order is completed when the
+        discharge actually starts cleaning, not when it queues
+        behind the roster — the queued case is completed by
+        :meth:`_start_queued_cleanings` when its slot frees up.
+        """
+        for m in self.monitors:
+            if not m.blocked_discharge_pending:
+                continue
+            if not m.admitted or m.is_blocked(self.elapsed):
+                continue
+            self.discharge(m.bed_id)
+            if not m.awaiting_cleaning:
+                self.discharge_planner.complete(m.bed_id, self.elapsed)
+
     def discharge(self, bed_id):
         """Discharge the patient in ``bed_id``.
 
@@ -496,14 +555,22 @@ class Ward:
         ``cleaning_capacity`` is set and every cleaning slot is busy,
         the discharge is queued instead: the patient stays in the bed,
         still monitored, until a slot frees up (see
-        :meth:`_start_queued_cleanings`). A bed whose discharge is
-        already queued is left alone.
+        :meth:`_start_queued_cleanings`). When the bed is blocked by
+        a bed-blocker event, the discharge is held instead: the
+        patient stays in the bed, still monitored, until the block
+        clears, when :meth:`_release_blocked_discharges` puts it
+        through. A bed whose discharge is already queued or held is
+        left alone.
         """
         m = self._monitor(bed_id)
         if m.awaiting_cleaning:
             return
         if not m.admitted:
             raise ValueError("bed %d is not occupied" % bed_id)
+        if m.is_blocked(self.elapsed):
+            if m.mark_blocked_discharge(self.elapsed):
+                self.bed_blocker_held += 1
+            return
         if (
             self.cleaning_capacity is not None
             and self.cleaning_active_count(self.elapsed)
@@ -517,15 +584,23 @@ class Ward:
         """Discharge a planned discharge due at ``expected_t``.
 
         Returns ``"discharged"`` when the bed went into cleaning at
-        once, ``"queued"`` when cleaning is backed up and the patient
-        stays in the bed, or ``"cancelled"`` when the patient already
-        left (a chaos discharge fired first, say).
+        once, ``"queued"`` when cleaning is backed up — or the bed
+        is blocked by a bed-blocker event — and the patient stays
+        in the bed, or ``"cancelled"`` when the patient already left
+        (a chaos ``discharge`` event fired first, say). A discharge
+        held by a block goes through the tick the block ends (see
+        :meth:`_release_blocked_discharges`), which completes the
+        delayed order with the wait recorded as its delay.
         """
         m = self._monitor(bed_id)
         if m.awaiting_cleaning:
             return "queued"
         if not m.admitted:
             return "cancelled"
+        if m.is_blocked(self.elapsed):
+            if m.mark_blocked_discharge(self.elapsed, expected_t):
+                self.bed_blocker_held += 1
+            return "queued"
         if (
             self.cleaning_capacity is not None
             and self.cleaning_active_count(self.elapsed)
@@ -973,6 +1048,7 @@ class Ward:
             "beds": beds,
             "occupied": sum(1 for b in beds if b["state"] == "occupied"),
             "cleaning": sum(1 for b in beds if b["state"] == "cleaning"),
+            "blocked": sum(1 for b in beds if b["state"] == "blocked"),
             "available": sum(1 for b in beds if b["state"] == "available"),
             "awaiting_cleaning": sum(
                 1 for b in beds if b["awaiting_cleaning"]

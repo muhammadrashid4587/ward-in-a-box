@@ -1,10 +1,28 @@
 """Chaos events: device dropout, alarm storms, stale readings, partitions,
-discharges, pharmacy stockouts, slow sensor drift, staff shortages."""
+discharges, pharmacy stockouts, slow sensor drift, staff shortages, bed
+blockers."""
 
 from .staffing import ROLES
 from .vitals import NORMAL
 
-VALID_TYPES = ("dropout", "alarm_storm", "stale", "partition", "discharge", "stockout", "sensor_drift", "staff_shortage")
+VALID_TYPES = ("dropout", "alarm_storm", "stale", "partition", "discharge", "stockout", "sensor_drift", "staff_shortage", "bed_blocker")
+
+# Why a bed is blocked: awaiting a porter to move the patient,
+# an isolation clean after an infectious patient, or an equipment
+# fault on the bed itself.
+BLOCK_REASONS = ("porter", "isolation_clean", "equipment_fault")
+
+
+def validate_block_reason(reason):
+    """A bed-blocker reason: one of ``porter``, ``isolation_clean``,
+    or ``equipment_fault`` — what is keeping the bed out of use.
+    """
+    if reason not in BLOCK_REASONS:
+        raise ValueError(
+            "bed_blocker reason must be one of 'porter', "
+            "'isolation_clean', 'equipment_fault', got %r" % (reason,)
+        )
+    return reason
 
 
 def validate_shortage(shortage):
@@ -105,10 +123,18 @@ class ChaosEvent:
     ``bed``/``beds``. Only lost nurses change the modelled care:
     a lost doctor or tech is recorded in the staffing summary
     but slows nothing, because the model keys response times
-    off nurses alone.
+    off nurses alone. ``bed_blocker`` needs ``reason`` (see
+    :func:`validate_block_reason`): while it is active, the
+    target beds are blocked — a bed awaiting a porter, an
+    isolation clean, or with an equipment fault — so they cannot
+    take a new admission and their patient cannot be discharged
+    until the block clears. A discharge attempted while blocked
+    is held and goes through the moment the block ends, with the
+    wait recorded as a discharge delay, exactly like a discharge
+    held behind a full cleaning roster.
     """
 
-    def __init__(self, type, at, duration=None, bed=None, beds=None, med=None, drift=None, shortage=None):
+    def __init__(self, type, at, duration=None, bed=None, beds=None, med=None, drift=None, shortage=None, reason=None):
         if type not in VALID_TYPES:
             raise ValueError("unknown chaos type: %r" % type)
         if type == "stockout":
@@ -118,6 +144,8 @@ class ChaosEvent:
             drift = validate_drift(drift)
         if type == "staff_shortage":
             shortage = validate_shortage(shortage)
+        if type == "bed_blocker":
+            reason = validate_block_reason(reason)
         if type == "discharge":
             duration = 0 if duration is None else duration
             if duration < 0:
@@ -134,6 +162,7 @@ class ChaosEvent:
         self.med = med.strip().lower() if isinstance(med, str) else None
         self.drift = drift
         self.shortage = shortage
+        self.reason = reason
 
     @property
     def end(self):
@@ -220,6 +249,16 @@ class ChaosEngine:
                 # run reproduces it exactly.
                 for b in ev.targets(ward):
                     ward.monitors[b].apply_drift(ev.drift, dt)
+            elif ev.type == "bed_blocker":
+                # The bed is out of use for the window: it cannot
+                # take a new admission and its patient cannot be
+                # discharged until the block clears. The monitor
+                # holds the block end and the reason; the ward
+                # releases any discharge held by the block the
+                # tick it ends (see Ward._release_blocked_discharges).
+                for b in ev.targets(ward):
+                    ward.monitors[b].blocked_until = ev.end
+                    ward.monitors[b].blocked_reason = ev.reason
             elif ev.type == "dropout":
                 for b in ev.targets(ward):
                     ward.monitors[b].offline_until = ev.end

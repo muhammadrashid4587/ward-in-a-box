@@ -115,6 +115,19 @@ class Monitor:
         # never fed the drift — a miscalibrated sensor does not
         # change the patient, only what the ward sees.
         self.sensor_drift = {}
+        # Bed blocker: a bed out of use while ``blocked_until``
+        # (elapsed seconds) has not passed, for ``blocked_reason``
+        # (``porter``, ``isolation_clean``, or ``equipment_fault``).
+        # While blocked the bed cannot take a new admission and
+        # its patient cannot be discharged; a discharge attempted
+        # while blocked is held in ``blocked_discharge_pending``
+        # from ``blocked_discharge_since`` (when it was first
+        # attempted, or the expected time for a planned one) until
+        # the block clears — see :meth:`mark_blocked_discharge`.
+        self.blocked_until = None
+        self.blocked_reason = None
+        self.blocked_discharge_pending = False
+        self.blocked_discharge_since = None
         self.seq = 0
         # False until the ward admits this bed (scenario timeline); an
         # unadmitted bed emits no readings at all.
@@ -198,17 +211,65 @@ class Monitor:
             )
         return on_oxygen
 
+    def is_blocked(self, now):
+        """True while a bed-blocker event holds this bed: it cannot
+        take a new admission and its patient cannot be discharged
+        until the block clears."""
+        return self.blocked_until is not None and now < self.blocked_until
+
+    def mark_blocked_discharge(self, now, expected_t=None):
+        """Hold a discharge that was attempted while the bed is
+        blocked: the patient stays in the bed until the block
+        clears, and the wait is measured from ``expected_t`` (a
+        planned discharge's expected time) or ``now``.
+
+        Returns True when this is a fresh hold — False when a
+        discharge is already held for this bed, so a second
+        attempt during the same block does not restart the
+        clock or double-count the hold.
+        """
+        if self.blocked_discharge_pending:
+            return False
+        self.blocked_discharge_pending = True
+        self.blocked_discharge_since = round(
+            expected_t if expected_t is not None else now, 3
+        )
+        return True
+
+    def bed_blocker_detail(self, now):
+        """Per-bed bed-blocker state as plain JSON data.
+
+        ``blocked`` is True while a bed-blocker event holds the
+        bed, with the reason and when the block ends; ``blocked``
+        is False once the window has passed, even before the next
+        tick clears the stored fields. ``discharge_pending`` is
+        True while a discharge attempted during the block is
+        still waiting for the block to clear.
+        """
+        blocked = self.is_blocked(now)
+        return {
+            "bed": self.bed_id,
+            "admitted": self.admitted,
+            "blocked": blocked,
+            "reason": self.blocked_reason if blocked else None,
+            "blocked_until": self.blocked_until if blocked else None,
+            "discharge_pending": self.blocked_discharge_pending,
+        }
+
     def state(self, now):
         """Bed state at elapsed time ``now``.
 
         ``"occupied"`` while a patient is admitted, ``"cleaning"`` after
-        a discharge until the turnover period ends, ``"available"``
+        a discharge until the turnover period ends, ``"blocked"`` while
+        a bed-blocker event holds an otherwise free bed, ``"available"``
         once the bed can take a new admission.
         """
         if self.admitted:
             return "occupied"
         if self.cleaning_until is not None and now < self.cleaning_until:
             return "cleaning"
+        if self.is_blocked(now):
+            return "blocked"
         return "available"
 
     def discharge(self, now, cleaning_s):
@@ -242,15 +303,30 @@ class Monitor:
         if self.awaiting_cleaning:
             return
         self.awaiting_cleaning = True
-        self.pending_since = round(
-            expected_t if expected_t is not None else now, 3
-        )
+        # A discharge that was held by a bed blocker and is now
+        # queued behind a full cleaning roster keeps its original
+        # clock: the delay is measured from when the discharge
+        # was first attempted (or its expected time), not from
+        # when the block cleared, so the blocked wait is not lost.
+        if self.blocked_discharge_since is not None:
+            self.pending_since = round(self.blocked_discharge_since, 3)
+            self.blocked_discharge_since = None
+            self.blocked_discharge_pending = False
+        else:
+            self.pending_since = round(
+                expected_t if expected_t is not None else now, 3
+            )
 
     def begin_cleaning(self, now, cleaning_s):
         """Start turnover for a discharged (or queued) patient.
 
         Records the discharge delay when one was queued: how long
         past the expected discharge time cleaning actually started.
+        A discharge held by a bed blocker counts the same way: the
+        wait from when it was first attempted (or its expected
+        time, for a planned one) to cleaning starting is a
+        discharge delay, so a blocked bed shows up in the same
+        delay totals as a bed held behind a full cleaning roster.
         """
         if self.pending_since is not None:
             delay = round(now - self.pending_since, 3)
@@ -260,6 +336,15 @@ class Monitor:
                     self.total_discharge_delay_s + delay, 3
                 )
             self.pending_since = None
+        if self.blocked_discharge_since is not None:
+            delay = round(now - self.blocked_discharge_since, 3)
+            if delay > 0:
+                self.discharge_delays += 1
+                self.total_discharge_delay_s = round(
+                    self.total_discharge_delay_s + delay, 3
+                )
+            self.blocked_discharge_since = None
+        self.blocked_discharge_pending = False
         self.awaiting_cleaning = False
         self._record_alarm_transitions([], now)
         self._close_escalation(now)
@@ -280,7 +365,8 @@ class Monitor:
     def admit(self, now, profile=None, acuity=None, on_oxygen=None, consciousness=None):
         """Admit a new patient to an available bed.
 
-        Raises ValueError if the bed is occupied or still cleaning.
+        Raises ValueError if the bed is occupied, still cleaning,
+        or blocked by a bed-blocker event.
         A new admission starts with fresh vitals, so the previous
         patient's readings and alarms do not carry over. The new
         patient is not on oxygen unless ``on_oxygen`` says so —
@@ -294,6 +380,11 @@ class Monitor:
         if state == "cleaning":
             raise ValueError(
                 "bed %d is cleaning until t=%s" % (self.bed_id, self.cleaning_until)
+            )
+        if state == "blocked":
+            raise ValueError(
+                "bed %d is blocked (%s) until t=%s"
+                % (self.bed_id, self.blocked_reason, self.blocked_until)
             )
         if profile is not None:
             self.profile = profile
@@ -386,6 +477,10 @@ class Monitor:
         return {
             "bed": self.bed_id,
             "state": self.state(now),
+            "blocked": self.is_blocked(now),
+            "blocked_reason": (
+                self.blocked_reason if self.is_blocked(now) else None
+            ),
             "cleaning_until": self.cleaning_until
             if self.state(now) == "cleaning"
             else None,
@@ -401,6 +496,9 @@ class Monitor:
         self.raised_this_tick = []
         if self.cleaning_until is not None and now >= self.cleaning_until:
             self.cleaning_until = None
+        if self.blocked_until is not None and now >= self.blocked_until:
+            self.blocked_until = None
+            self.blocked_reason = None
         if not self.admitted:
             return None
         if self.offline_until is not None:

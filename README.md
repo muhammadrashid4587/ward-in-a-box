@@ -177,6 +177,13 @@ python3 -m ward.cli scenarios/sensor-drift.json --seed 42
 # instead of 30.0 s
 python3 -m ward.cli scenarios/staff-shortage.json --seed 42
 
+# Bed blocker: bed 1 waits for a porter from 5 s to 25 s, so its
+# discharge at 10 s is held until 25 s (15 s late), and bed 3
+# finishes cleaning at 15 s but is blocked for an isolation clean
+# until 30 s, so the waiting triage patient takes bed 2 when it
+# frees at 20 s instead, after waiting 20 s
+python3 -m ward.cli scenarios/bed-blocker.json --seed 42
+
 # NEWS2 trend alert hooks: the same ward, with each trend alert
 # also POSTed to a webhook (here a placeholder URL — point it at
 # your own endpoint; a dead endpoint is logged, never fatal)
@@ -263,6 +270,10 @@ python3 -m ward.cli scenarios/example.json --seed 42
   bias per vital on each bed, how many beds have a drifted sensor,
   and the largest absolute bias per vital, as JSON
   (503 while partitioned)
+- `GET /bed-blocker` — per-bed bed-blocker state: whether each bed
+  is blocked, why, and when the block ends, how many beds are
+  blocked, and how many discharges are held by a block, as JSON
+  (503 while partitioned)
 
 A reading looks like:
 
@@ -296,7 +307,8 @@ discharge summary from `/discharge`, the discharge-readiness
 summary from `/discharge-readiness`, the discharge-priority
 summary from `/discharge-priority`, the early-warning
 summary from `/news2`, and the sensor-drift summary from
-`/sensor-drift`, so a client gets bed occupancy, vitals, alarms, staffing,
+`/sensor-drift`, and the bed-blocker summary from
+`/bed-blocker`, so a client gets bed occupancy, vitals, alarms, staffing,
 medication, and the intake queue in one message. Ping frames are answered with pong, close frames
 are echoed and the connection is then closed; text frames from the
 client are accepted and ignored — the ward pushes ticks, it takes no
@@ -402,6 +414,13 @@ Chaos types:
   would; ward-wide, so `bed`/`beds` are ignored. Only lost
   nurses change the modelled care — a lost doctor or tech is
   recorded but slows nothing; see Staff shortage below.
+- `bed_blocker` — a bed is out of use for `duration` seconds;
+  needs `"reason"`, one of `"porter"`, `"isolation_clean"`, or
+  `"equipment_fault"`. While it is active the bed cannot take a
+  new admission and its patient cannot be discharged until the
+  block clears; a discharge attempted while blocked is held and
+  goes through the moment the block ends, with the wait recorded
+  as a discharge delay; see Bed blocker below.
 
 `bed` targets one bed, `beds` targets several, neither targets all beds
 (`partition` is always ward-wide). Times are elapsed seconds from start.
@@ -471,7 +490,9 @@ admitted. See `scenarios/ramp-up.json` for a runnable example.
 When a patient is discharged, the bed is not free at once: it goes
 through cleaning first. A bed has three states — `occupied` while a
 patient is admitted, `cleaning` after a discharge until turnover
-finishes, `available` once it can take a new admission. The cleaning
+finishes, `available` once it can take a new admission — plus a
+fourth, `blocked`, while a bed-blocker event holds a bed that has
+finished cleaning (see Bed blocker below). The cleaning
 duration is `cleaning_s` seconds, set on the ward (30 by default) or
 in the scenario:
 
@@ -642,6 +663,45 @@ is out from 10 s to 40 s during an alarm storm on beds 0-2,
 the load factor sits at 1.5 for the window and 1.0 either
 side of it, and all 15 storm alarms are acknowledged in
 45.0 s on average instead of 30.0 s.
+
+## Bed blocker
+
+A `bed_blocker` chaos event takes a bed out of use for a window —
+a bed awaiting a porter to move its patient, an isolation clean
+after an infectious patient, or an equipment fault on the bed
+itself:
+
+```json
+{"type": "bed_blocker", "bed": 1, "at": 5, "duration": 20,
+ "reason": "porter"}
+```
+
+While the event is active, the bed cannot take a new admission —
+a scenario timeline will not admit to it, the triage queue skips
+it even when it has finished cleaning, and a live admission is
+refused — and its patient cannot be discharged: a discharge
+attempted while blocked, whether a chaos `discharge` event or a
+planned discharge order due inside the window, is held, and goes
+through on the very tick the block ends. The wait is recorded as
+a discharge delay, exactly like a discharge held behind a full
+cleaning roster, so the delay shows up in the per-bed turnover
+totals, the discharge summary, and the run summary. A blocked
+bed that has finished cleaning reports state `"blocked"` in the
+turnover summary instead of `"available"`, so a client can tell
+a bed that is free from one that is free but unusable. Every
+snapshot carries a `"bed_blocker"` object with the per-bed block
+state — whether it is blocked, why, and when the block ends —
+and whether a discharge is still waiting on it, plus ward totals
+(how many beds are blocked, how many discharges are held, and
+how many the run has held), served on its own by
+`GET /bed-blocker` and carried in every WebSocket frame, and the
+run summary (`--summary`) reports the same totals from the last
+tick. See `scenarios/bed-blocker.json` for a runnable example:
+over a seeded 40-tick run bed 1 waits for a porter from 5 s to
+25 s, so its discharge at 10 s is held until 25 s (15 s late),
+and bed 3 finishes cleaning at 15 s but is blocked for an
+isolation clean until 30 s, so the waiting triage patient takes
+bed 2 when it frees at 20 s instead, after waiting 20 s.
 
 ## Triage / ED intake queue
 
@@ -2464,3 +2524,13 @@ run.
   the no-nurse factor; the current shortage rides in the
   staffing summary — every snapshot, WebSocket frame,
   `GET /staffing`, and the run summary) — done in v0.46.0
+- Bed blocker (a `bed_blocker` chaos event takes a bed out of use
+  for a window — awaiting a porter, an isolation clean, or an
+  equipment fault — so it cannot take a new admission and its
+  patient cannot be discharged until the block clears, with a
+  discharge attempted while blocked held until the block ends
+  and the wait recorded as a discharge delay; a blocked bed
+  reports state `"blocked"` in the turnover summary, and the
+  block state rides in every snapshot, WebSocket frame, a
+  `GET /bed-blocker` endpoint, and the run summary) — done in
+  v0.47.0

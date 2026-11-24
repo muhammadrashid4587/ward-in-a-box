@@ -102,7 +102,10 @@ def summarize(path):
     each risk level — and sensor-drift totals from the last tick:
     how many beds have a drifted sensor, each drifting bed's
     accumulated bias per vital, and the largest absolute bias per
-    vital — and medication totals from the last tick:
+    vital — and bed-blocker totals from the last tick: how many
+    beds are blocked and why, how many discharges are still held
+    by a block, and how many discharges the run has held this
+    way — and medication totals from the last tick:
     doses given, late, missed, and skipped for a stockout, and
     whether the missed-dose hooks are configured and how many hook
     deliveries were invoked and failed — and staffing totals from
@@ -127,6 +130,7 @@ def summarize(path):
     last_meds = None
     last_staffing = None
     last_sensor_drift = None
+    last_bed_blocker = None
     with open(path) as f:
         for line in f:
             line = line.strip()
@@ -159,6 +163,8 @@ def summarize(path):
                 last_staffing = obj["staffing"]
             if isinstance(obj.get("sensor_drift"), dict):
                 last_sensor_drift = obj["sensor_drift"]
+            if isinstance(obj.get("bed_blocker"), dict):
+                last_bed_blocker = obj["bed_blocker"]
                 # NEWS2 history totals per bed, from the score on
                 # each tick's reading: ticks scored, peak score and
                 # the risk at that score, and ticks at each risk
@@ -481,6 +487,29 @@ def summarize(path):
                 "max_bias": last_sensor_drift.get("max_bias", {}),
             }
             if last_sensor_drift is not None
+            else None
+        ),
+        # Bed-blocker totals from the last tick: how many beds
+        # are blocked and why, how many discharges are still
+        # held by a block, and how many discharges the run has
+        # held this way — so a run's beds out of use are visible
+        # without replaying every tick.
+        "bed_blocker": (
+            {
+                "beds_blocked": last_bed_blocker["beds_blocked"],
+                "beds": {
+                    str(b["bed"]): b["reason"]
+                    for b in last_bed_blocker["beds"]
+                    if b["blocked"]
+                },
+                "discharges_pending": last_bed_blocker.get(
+                    "discharges_pending", 0
+                ),
+                "discharges_held": last_bed_blocker.get(
+                    "discharges_held", 0
+                ),
+            }
+            if last_bed_blocker is not None
             else None
         ),
         # Staffing totals from the last tick: the load factor, how

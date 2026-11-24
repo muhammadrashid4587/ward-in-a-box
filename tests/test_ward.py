@@ -9339,5 +9339,321 @@ class TestStaffShortage(unittest.TestCase):
         self.assertEqual(snaps[69]["staffing"]["load_factor"], 1.0)
 
 
+class TestBedBlocker(unittest.TestCase):
+    # A bed blocker: a bed out of use for a window — awaiting a
+    # porter, an isolation clean, or an equipment fault — so it
+    # cannot take a new admission and its patient cannot be
+    # discharged until the block clears. A discharge attempted
+    # while blocked is held and goes through the tick the block
+    # ends, with the wait recorded as a discharge delay.
+
+    def _blocker_ward(self, bed=0, at=5, duration=20, reason="porter", **kwargs):
+        return Ward(
+            beds=2,
+            profiles=["stable", "stable"],
+            chaos=[
+                ChaosEvent(
+                    "bed_blocker",
+                    at=at,
+                    duration=duration,
+                    bed=bed,
+                    reason=reason,
+                )
+            ],
+            seed=42,
+            **kwargs,
+        )
+
+    def test_block_reason_validation(self):
+        # A bed-blocker event needs a reason.
+        with self.assertRaises(ValueError):
+            ChaosEvent("bed_blocker", at=0, duration=10, bed=0)
+        # Only the known reasons are valid.
+        with self.assertRaises(ValueError):
+            ChaosEvent(
+                "bed_blocker",
+                at=0,
+                duration=10,
+                bed=0,
+                reason="waiting_for_bed",
+            )
+        for reason in ("porter", "isolation_clean", "equipment_fault"):
+            ev = ChaosEvent(
+                "bed_blocker",
+                at=0,
+                duration=10,
+                bed=0,
+                reason=reason,
+            )
+            self.assertEqual(ev.reason, reason)
+
+    def test_blocked_discharge_held_until_block_clears(self):
+        ward = Ward(
+            beds=2,
+            profiles=["stable", "stable"],
+            chaos=[
+                ChaosEvent(
+                    "bed_blocker",
+                    at=5,
+                    duration=20,
+                    bed=0,
+                    reason="porter",
+                ),
+                ChaosEvent("discharge", at=10, bed=0),
+            ],
+            cleaning_s=10,
+            seed=42,
+        )
+        snaps = [ward.tick() for _ in range(15)]
+        # The discharge is attempted at 10 s, while the bed is
+        # blocked awaiting a porter: the patient stays in the
+        # bed, still monitored, and the hold is recorded.
+        self.assertTrue(snaps[9]["beds"][0]["online"])
+        self.assertEqual(snaps[9]["bed_blocker"]["beds_blocked"], 1)
+        self.assertEqual(
+            snaps[9]["bed_blocker"]["beds"][0]["reason"], "porter"
+        )
+        self.assertEqual(
+            snaps[9]["bed_blocker"]["beds"][0]["blocked_until"], 25.0
+        )
+        self.assertEqual(
+            snaps[9]["bed_blocker"]["discharges_pending"], 1
+        )
+        self.assertEqual(snaps[9]["bed_blocker"]["discharges_held"], 1)
+        # A second discharge attempt during the same block does
+        # not restart the clock or count the hold twice.
+        ward.discharge(0)
+        self.assertEqual(ward.bed_blocker_held, 1)
+        self.assertTrue(snaps[14]["beds"][0]["online"])
+        self.assertEqual(
+            snaps[14]["bed_blocker"]["discharges_pending"], 1
+        )
+        snaps += [ward.tick() for _ in range(15)]
+        # The block ends at 25 s: the discharge goes through on
+        # that tick, and the 15 s wait is a discharge delay.
+        self.assertEqual(
+            snaps[24]["turnover"]["beds"][0]["state"], "cleaning"
+        )
+        self.assertEqual(
+            snaps[24]["bed_blocker"]["discharges_pending"], 0
+        )
+        self.assertEqual(snaps[24]["bed_blocker"]["discharges_held"], 1)
+        self.assertEqual(
+            snaps[24]["turnover"]["total_discharge_delay_s"], 15.0
+        )
+        self.assertEqual(snaps[29]["bed_blocker"]["beds_blocked"], 0)
+
+    def test_blocked_bed_refuses_admission(self):
+        ward = Ward(
+            beds=2,
+            profiles=["stable", "stable"],
+            chaos=[
+                ChaosEvent("discharge", at=0, bed=1),
+                ChaosEvent(
+                    "bed_blocker",
+                    at=0,
+                    duration=10,
+                    bed=1,
+                    reason="equipment_fault",
+                ),
+            ],
+            cleaning_s=1,
+            seed=42,
+        )
+        for _ in range(2):
+            ward.tick()
+        # Cleaning finished at 1 s, but the bed is blocked until
+        # 10 s: it reports "blocked", not "available", and an
+        # admission is refused.
+        self.assertEqual(
+            ward.turnover_summary()["beds"][1]["state"], "blocked"
+        )
+        self.assertTrue(ward.turnover_summary()["beds"][1]["blocked"])
+        self.assertEqual(
+            ward.turnover_summary()["beds"][1]["blocked_reason"],
+            "equipment_fault",
+        )
+        self.assertEqual(ward.turnover_summary()["blocked"], 1)
+        with self.assertRaises(ValueError):
+            ward.admit(1)
+        for _ in range(8):
+            ward.tick()
+        # The block cleared at 10 s: the bed is available again
+        # and takes a patient.
+        self.assertEqual(
+            ward.turnover_summary()["beds"][1]["state"], "available"
+        )
+        ward.admit(1)
+        self.assertTrue(ward.monitors[1].admitted)
+
+    def test_timeline_admission_skips_blocked_bed(self):
+        ward = Ward(
+            beds=2,
+            profiles=["stable", "stable"],
+            chaos=[
+                ChaosEvent(
+                    "bed_blocker",
+                    at=5,
+                    duration=15,
+                    bed=1,
+                    reason="porter",
+                )
+            ],
+            timeline=Timeline(
+                [
+                    TimelinePhase(0, 1, ramp_s=0),
+                    TimelinePhase(10, 2, ramp_s=0),
+                ]
+            ),
+            seed=42,
+        )
+        snaps = [ward.tick() for _ in range(25)]
+        # Bed 1 is due at 10 s but blocked until 20 s, so the
+        # timeline does not admit it early.
+        self.assertFalse(snaps[14]["beds"][1].get("admitted", True))
+        # Once the block clears the bed comes online.
+        self.assertTrue(snaps[19]["beds"][1]["online"])
+        self.assertTrue(snaps[24]["beds"][1]["online"])
+
+    def test_planned_discharge_delayed_by_block(self):
+        ward = Ward(
+            beds=2,
+            profiles=["stable", "stable"],
+            chaos=[
+                ChaosEvent(
+                    "bed_blocker",
+                    at=5,
+                    duration=20,
+                    bed=0,
+                    reason="porter",
+                )
+            ],
+            discharge_planning={
+                "lead_time_s": 5,
+                "orders": [{"bed": 0, "at": 5}],
+            },
+            cleaning_s=10,
+            seed=42,
+        )
+        snaps = [ward.tick() for _ in range(30)]
+        # The order is due at 10 s, while the bed is blocked:
+        # it waits, marked delayed, not cancelled.
+        self.assertEqual(
+            snaps[14]["discharge"]["orders"][0]["status"], "delayed"
+        )
+        # The block ends at 25 s: the order completes then, 15 s
+        # late, and the delay is recorded on the order and in
+        # the ward totals.
+        order = snaps[29]["discharge"]["orders"][0]
+        self.assertEqual(order["status"], "discharged")
+        self.assertEqual(order["actual_t"], 25.0)
+        self.assertEqual(order["delay_s"], 15.0)
+        self.assertEqual(snaps[29]["discharge"]["discharged"], 1)
+        self.assertEqual(snaps[29]["discharge"]["delayed"], 1)
+        self.assertEqual(snaps[29]["discharge"]["total_delay_s"], 15.0)
+
+    def test_blocker_summary_and_endpoint(self):
+        ward = Ward(
+            beds=2,
+            profiles=["stable", "stable"],
+            chaos=[
+                ChaosEvent(
+                    "bed_blocker",
+                    at=5,
+                    duration=20,
+                    bed=0,
+                    reason="porter",
+                ),
+                ChaosEvent("discharge", at=10, bed=0),
+            ],
+            cleaning_s=10,
+            seed=42,
+        )
+        for _ in range(15):
+            snap = ward.tick()
+        self.assertEqual(snap["bed_blocker"]["beds_blocked"], 1)
+        self.assertEqual(
+            snap["bed_blocker"]["beds"][0]["reason"], "porter"
+        )
+        server, port = serve_in_thread(ward)
+        try:
+            status, body = get(port, "/bed-blocker")
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                json.loads(body)["beds_blocked"], 1
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_summary_reports_blocker(self):
+        ward = Ward(
+            beds=2,
+            profiles=["stable", "stable"],
+            chaos=[
+                ChaosEvent(
+                    "bed_blocker",
+                    at=5,
+                    duration=20,
+                    bed=0,
+                    reason="porter",
+                ),
+                ChaosEvent("discharge", at=10, bed=0),
+            ],
+            cleaning_s=10,
+            seed=42,
+        )
+        path = os.path.join(tempfile.mkdtemp(), "run.jsonl")
+        with Recorder(path, ward.beds, ward.rate_hz, seed=42) as rec:
+            ward.recorder = rec
+            for _ in range(15):
+                ward.tick()
+        summary = summarize(path)
+        self.assertEqual(summary["bed_blocker"]["beds_blocked"], 1)
+        self.assertEqual(
+            summary["bed_blocker"]["beds"], {"0": "porter"}
+        )
+        self.assertEqual(summary["bed_blocker"]["discharges_pending"], 1)
+        self.assertEqual(summary["bed_blocker"]["discharges_held"], 1)
+        with Recorder(path, ward.beds, ward.rate_hz, seed=42) as rec:
+            ward.recorder = rec
+            for _ in range(15):
+                ward.tick()
+        summary = summarize(path)
+        self.assertEqual(summary["bed_blocker"]["beds_blocked"], 0)
+        self.assertEqual(summary["bed_blocker"]["beds"], {})
+        self.assertEqual(summary["bed_blocker"]["discharges_held"], 1)
+
+    def test_scenario_file_loads_and_runs(self):
+        cfg = load_scenario("scenarios/bed-blocker.json")
+        blockers = [e for e in cfg["chaos"] if e.type == "bed_blocker"]
+        self.assertEqual(len(blockers), 2)
+        self.assertEqual(
+            {e.reason for e in blockers},
+            {"porter", "isolation_clean"},
+        )
+        ward = build_ward(cfg, seed=42)
+        snaps = [ward.tick() for _ in range(40)]
+        # Bed 3 finishes cleaning at 15 s but is blocked for an
+        # isolation clean until 30 s, so the waiting triage
+        # patient skips it and takes bed 2 when it frees at 20 s
+        # instead, after waiting 20 s.
+        self.assertEqual(snaps[14]["turnover"]["beds"][3]["state"], "blocked")
+        self.assertEqual(snaps[19]["bed_blocker"]["beds_blocked"], 2)
+        self.assertEqual(snaps[19]["triage"]["admitted"], 1)
+        self.assertEqual(snaps[19]["triage"]["mean_wait_s"], 20.0)
+        # Bed 1's discharge was held from 10 s until its porter
+        # block ended at 25 s: 15 s of delay, then cleaning.
+        self.assertEqual(
+            snaps[24]["turnover"]["total_discharge_delay_s"], 15.0
+        )
+        self.assertEqual(snaps[24]["bed_blocker"]["discharges_held"], 1)
+        self.assertEqual(snaps[24]["bed_blocker"]["discharges_pending"], 0)
+        # By 40 s both blocks have cleared and both beds are free.
+        self.assertEqual(snaps[39]["bed_blocker"]["beds_blocked"], 0)
+        self.assertEqual(snaps[39]["turnover"]["available"], 2)
+        self.assertEqual(snaps[39]["turnover"]["total_turnovers"], 3)
+
+
 if __name__ == "__main__":
     unittest.main()
