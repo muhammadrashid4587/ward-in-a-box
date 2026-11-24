@@ -81,8 +81,10 @@ def summarize(path):
     totals from the last tick: planned discharges, how many landed,
     how many were delayed by a backed-up cleaning roster, and the
     total delay — and discharge-readiness totals from the last tick:
-    how many occupied beds are flagged ready and how many are not —
-    and early-warning totals from the last tick: how many beds are
+    how many occupied beds are flagged ready and how many are not,
+    how many times the readiness flag flipped this run, and whether
+    the discharge-readiness hooks are configured and how many hook
+    deliveries were invoked and failed — and early-warning totals from the last tick: how many beds are
     at high, medium, and low NEWS2 risk, how many deterioration
     episodes are open, and how many have raised, and how many
     NEWS2 trend alerts are open and have raised — and whether the
@@ -307,7 +309,11 @@ def summarize(path):
         # Discharge-readiness totals from the last tick: how many
         # occupied beds are flagged ready, how many are not, and the
         # stability window in force — plus the auto-order lead-time
-        # override, when one is set.
+        # override, when one is set — and how many times the
+        # readiness flag flipped this run, to ready and back, and
+        # whether the discharge-readiness hooks are configured and
+        # how many hook deliveries were invoked, failed, retried,
+        # and delivered.
         "discharge_readiness": (
             {
                 "ready": last_readiness["ready"],
@@ -316,6 +322,25 @@ def summarize(path):
                 "stable_window_s": last_readiness["stable_window_s"],
                 "auto_order_lead_time_s": last_readiness.get(
                     "auto_order_lead_time_s"
+                ),
+                "readiness_flips": last_readiness.get(
+                    "readiness_flips", 0
+                ),
+                "flips_to_ready": last_readiness.get(
+                    "flips_to_ready", 0
+                ),
+                "flips_to_not_ready": last_readiness.get(
+                    "flips_to_not_ready", 0
+                ),
+                "discharge_readiness_hooks": last_readiness.get(
+                    "discharge_readiness_hooks",
+                    {
+                        "configured": False,
+                        "invoked": 0,
+                        "failed": 0,
+                        "retries": 0,
+                        "delivered": 0,
+                    },
                 ),
             }
             if last_readiness is not None

@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from ward.alert_hooks import (
     TrendAlertHooks,
     validate_boarding_full_hooks,
+    validate_discharge_readiness_hooks,
     validate_escalation_hooks,
     validate_missed_dose_hooks,
     validate_trend_alert_hooks,
@@ -2739,6 +2740,338 @@ class TestDischargeReadiness(unittest.TestCase):
             )
         finally:
             os.unlink(path)
+
+
+class TestDischargeReadinessHooks(unittest.TestCase):
+    def _ward(self, hooks=None, **kw):
+        kwargs = {
+            "beds": 1,
+            "profiles": ["stable"],
+            "discharge_readiness": {"stable_window_s": 5},
+            "discharge_readiness_hooks": hooks,
+            "seed": 42,
+        }
+        kwargs.update(kw)
+        return Ward(**kwargs)
+
+    def test_validate_discharge_readiness_hooks(self):
+        hooks = validate_discharge_readiness_hooks(None)
+        self.assertIsInstance(hooks, TrendAlertHooks)
+        self.assertFalse(hooks.configured)
+        self.assertEqual(hooks.kind, "discharge-readiness")
+        custom = validate_discharge_readiness_hooks(
+            {"webhook_url": "https://example.invalid/hooks", "timeout_s": 2}
+        )
+        self.assertTrue(custom.configured)
+        self.assertEqual(custom.kind, "discharge-readiness")
+        self.assertEqual(custom.timeout_s, 2.0)
+        seen = []
+        append = seen.append
+        cb = validate_discharge_readiness_hooks({"callback": append})
+        self.assertTrue(cb.configured)
+        self.assertIs(cb.callback, append)
+        with self.assertRaises(ValueError):
+            validate_discharge_readiness_hooks(
+                {"webhook_url": "ftp://x/hooks"}
+            )
+        with self.assertRaises(ValueError):
+            validate_discharge_readiness_hooks({"callback": "not callable"})
+        with self.assertRaises(ValueError):
+            validate_discharge_readiness_hooks({"timeout_s": 0})
+        with self.assertRaises(ValueError):
+            validate_discharge_readiness_hooks({"url": "http://x/hooks"})
+        with self.assertRaises(ValueError):
+            validate_discharge_readiness_hooks("http://x/hooks")
+
+    def test_hooks_off_by_default(self):
+        # No hooks configured: the bed still flips to ready, and
+        # the flip event records that no hook was invoked.
+        ward = self._ward()
+        self.assertFalse(ward.discharge_readiness_hooks.configured)
+        for _ in range(5):
+            ward.tick()  # t=5: 5 s of quiet vitals, ready
+        summary = ward.readiness_summary()
+        self.assertEqual(summary["ready"], 1)
+        self.assertEqual(summary["readiness_flips"], 1)
+        self.assertEqual(summary["flips_to_ready"], 1)
+        self.assertEqual(summary["flips_to_not_ready"], 0)
+        self.assertEqual(
+            summary["discharge_readiness_hooks"],
+            {"configured": False, "invoked": 0, "failed": 0, "retries": 0, "delivered": 0},
+        )
+        event = summary["beds"][0]["readiness_events"][0]
+        self.assertEqual(event["ready"], True)
+        self.assertEqual(event["ready_t"], 5.0)
+        self.assertFalse(event["hook_invoked"])
+        self.assertEqual(event["hook_errors"], [])
+        self.assertEqual(event["hook_retries"], 0)
+        self.assertEqual(event["hook_final_status"], "not_invoked")
+        self.assertEqual(
+            ward.snapshot()["discharge_readiness"]["readiness_flips"], 1
+        )
+
+    def test_callback_hook_invoked_on_flip_to_ready(self):
+        seen = []
+        ward = self._ward({"callback": seen.append})
+        self.assertTrue(ward.discharge_readiness_hooks.configured)
+        for _ in range(5):
+            ward.tick()  # t=5: ready
+        self.assertEqual(len(seen), 1)
+        payload = seen[0]
+        self.assertEqual(payload["event"], "readiness_flip")
+        self.assertEqual(payload["bed"], 0)
+        self.assertEqual(payload["ready"], True)
+        self.assertEqual(payload["ready_t"], 5.0)
+        self.assertEqual(payload["stable_s"], 5.0)
+        self.assertTrue(payload["orders_complete"])
+        self.assertEqual(payload["news2"]["risk"], "low")
+        # The flip event records the invocation.
+        event = ward.readiness_summary()["beds"][0]["readiness_events"][0]
+        self.assertTrue(event["hook_invoked"])
+        self.assertEqual(event["hook_errors"], [])
+        self.assertEqual(event["hook_final_status"], "delivered")
+        # One invocation, no failure, in the ward totals.
+        summary = ward.readiness_summary()["discharge_readiness_hooks"]
+        self.assertEqual(
+            summary, {"configured": True, "invoked": 1, "failed": 0, "retries": 0, "delivered": 1}
+        )
+        # Staying ready fires nothing more: one flip, one event.
+        for _ in range(5):
+            ward.tick()  # t=10
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(ward.readiness_summary()["readiness_flips"], 1)
+
+    def test_flip_back_to_not_ready_fires_again(self):
+        # An alarm storm at 10 s drags the vitals out of band, so
+        # the bed stops being ready at 11 s, then goes quiet again
+        # and flips back to ready at 25 s: three flips in total.
+        seen = []
+        ward = self._ward(
+            {"callback": seen.append},
+            chaos=[ChaosEvent("alarm_storm", 10, 10, bed=0)],
+        )
+        for _ in range(40):
+            ward.tick()
+        self.assertEqual(
+            [(p["ready"], p["ready_t"]) for p in seen],
+            [(True, 5.0), (False, 11.0), (True, 25.0)],
+        )
+        summary = ward.readiness_summary()
+        self.assertEqual(summary["readiness_flips"], 3)
+        self.assertEqual(summary["flips_to_ready"], 2)
+        self.assertEqual(summary["flips_to_not_ready"], 1)
+        self.assertEqual(
+            summary["discharge_readiness_hooks"]["invoked"], 3
+        )
+        self.assertEqual(
+            summary["discharge_readiness_hooks"]["delivered"], 3
+        )
+        # The not-ready flip carries the alarm-broken state: no
+        # stable seconds since the alarm raised.
+        self.assertEqual(seen[1]["stable_s"], 0.0)
+
+    def test_callback_failure_is_not_fatal(self):
+        def boom(payload):
+            raise ValueError("pager is down")
+
+        ward = self._ward({"callback": boom})
+        for _ in range(5):
+            ward.tick()  # t=5: ready, hook raises
+        snap = ward.tick()  # t=6: the tick still completes
+        self.assertTrue(snap["beds"][0]["online"])
+        event = ward.readiness_summary()["beds"][0]["readiness_events"][0]
+        self.assertTrue(event["hook_invoked"])
+        self.assertEqual(event["hook_errors"], ["pager is down"])
+        self.assertEqual(event["hook_final_status"], "failed")
+        summary = ward.readiness_summary()["discharge_readiness_hooks"]
+        self.assertEqual(summary["invoked"], 1)
+        self.assertEqual(summary["failed"], 1)
+
+    def test_webhook_hook_posts_to_stub_server(self):
+        server, port, received = capture_server()
+        try:
+            ward = self._ward(
+                {"webhook_url": "http://127.0.0.1:%d/hooks" % port}
+            )
+            for _ in range(5):
+                ward.tick()  # t=5: ready
+            self.assertTrue(ward.discharge_readiness_hooks.wait(timeout=5))
+            self.assertEqual(len(received), 1)
+            path, content_type, body = received[0]
+            self.assertEqual(path, "/hooks")
+            self.assertEqual(content_type, "application/json")
+            payload = json.loads(body)
+            self.assertEqual(payload["event"], "readiness_flip")
+            self.assertEqual(payload["bed"], 0)
+            self.assertEqual(payload["ready"], True)
+            self.assertEqual(payload["ready_t"], 5.0)
+            self.assertEqual(payload["news2"]["risk"], "low")
+            event = ward.readiness_summary()["beds"][0]["readiness_events"][0]
+            self.assertTrue(event["hook_invoked"])
+            self.assertEqual(event["hook_errors"], [])
+            self.assertEqual(event["hook_final_status"], "delivered")
+            summary = ward.readiness_summary()["discharge_readiness_hooks"]
+            self.assertEqual(
+                summary, {"configured": True, "invoked": 1, "failed": 0, "retries": 0, "delivered": 1}
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_webhook_failure_is_not_fatal(self):
+        # A port with nothing listening: the POST fails, the ward
+        # keeps ticking, and the failure is counted, not raised.
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        ward = self._ward(
+            {
+                "webhook_url": "http://127.0.0.1:%d/hooks" % port,
+                "timeout_s": 2,
+            }
+        )
+        for _ in range(5):
+            ward.tick()  # t=5: ready
+        snap = ward.tick()  # t=6: the tick still completes
+        self.assertTrue(snap["beds"][0]["online"])
+        # The hook was invoked (dispatched), even though the
+        # delivery failed.
+        self.assertTrue(
+            ward.readiness_summary()["beds"][0]["readiness_events"][0][
+                "hook_invoked"
+            ]
+        )
+        self.assertTrue(ward.discharge_readiness_hooks.wait(timeout=5))
+        event = ward.readiness_summary()["beds"][0]["readiness_events"][0]
+        self.assertEqual(event["hook_final_status"], "failed")
+        summary = ward.readiness_summary()["discharge_readiness_hooks"]
+        self.assertEqual(summary["invoked"], 1)
+        self.assertEqual(summary["failed"], 1)
+
+    def test_scenario_discharge_readiness_hooks(self):
+        cfg = load_scenario(
+            os.path.join(
+                HERE, "..", "scenarios", "discharge-readiness-hooks.json"
+            )
+        )
+        self.assertTrue(cfg["discharge_readiness_hooks"].configured)
+        server, port, received = capture_server()
+        try:
+            # The scenario's URL is a placeholder; point it at
+            # the stub server for this run.
+            cfg["discharge_readiness_hooks"] = (
+                validate_discharge_readiness_hooks(
+                    {"webhook_url": "http://127.0.0.1:%d/hooks" % port}
+                )
+            )
+            ward = build_ward(cfg, seed=42)
+            for _ in range(40):
+                snap = ward.tick()
+            self.assertTrue(ward.discharge_readiness_hooks.wait(timeout=5))
+            # Five flips over the run: beds 0 and 3 flag ready at
+            # 5 s, bed 3's fever stops it being ready at 8 s, bed
+            # 1's dose lands at 30 s, and bed 3 flags ready again
+            # at 39 s. Bed 2's insulin is missed, so it never
+            # flips. The deliveries run in separate daemon
+            # threads, so their arrival order at the stub is not
+            # guaranteed — sort by flip time and bed before
+            # asserting.
+            self.assertEqual(len(received), 5)
+            payloads = sorted(
+                (json.loads(r[2]) for r in received),
+                key=lambda p: (p["ready_t"], p["bed"]),
+            )
+            self.assertEqual(
+                [p["event"] for p in payloads],
+                ["readiness_flip"] * 5,
+            )
+            self.assertEqual(
+                [(p["bed"], p["ready"], p["ready_t"]) for p in payloads],
+                [
+                    (0, True, 5.0),
+                    (3, True, 5.0),
+                    (3, False, 8.0),
+                    (1, True, 30.0),
+                    (3, True, 39.0),
+                ],
+            )
+            # Every flip event records that its hook was invoked.
+            for bed in snap["discharge_readiness"]["beds"]:
+                for event in bed["readiness_events"]:
+                    self.assertTrue(event["hook_invoked"])
+            # The totals are read from a fresh summary after the
+            # wait: the snapshot from the last tick was taken
+            # before the last delivery settled.
+            summary = ward.readiness_summary()
+            self.assertEqual(summary["readiness_flips"], 5)
+            self.assertEqual(summary["flips_to_ready"], 4)
+            self.assertEqual(summary["flips_to_not_ready"], 1)
+            self.assertEqual(
+                summary["discharge_readiness_hooks"],
+                {"configured": True, "invoked": 5, "failed": 0, "retries": 0, "delivered": 5},
+            )
+            self.assertEqual(summary["ready"], 3)
+            self.assertEqual(summary["not_ready"], 1)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_recorder_summary_carries_hook_totals(self):
+        seen = []
+        ward = self._ward({"callback": seen.append})
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".jsonl", delete=False
+        ) as f:
+            path = f.name
+        try:
+            with Recorder(path, ward.beds, ward.rate_hz, seed=42) as rec:
+                ward.recorder = rec
+                for _ in range(5):
+                    ward.tick()
+            self.assertEqual(len(seen), 1)
+            summary = summarize(path)
+            self.assertEqual(summary["discharge_readiness"]["ready"], 1)
+            self.assertEqual(
+                summary["discharge_readiness"]["readiness_flips"], 1
+            )
+            self.assertEqual(
+                summary["discharge_readiness"]["flips_to_ready"], 1
+            )
+            self.assertEqual(
+                summary["discharge_readiness"]["flips_to_not_ready"], 0
+            )
+            hooks = summary["discharge_readiness"][
+                "discharge_readiness_hooks"
+            ]
+            self.assertEqual(
+                hooks, {"configured": True, "invoked": 1, "failed": 0, "retries": 0, "delivered": 1}
+            )
+        finally:
+            os.unlink(path)
+
+    def test_ws_frame_carries_readiness_hooks(self):
+        ward = self._ward()
+        for _ in range(5):
+            ward.tick()  # t=5: ready, one flip recorded
+        server, port = serve_in_thread(ward)
+        try:
+            ws = WsClient(port)
+            try:
+                msg = json.loads(ws.read_until_opcode(1))
+                self.assertIn("discharge_readiness", msg)
+                self.assertEqual(
+                    msg["discharge_readiness"]["readiness_flips"], 1
+                )
+                self.assertEqual(
+                    msg["discharge_readiness"]["discharge_readiness_hooks"],
+                    {"configured": False, "invoked": 0, "failed": 0, "retries": 0, "delivered": 0},
+                )
+            finally:
+                ws.close()
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 class TestAutoDischargeOrders(unittest.TestCase):

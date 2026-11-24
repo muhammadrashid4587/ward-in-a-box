@@ -102,6 +102,11 @@ python3 -m ward.cli scenarios/discharge.json --seed 42
 # with a fever
 python3 -m ward.cli scenarios/discharge-ready.json --seed 42
 
+# Discharge-readiness hooks: the same ward, with every readiness
+# flip also POSTed to a webhook (here a placeholder URL — point it
+# at your own endpoint; a dead endpoint is logged, never fatal)
+python3 -m ward.cli scenarios/discharge-readiness-hooks.json --seed 42
+
 # Auto discharge orders: beds flagged ready get a discharge order
 # raised for them at once, and discharge an hour later by default
 python3 -m ward.cli scenarios/discharge-auto-order.json --seed 42
@@ -970,6 +975,54 @@ window, a 5-second planner default, and a 2-second override, beds
 1's dose lands at 30 s and it auto-discharges at 32 s, and bed 2
 (missed insulin) never flags ready and gets no order — 3 auto
 orders, 3 discharges, a mean ready-to-discharge time of 2.0 s.
+
+## Discharge-readiness hooks
+
+A readiness flip says a patient just became ready to leave — or
+just stopped being ready, because an alarm restarted their
+stability clock; the hook makes sure something outside the ward
+hears about it. A ward that wants the outside world to hear about
+that moment — a bed manager, a dashboard, a discharge coordinator
+— configures discharge-readiness hooks, the same channels as the
+NEWS2 hooks (webhook and/or in-process callback), on the same
+best-effort, never-fatal terms:
+
+```json
+{"discharge_readiness_hooks": {"webhook_url": "http://127.0.0.1:18099/hooks"}}
+```
+
+The hook fires once per flip, in the tick the flag changes, with
+a `readiness_flip` event payload: the bed, the new state
+(`"ready"` true or false), when it flipped, how long the vitals
+have been stable, whether the medication orders are complete, and
+the NEWS2 score at the flip — so the outside world can see what
+the early-warning score said when the patient became ready (a
+febrile patient can flag ready while still medium risk on NEWS2,
+because readiness is judged on quiet vitals and complete orders,
+not on the score). A bed that stays ready for an hour fires once,
+not once a tick; a discharge ends the stay silently, so the next
+patient in the bed starts from not-ready and their first flip is
+a real one. Each flip event records whether the hook was invoked
+(`"hook_invoked"`, False with no hooks) and any synchronous error
+(`"hook_errors"`), and the readiness summary carries the flip
+totals (`"readiness_flips"`, `"flips_to_ready"`,
+`"flips_to_not_ready"`) and the ward discharge-readiness-hook
+totals (`"discharge_readiness_hooks"`: whether any hook is
+configured, how many deliveries were invoked, how many failed,
+how many retries were spent, and how many deliveries eventually
+landed) — in `GET /discharge-readiness`, every snapshot and
+WebSocket frame, and the run summary (`--summary`). The same
+retry rules as the NEWS2 hooks apply — a failed webhook POST is
+retried with backoff up to `"max_retries"` times, and the event
+records `"hook_retries"` and `"hook_final_status"` alongside
+`"hook_invoked"`. Hooks are off by default, so a ward with none
+configured behaves exactly as before. See
+`scenarios/discharge-readiness-hooks.json` for a runnable example:
+over a seeded 40-tick run the same ward as `discharge-ready.json`
+flips 5 times — beds 0 and 3 ready at 5 s, bed 3 not ready at 8 s,
+bed 1 ready at 30 s, bed 3 ready again at 39 s — POSTed to the
+configured webhook, with 5 hook deliveries invoked and 0 failed
+against a stub server.
 
 ## NEWS2 early-warning scoring
 
@@ -1977,3 +2030,18 @@ run.
   staffing summary — every snapshot, WebSocket frame, `GET /staffing`,
   and the run summary; off by default, configured per ward with
   `news2_staffing_escalation` in the scenario) — done in v0.36.0
+- Discharge-readiness hooks (when a patient's discharge-ready flag
+  flips — to ready or back to not-ready — the ward's configured
+  webhook URL gets a `readiness_flip` event payload POSTed to it in
+  a daemon thread and/or an in-process Python callback is called in
+  the flipping tick, reusing the NEWS2 hook machinery, best effort
+  and never fatal; the payload carries the new state, when it
+  flipped, how long the vitals have been stable, whether the
+  medication orders are complete, and the NEWS2 score at the flip;
+  a bed that stays ready fires once, not once a tick, and a
+  discharge resets the flag silently; each flip event records
+  whether the hook was invoked, and the readiness summary, every
+  snapshot, WebSocket frame, `GET /discharge-readiness`, and the run
+  summary carry the flip totals and the hook totals; off by default,
+  configured per ward with `discharge_readiness_hooks` in the
+  scenario) — done in v0.37.0

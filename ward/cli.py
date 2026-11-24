@@ -6,6 +6,7 @@ import sys
 
 from .alert_hooks import (
     validate_boarding_full_hooks,
+    validate_discharge_readiness_hooks,
     validate_escalation_hooks,
     validate_missed_dose_hooks,
     validate_trend_alert_hooks,
@@ -236,6 +237,18 @@ def load_scenario(path):
             )
         except ValueError as e:
             raise ValueError("missed_dose_hooks: %s" % e)
+    discharge_readiness_hooks = None
+    if "discharge_readiness_hooks" in data:
+        if not isinstance(data["discharge_readiness_hooks"], dict):
+            raise ValueError("discharge_readiness_hooks must be an object")
+        try:
+            discharge_readiness_hooks = (
+                validate_discharge_readiness_hooks(
+                    data["discharge_readiness_hooks"]
+                )
+            )
+        except ValueError as e:
+            raise ValueError("discharge_readiness_hooks: %s" % e)
     return {
         "beds": beds,
         "rate_hz": rate,
@@ -259,6 +272,7 @@ def load_scenario(path):
         "boarding_full_hooks": boarding_full_hooks,
         "wait_time_hooks": wait_time_hooks,
         "missed_dose_hooks": missed_dose_hooks,
+        "discharge_readiness_hooks": discharge_readiness_hooks,
         "triage": triage,
         "host": data.get("host", "127.0.0.1"),
         "port": data.get("port", 8080),
@@ -290,6 +304,7 @@ def build_ward(cfg, seed=None, recorder=None):
         boarding_full_hooks=cfg.get("boarding_full_hooks"),
         wait_time_hooks=cfg.get("wait_time_hooks"),
         missed_dose_hooks=cfg.get("missed_dose_hooks"),
+        discharge_readiness_hooks=cfg.get("discharge_readiness_hooks"),
         triage=cfg.get("triage"),
         recorder=recorder,
     )

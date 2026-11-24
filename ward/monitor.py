@@ -4,6 +4,7 @@ import random
 from collections import deque
 
 from .alert_hooks import (
+    validate_discharge_readiness_hooks,
     validate_escalation_hooks,
     validate_missed_dose_hooks,
     validate_trend_alert_hooks,
@@ -49,7 +50,7 @@ class Monitor:
     seconds); the monitor clears each one when its time passes.
     """
 
-    def __init__(self, bed_id, profile="stable", rng=None, acuity=3, meds=None, on_oxygen=False, consciousness="alert", consciousness_dynamics=None, news2_trend=None, trend_alert_hooks=None, escalation_hooks=None, missed_dose_hooks=None):
+    def __init__(self, bed_id, profile="stable", rng=None, acuity=3, meds=None, on_oxygen=False, consciousness="alert", consciousness_dynamics=None, news2_trend=None, trend_alert_hooks=None, escalation_hooks=None, missed_dose_hooks=None, discharge_readiness_hooks=None):
         self.bed_id = bed_id
         self.profile = profile
         self.acuity = validate_acuity(acuity)
@@ -80,6 +81,15 @@ class Monitor:
         # The schedule owns the object from here on.
         self.missed_dose_hooks = validate_missed_dose_hooks(
             missed_dose_hooks
+        )
+        # Discharge-readiness hooks: the ward's configured webhook
+        # and/or in-process callback, invoked when this bed's
+        # readiness flag flips — to ready or back to not-ready.
+        # Same machinery as the trend-alert hooks, off by default.
+        # Shared across the ward's monitors, so the ward totals
+        # count every delivery.
+        self.discharge_readiness_hooks = (
+            validate_discharge_readiness_hooks(discharge_readiness_hooks)
         )
         # Every consciousness change this stay, as
         # {"from": level, "to": level, "t": seconds}; empty while
@@ -137,6 +147,14 @@ class Monitor:
         # cleared, or admission when they never alarmed. None while
         # an alarm is active.
         self._stable_since = 0.0
+        # Readiness flips this stay, in tick order: one event per
+        # transition of the discharge-ready flag, to ready or back
+        # to not-ready (see :meth:`note_readiness`). ``_ready`` is
+        # the flag as of the last tick the ward noted; it resets
+        # silently on discharge, so a new patient in the bed
+        # starts from not-ready.
+        self._ready = False
+        self.readiness_history = []
         # Early warning: a deterioration episode is open while the
         # patient's NEWS2 risk is medium or high — raised at the
         # first tick the risk leaves low, closed when it returns.
@@ -235,6 +253,13 @@ class Monitor:
         self._record_alarm_transitions([], now)
         self._close_escalation(now)
         self._close_trend_alert(now)
+        # A discharge ends the stay: the readiness flag resets
+        # silently — the patient left, they did not stop being
+        # ready — so the next patient in the bed starts from
+        # not-ready and their first flip is a real one. The flip
+        # history stays, like the alarm and escalation histories,
+        # so the run totals still count this stay's flips.
+        self._ready = False
         self.meds.reset()
         self.admitted = False
         self.cleaning_until = round(now + cleaning_s, 3)
@@ -779,6 +804,59 @@ class Monitor:
             return 0.0
         return round(now - self._stable_since, 3)
 
+    def note_readiness(self, now, ready):
+        """Record a discharge-readiness flip, if the flag changed.
+
+        Called once per tick by the ward with the bed's current
+        readiness (see :meth:`discharge_ready`). A flip — to
+        ready or back to not-ready — records one event in
+        ``readiness_history`` and invokes the ward's
+        discharge-readiness hooks once, with a
+        ``readiness_flip`` payload carrying the new state, when
+        it flipped, how long the vitals have been stable,
+        whether the medication orders are complete, and the
+        NEWS2 score at the flip — so the outside world hears
+        the moment a patient becomes ready (or stops being
+        ready), and can see what the early-warning score said
+        when it happened. No event when the flag is unchanged,
+        so a bed that stays ready for an hour fires once, not
+        once a tick. The event records whether the hook was
+        invoked (``hook_invoked``, False when no hook is
+        configured) and any synchronous error
+        (``hook_errors``), with the retries and final delivery
+        outcome (``hook_retries``, ``hook_final_status``)
+        updated when a webhook delivery settles — the same
+        convention as the trend-alert and escalation hooks. A
+        hook failure is logged and counted, never fatal to the
+        tick.
+        """
+        ready = bool(ready)
+        if ready == self._ready:
+            return
+        now = round(now, 3)
+        self._ready = ready
+        news2 = (
+            self.last_reading.get("news2")
+            if self.last_reading is not None
+            else None
+        )
+        event = {
+            "bed": self.bed_id,
+            "event": "readiness_flip",
+            "ready": ready,
+            "ready_t": now,
+            "stable_s": self.stable_s(now) if self.admitted else 0.0,
+            "orders_complete": self.meds.orders_complete(),
+            "news2": dict(news2) if news2 is not None else None,
+        }
+        self.readiness_history.append(event)
+        result = self.discharge_readiness_hooks.fire(
+            dict(event),
+            record=event,
+        )
+        event["hook_invoked"] = result["invoked"]
+        event["hook_errors"] = result["errors"]
+
     def discharge_ready(self, now, stable_window_s):
         """True when the patient is discharge-ready: admitted, vitals
         stable for at least ``stable_window_s`` seconds, and all
@@ -795,7 +873,19 @@ class Monitor:
 
         ``auto_ordered`` is True when the ward has raised an
         automatic discharge-planning order for this bed's current
-        stay (one that is still planned or delayed)."""
+        stay (one that is still planned or delayed). ``news2`` is
+        the score from the latest reading (None while the bed has
+        no patient or no reading yet), and ``readiness_events``
+        lists every readiness flip — to ready or back to
+        not-ready — with when it flipped and the NEWS2 score at
+        the flip, and whether the ward's hooks were invoked for
+        it (``hook_invoked``) and the retries and final delivery
+        outcome (``hook_retries``, ``hook_final_status``)."""
+        news2 = (
+            self.last_reading.get("news2")
+            if self.last_reading is not None and self.admitted
+            else None
+        )
         return {
             "bed": self.bed_id,
             "ready": self.discharge_ready(now, stable_window_s),
@@ -804,6 +894,8 @@ class Monitor:
             "stable_window_s": float(stable_window_s),
             "orders_complete": self.meds.orders_complete(),
             "auto_ordered": bool(auto_ordered),
+            "news2": dict(news2) if news2 is not None else None,
+            "readiness_events": [dict(e) for e in self.readiness_history],
         }
 
     def alarm_rate(self, now, window_s=60.0):
