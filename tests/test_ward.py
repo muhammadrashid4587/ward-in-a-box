@@ -4576,6 +4576,209 @@ class TestPoissonArrivals(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(first["arrivals_generated"], 25)
 
+    def test_ramp_rate_interpolates_over_time(self):
+        model = TriageQueue(
+            poisson={
+                "ramp": {
+                    "at": 10,
+                    "from_per_hour": 60,
+                    "to_per_hour": 660,
+                    "over_s": 60,
+                }
+            },
+            seed=42,
+        ).poisson
+        # Before the ramp starts the rate is the starting rate.
+        self.assertEqual(model.rate_at(8, 0), 60.0)
+        self.assertEqual(model.rate_at(8, 10), 60.0)
+        # Halfway through, halfway between the rates.
+        self.assertEqual(model.rate_at(8, 40), 360.0)
+        # At the end of the window, and after it, the end rate.
+        self.assertEqual(model.rate_at(8, 70), 660.0)
+        self.assertEqual(model.rate_at(8, 600), 660.0)
+        # The ramp reads elapsed time, not the ward clock hour.
+        self.assertEqual(model.rate_at(20, 40), 360.0)
+
+    def test_ramp_step_when_over_s_is_zero(self):
+        model = TriageQueue(
+            poisson={
+                "ramp": {
+                    "at": 5,
+                    "from_per_hour": 60,
+                    "to_per_hour": 600,
+                    "over_s": 0,
+                }
+            },
+            seed=42,
+        ).poisson
+        self.assertEqual(model.rate_at(8, 4), 60.0)
+        self.assertEqual(model.rate_at(8, 5), 600.0)
+        self.assertEqual(model.rate_at(8, 500), 600.0)
+
+    def test_ramp_validation(self):
+        with self.assertRaises(ValueError):
+            TriageQueue(
+                poisson={
+                    "rate_per_hour": 60,
+                    "ramp": {"from_per_hour": 60, "to_per_hour": 600},
+                },
+                seed=42,
+            )
+        with self.assertRaises(ValueError):
+            TriageQueue(
+                poisson={
+                    "hourly_rates": [60] * 24,
+                    "ramp": {"from_per_hour": 60, "to_per_hour": 600},
+                },
+                seed=42,
+            )
+        with self.assertRaises(ValueError):
+            TriageQueue(
+                poisson={"ramp": {"to_per_hour": 600, "over_s": 60}},
+                seed=42,
+            )
+        with self.assertRaises(ValueError):
+            TriageQueue(
+                poisson={
+                    "ramp": {
+                        "from_per_hour": -1,
+                        "to_per_hour": 600,
+                        "over_s": 60,
+                    }
+                },
+                seed=42,
+            )
+        with self.assertRaises(ValueError):
+            TriageQueue(
+                poisson={
+                    "ramp": {
+                        "from_per_hour": 60,
+                        "to_per_hour": 600,
+                        "over_s": -5,
+                    }
+                },
+                seed=42,
+            )
+        with self.assertRaises(ValueError):
+            TriageQueue(
+                poisson={
+                    "ramp": {
+                        "at": -1,
+                        "from_per_hour": 60,
+                        "to_per_hour": 600,
+                        "over_s": 60,
+                    }
+                },
+                seed=42,
+            )
+        with self.assertRaises(ValueError):
+            TriageQueue(poisson={"ramp": "fast"}, seed=42)
+
+    def test_ramp_generates_more_arrivals_as_rate_rises(self):
+        # A 60 -> 3600/hr ramp over 60 s: the last 30 s run at a far
+        # higher rate than the first 30, so most arrivals land late.
+        queue = TriageQueue(
+            capacity=100,
+            poisson={
+                "ramp": {
+                    "from_per_hour": 60,
+                    "to_per_hour": 3600,
+                    "over_s": 60,
+                }
+            },
+            seed=42,
+        )
+        early = late = 0
+        for i in range(60):
+            arrivals = queue.process_poisson_arrivals(i + 1, 1.0, 8)
+            if i < 30:
+                early += len(arrivals)
+            else:
+                late += len(arrivals)
+        self.assertEqual((early, late), (6, 24))
+        self.assertEqual(queue.poisson.generated, 30)
+
+    def test_ramp_in_summary_and_run_summary(self):
+        ward = Ward(
+            beds=4,
+            cleaning_s=10.0,
+            seed=42,
+            triage={
+                "capacity": 5,
+                "poisson": {
+                    "ramp": {
+                        "from_per_hour": 60,
+                        "to_per_hour": 1800,
+                        "over_s": 60,
+                    }
+                },
+            },
+            chaos=[
+                ChaosEvent("discharge", at=5, bed=1),
+                ChaosEvent("discharge", at=8, bed=2),
+            ],
+        )
+        for _ in range(60):
+            snap = ward.tick()
+        summary = ward.triage_summary()
+        self.assertEqual(
+            summary["arrival_ramp"],
+            {
+                "at": 0.0,
+                "from_per_hour": 60.0,
+                "to_per_hour": 1800.0,
+                "over_s": 60.0,
+            },
+        )
+        self.assertEqual(summary["arrival_rate_per_hour"], 1800.0)
+        self.assertEqual(summary["arrivals_generated"], 11)
+        self.assertEqual(summary["admitted"], 2)
+        self.assertEqual(summary["diverted"], 4)
+        # The live arrivals view tracks the ramped rate too.
+        self.assertEqual(snap["arrivals"]["arrival_rate_per_hour"], 1800.0)
+        self.assertEqual(snap["arrivals"]["arrivals_total"], 11)
+        # The run summary carries the ramp config from the last tick.
+        path = os.path.join(tempfile.mkdtemp(), "run.jsonl")
+        with Recorder(path, ward.beds, ward.rate_hz, seed=42) as rec:
+            ward.recorder = rec
+            ward.tick()
+        summary = summarize(path)
+        self.assertEqual(
+            summary["triage"]["arrival_ramp"],
+            {
+                "at": 0.0,
+                "from_per_hour": 60.0,
+                "to_per_hour": 1800.0,
+                "over_s": 60.0,
+            },
+        )
+        self.assertEqual(summary["triage"]["arrival_rate_per_hour"], 1800.0)
+
+    def test_ramp_seeded_runs_are_reproducible(self):
+        def run():
+            ward = Ward(
+                beds=2,
+                cleaning_s=10.0,
+                seed=42,
+                triage={
+                    "capacity": 8,
+                    "poisson": {
+                        "ramp": {
+                            "from_per_hour": 60,
+                            "to_per_hour": 1800,
+                            "over_s": 60,
+                        }
+                    },
+                },
+            )
+            for _ in range(20):
+                ward.tick()
+            return ward.triage_summary()
+
+        first, second = run(), run()
+        self.assertEqual(first, second)
+        self.assertEqual(first["arrivals_generated"], 2)
+
     def test_poisson_arrivals_feed_queue_and_get_admitted(self):
         ward = Ward(
             beds=2,

@@ -342,7 +342,7 @@ class TriageQueue:
         """
         if self.poisson is None:
             return []
-        self._current_rate = self.poisson.rate_at(hour)
+        self._current_rate = self.poisson.rate_at(hour, now)
         arrivals = self.poisson.generate(now, dt, hour)
         for arrival in arrivals:
             self.arrive(
@@ -614,6 +614,12 @@ class TriageQueue:
                 list(self.poisson.hourly_rates)
                 if self.poisson is not None
                 and self.poisson.hourly_rates is not None
+                else None
+            ),
+            "arrival_ramp": (
+                dict(self.poisson.ramp)
+                if self.poisson is not None
+                and self.poisson.ramp is not None
                 else None
             ),
             "mean_wait_s": round(sum(waits) / len(waits), 3) if waits else 0.0,

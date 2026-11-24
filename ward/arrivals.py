@@ -5,11 +5,15 @@ random, at a rate that rises and falls through the day. This module
 models that as a Poisson process — in each tick, the number of new
 arrivals is a Poisson draw with mean ``rate * dt`` — with the rate
 either flat (``rate_per_hour``) or varying by hour of day
-(``hourly_rates``, one rate per hour, 0-23). The draws come from the
-ward's seeded RNG, so a seeded run reproduces exactly the same
-arrivals. Each arrival draws an acuity and a profile from
-configurable weights, then joins the triage queue like any other
-arrival: it waits for a bed, or is diverted when the queue is full.
+(``hourly_rates``, one rate per hour, 0-23), or ramping smoothly
+from one rate to another over a window (``ramp``, with
+``from_per_hour`` at ``at`` rising linearly to ``to_per_hour`` by
+``at + over_s`` — an ED load that builds up instead of switching
+on). The draws come from the ward's seeded RNG, so a seeded run
+reproduces exactly the same arrivals. Each arrival draws an acuity
+and a profile from configurable weights, then joins the triage
+queue like any other arrival: it waits for a bed, or is diverted
+when the queue is full.
 """
 
 import math
@@ -94,30 +98,41 @@ def _validate_weights(weights, default, kind, check_key):
 class ArrivalModel:
     """A Poisson walk-in arrival process.
 
-    Give either ``rate_per_hour`` (one flat rate, arrivals per hour)
-    or ``hourly_rates`` (a list of 24 rates, one per hour of day, so
-    the ward is quiet overnight and busy at midday). ``rng`` is the
-    random source — the ward passes its own seeded RNG so a seeded
-    run reproduces the same arrivals; pass ``seed`` instead when
-    using the model standalone.
+    Give exactly one of ``rate_per_hour`` (one flat rate, arrivals
+    per hour), ``hourly_rates`` (a list of 24 rates, one per hour of
+    day, so the ward is quiet overnight and busy at midday), or
+    ``ramp`` (a dict with ``from_per_hour`` and ``to_per_hour`` and
+    ``over_s``, optionally ``at`` — the rate rises linearly from the
+    first to the second over the window, so a seeded run reproduces
+    an ED load that builds up instead of switching on). ``rng`` is
+    the random source — the ward passes its own seeded RNG so a
+    seeded run reproduces the same arrivals; pass ``seed`` instead
+    when using the model standalone.
     """
 
     def __init__(
         self,
         rate_per_hour=None,
         hourly_rates=None,
+        ramp=None,
         acuity_weights=None,
         profile_weights=None,
         rng=None,
         seed=None,
     ):
-        if rate_per_hour is not None and hourly_rates is not None:
-            raise ValueError(
-                "give rate_per_hour or hourly_rates, not both"
+        given = [
+            name
+            for name, value in (
+                ("rate_per_hour", rate_per_hour),
+                ("hourly_rates", hourly_rates),
+                ("ramp", ramp),
             )
-        if rate_per_hour is None and hourly_rates is None:
+            if value is not None
+        ]
+        if len(given) != 1:
             raise ValueError(
-                "arrival model needs rate_per_hour or hourly_rates"
+                "give exactly one of rate_per_hour, hourly_rates, ramp; "
+                "got %s" % (", ".join(given) if given else "none",)
             )
         if rate_per_hour is not None:
             if (
@@ -130,7 +145,8 @@ class ArrivalModel:
                 )
             self.rate_per_hour = float(rate_per_hour)
             self.hourly_rates = None
-        else:
+            self.ramp = None
+        elif hourly_rates is not None:
             if not isinstance(hourly_rates, list) or len(hourly_rates) != 24:
                 raise ValueError(
                     "hourly_rates must be a list of 24 rates, got %r"
@@ -148,6 +164,11 @@ class ArrivalModel:
                     )
             self.hourly_rates = [float(r) for r in hourly_rates]
             self.rate_per_hour = None
+            self.ramp = None
+        else:
+            self.rate_per_hour = None
+            self.hourly_rates = None
+            self.ramp = _validate_ramp(ramp)
         self.acuity_weights = _validate_weights(
             acuity_weights,
             DEFAULT_ACUITY_WEIGHTS,
@@ -164,8 +185,25 @@ class ArrivalModel:
         # Arrivals generated so far (including ones the queue diverted).
         self.generated = 0
 
-    def rate_at(self, hour):
-        """Arrivals per hour at ``hour`` (0-23, fractional hours ok)."""
+    def rate_at(self, hour, now=0.0):
+        """Arrivals per hour at ``hour`` (0-23, fractional hours ok).
+
+        With a ramp configured the hour is ignored: the rate is
+        read off the elapsed time ``now`` instead — ``from_per_hour``
+        before the ramp starts, interpolating linearly while it
+        runs, ``to_per_hour`` once it has finished.
+        """
+        if self.ramp is not None:
+            if now < self.ramp["at"]:
+                return self.ramp["from_per_hour"]
+            if self.ramp["over_s"] == 0 or now >= (
+                self.ramp["at"] + self.ramp["over_s"]
+            ):
+                return self.ramp["to_per_hour"]
+            frac = (now - self.ramp["at"]) / self.ramp["over_s"]
+            return self.ramp["from_per_hour"] + (
+                self.ramp["to_per_hour"] - self.ramp["from_per_hour"]
+            ) * frac
         if self.hourly_rates is not None:
             return self.hourly_rates[int(hour) % 24]
         return self.rate_per_hour
@@ -176,9 +214,10 @@ class ArrivalModel:
         Returns a list of ``{"arrival_t", "acuity", "profile"}`` dicts
         — the same shape a scheduled arrival has once it joins the
         queue. ``now`` is the tick's elapsed time, ``hour`` the ward
-        clock hour (0-23) the rate is read at.
+        clock hour (0-23) the rate is read at (ignored while a ramp
+        is running: the ramp reads the rate off ``now`` instead).
         """
-        mean = self.rate_at(hour) * dt / 3600.0
+        mean = self.rate_at(hour, now) * dt / 3600.0
         count = _poisson(self.rng, mean)
         arrivals = []
         for _ in range(count):
@@ -191,6 +230,40 @@ class ArrivalModel:
             )
         self.generated += count
         return arrivals
+
+
+def _validate_ramp(ramp):
+    """A validated ramp dict: ``from_per_hour`` rising linearly to
+    ``to_per_hour`` over ``over_s`` seconds starting at ``at``
+    (0 by default); ``over_s`` 0 means the rate steps at ``at``.
+    """
+    if not isinstance(ramp, dict):
+        raise ValueError("ramp must be an object, got %r" % (ramp,))
+    for key in ("from_per_hour", "to_per_hour"):
+        if key not in ramp:
+            raise ValueError("ramp needs %r, got %r" % (key, ramp))
+    out = {}
+    for key in ("from_per_hour", "to_per_hour"):
+        value = ramp[key]
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or value < 0
+        ):
+            raise ValueError(
+                "ramp %s must be >= 0, got %r" % (key, value)
+            )
+        out[key] = float(value)
+    for key, default in (("at", 0.0), ("over_s", 0.0)):
+        value = ramp.get(key, default)
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or value < 0
+        ):
+            raise ValueError("ramp %s must be >= 0, got %r" % (key, value))
+        out[key] = float(value)
+    return out
 
 
 def _check_profile(profile):

@@ -65,6 +65,10 @@ python3 -m ward.cli scenarios/wait-alarm.json --seed 42
 # up after discharge and cleaning
 python3 -m ward.cli scenarios/arrivals.json --seed 42
 
+# Arrival-rate ramp-up: walk-ins build from 60/hr to 1800/hr
+# over 60 s instead of switching on at a flat rate
+python3 -m ward.cli scenarios/arrival-ramp.json --seed 42
+
 # ED boarding: one patient queues, one boards in the ED, a third is
 # diverted; the boarded patient takes the first freed bed
 python3 -m ward.cli scenarios/boarding.json --seed 42
@@ -600,13 +604,25 @@ read at the ward clock hour, so the ward is quiet overnight and
 busy at midday — and each arrival draws an acuity and a profile
 from configurable weights (defaults: mostly acuity 3-4, half
 stable). A flat rate works too: `"poisson": {"rate_per_hour": 120}`.
+A ramp works instead of either: `"poisson": {"ramp":
+{"from_per_hour": 30, "to_per_hour": 180, "over_s": 600}}` rises
+linearly from 30/hr at `at` (0 by default) to 180/hr 600 s later,
+so an ED load builds up over a shift instead of switching on —
+`over_s` 0 steps the rate at `at` instead. The ramp reads elapsed
+time, not the ward clock hour, and like the flat and hourly rates
+it is mutually exclusive with them: give exactly one of
+`rate_per_hour`, `hourly_rates`, or `ramp`.
 The draws come from the ward's seeded RNG, so `--seed 42` reproduces
 exactly the same arrivals. Walk-ins join the same triage queue as
 scheduled arrivals: they wait for a bed freed by discharge and
 cleaning, or are diverted when the queue is full. The triage
 summary carries the current arrival rate
 (`arrival_rate_per_hour`), the hourly rate table, and how many
-walk-ins have been generated (`arrivals_generated`); it also
+walk-ins have been generated (`arrivals_generated`); when a ramp
+is configured it carries the ramp instead (`arrival_ramp`, with
+`at`, `from_per_hour`, `to_per_hour`, and `over_s`), and the run
+summary (`--summary`) reports the same ramp config alongside the
+rate at the last tick. The triage summary also
 carries arrivals per ward clock hour (`arrivals_by_hour`), so the
 ED load shape over the day is visible — every arrival counts
 toward its hour, whether it joined the queue or was diverted
@@ -616,6 +632,11 @@ per-hour arrivals alongside the configured hourly rates. See
 `scenarios/arrivals.json` for a runnable example: over a
 seeded 60-tick run at 180/hr, 3 walk-ins arrive, 2 take the beds
 freed by the discharges at 5 s and 8 s, and 1 is still waiting.
+See `scenarios/arrival-ramp.json` for the same ward with a ramp
+instead of a flat table: over a seeded 60-tick run the rate rises
+from 60/hr to 1800/hr, 11 walk-ins arrive, 2 take the beds freed
+by the discharges at 5 s and 8 s, 4 are diverted, and 5 are still
+waiting.
 
 ## Live arrivals view
 
@@ -2230,3 +2251,12 @@ run.
   and the run summary; a bed whose rank did not change records
   nothing, so a steady ward logs one entry per bed) — done in
   v0.41.0
+- Poisson arrival-rate ramp-up (a `ramp` in the `poisson` block —
+  `from_per_hour` rising linearly to `to_per_hour` over `over_s`
+  seconds from `at`, `over_s` 0 stepping the rate instead — so an
+  ED load builds up over a shift instead of switching on at a flat
+  rate or jumping hour to hour; mutually exclusive with
+  `rate_per_hour` and `hourly_rates`, read off elapsed time rather
+  than the ward clock hour, seeded so runs are reproducible, with
+  the ramp config in the triage summary, the live arrivals view's
+  current rate tracking it, and the run summary) — done in v0.42.0

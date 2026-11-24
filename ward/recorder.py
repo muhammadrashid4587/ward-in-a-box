@@ -227,6 +227,7 @@ def summarize(path):
                 "arrival_hourly_rates": last_triage.get(
                     "arrival_hourly_rates"
                 ),
+                "arrival_ramp": last_triage.get("arrival_ramp"),
                 "boarding_full_alarms_raised": last_triage.get(
                     "boarding_full_alarms_raised", 0
                 ),
