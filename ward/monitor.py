@@ -520,6 +520,10 @@ class Monitor:
                 "response_due_t": due,
                 "responded_t": None,
                 "time_to_respond_s": None,
+                # True once a NEWS2 staffing escalation has
+                # covered this episode — the ward called in extra
+                # nurses while this patient was at high risk.
+                "staffing_escalated": False,
             }
             self.escalations_raised += 1
             # An opening escalation invokes the ward's hooks, if
@@ -551,6 +555,30 @@ class Monitor:
                 self._escalation["peak_score"] = news2["score"]
             if risk == "high":
                 self._escalation["peak_risk"] = "high"
+
+    def open_high_episode(self):
+        """True while a deterioration episode is open at high risk.
+
+        The episode is open and the latest reading scored high —
+        the ward counts these to decide whether to call in extra
+        staff. An unadmitted bed has no open episode.
+        """
+        if (
+            self._escalation is None
+            or not self.admitted
+            or self.last_reading is None
+        ):
+            return False
+        news2 = self.last_reading.get("news2")
+        return news2 is not None and news2["risk"] == "high"
+
+    def mark_staffing_escalated(self):
+        """Flag the open deterioration episode as covered by a
+        staffing escalation — the ward called in extra nurses
+        while this patient was at high risk. No-op with no open
+        episode."""
+        if self._escalation is not None:
+            self._escalation["staffing_escalated"] = True
 
     def _maybe_respond(self, now):
         """Record the response when it falls due.
@@ -667,7 +695,10 @@ class Monitor:
         when the episode closed before anyone responded — and
         whether the ward's escalation hooks were invoked for it
         (``hook_invoked``) and the retries and final delivery
-        outcome (``hook_retries``, ``hook_final_status``).
+        outcome (``hook_retries``, ``hook_final_status``) — and
+        whether a NEWS2 staffing escalation covered it
+        (``staffing_escalated``, True once the ward called in
+        extra nurses while the episode was open at high risk).
         ``trend``
         is the current rate of change of the score (see
         :func:`ward.news2.trend_for`), and ``trend_alerts`` lists

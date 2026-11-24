@@ -96,7 +96,9 @@ def summarize(path):
     each risk level — and medication totals from the last tick:
     doses given, late, missed, and skipped for a stockout, and
     whether the missed-dose hooks are configured and how many hook
-    deliveries were invoked and failed.
+    deliveries were invoked and failed — and staffing totals from
+    the last tick: the load factor, how many extra nurses a NEWS2
+    staffing escalation has called in, and the escalation state.
     Returns ``None`` fields for a recording with no ticks.
     """
     header = None
@@ -113,6 +115,7 @@ def summarize(path):
     last_readiness = None
     last_early_warning = None
     last_meds = None
+    last_staffing = None
     with open(path) as f:
         for line in f:
             line = line.strip()
@@ -139,6 +142,8 @@ def summarize(path):
                 last_readiness = obj["discharge_readiness"]
             if isinstance(obj.get("early_warning"), dict):
                 last_early_warning = obj["early_warning"]
+            if isinstance(obj.get("staffing"), dict):
+                last_staffing = obj["staffing"]
                 # NEWS2 history totals per bed, from the score on
                 # each tick's reading: ticks scored, peak score and
                 # the risk at that score, and ticks at each risk
@@ -381,4 +386,31 @@ def summarize(path):
         # and the risk at that score, ticks at each risk level, and
         # the first and last scored times.
         "news2_history": news2_hist,
+        # Staffing totals from the last tick: the load factor, how
+        # many extra nurses a NEWS2 staffing escalation has called
+        # in, and the escalation state — whether one is configured
+        # and active, how many high-risk episodes are open, and
+        # every escalation raised so far.
+        "staffing": (
+            {
+                "load_factor": last_staffing["load_factor"],
+                "escalation_nurses": last_staffing.get(
+                    "escalation_nurses", 0
+                ),
+                "escalation": last_staffing.get(
+                    "escalation",
+                    {
+                        "configured": False,
+                        "active": False,
+                        "threshold_high": None,
+                        "extra_nurses": 0,
+                        "open_high_episodes": 0,
+                        "escalations_raised": 0,
+                        "escalations": [],
+                    },
+                ),
+            }
+            if last_staffing is not None
+            else None
+        ),
     }

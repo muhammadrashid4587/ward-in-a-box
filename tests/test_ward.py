@@ -29,6 +29,10 @@ from ward.alert_hooks import (
 from ward.chaos import ChaosEvent
 from ward.cli import build_ward, load_scenario, main
 from ward.discharge import DischargePlanner
+from ward.escalation import (
+    StaffingEscalation,
+    validate_news2_staffing_escalation,
+)
 from ward.monitor import Monitor
 from ward.readiness import DischargeReadiness
 from ward.recorder import Recorder, iter_ticks, summarize
@@ -7017,6 +7021,285 @@ class TestMissedDoseHooks(unittest.TestCase):
             self.assertEqual(
                 hooks, {"configured": True, "invoked": 1, "failed": 0, "retries": 0, "delivered": 1}
             )
+        finally:
+            os.unlink(path)
+
+
+class TestNEWS2StaffingEscalation(unittest.TestCase):
+    def _ward(self, config="default"):
+        """An 8-bed night ward with one nurse, two febrile beds
+        under an alarm storm from 5 s — both go high, so the
+        default threshold of 2 is reached at 5 s."""
+        kwargs = {
+            "beds": 8,
+            "rate_hz": 1.0,
+            "seed": 42,
+            "profiles": [
+                "febrile",
+                "febrile",
+                "hypoxic",
+                "stable",
+                "stable",
+                "stable",
+                "stable",
+                "stable",
+            ],
+            "chaos": [ChaosEvent("alarm_storm", 5, 30, beds=[0, 1])],
+            "staffing": {
+                "start_hour": 20,
+                "day": {"nurse": 3, "doctor": 1, "tech": 1},
+                "night": {"nurse": 1, "doctor": 1, "tech": 0},
+            },
+        }
+        if config == "default":
+            kwargs["news2_staffing_escalation"] = {
+                "threshold_high": 2,
+                "extra_nurses": 1,
+                "cooldown_s": 60,
+            }
+        elif config is not None:
+            kwargs["news2_staffing_escalation"] = config
+        return Ward(**kwargs)
+
+    def test_config_validation(self):
+        self.assertIsNone(validate_news2_staffing_escalation(None))
+        self.assertEqual(
+            validate_news2_staffing_escalation({}),
+            {"threshold_high": 2, "extra_nurses": 1, "cooldown_s": 60.0},
+        )
+        self.assertEqual(
+            validate_news2_staffing_escalation(
+                {"threshold_high": 3, "extra_nurses": 2, "cooldown_s": 0}
+            ),
+            {"threshold_high": 3, "extra_nurses": 2, "cooldown_s": 0.0},
+        )
+        for bad in (
+            "2",
+            {"threshold_high": 0},
+            {"threshold_high": 1.5},
+            {"threshold_high": True},
+            {"extra_nurses": 0},
+            {"extra_nurses": 1.5},
+            {"cooldown_s": -1},
+            {"cooldown_s": "60"},
+            {"unknown": 1},
+        ):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                validate_news2_staffing_escalation(bad)
+
+    def test_escalation_nurses_lower_the_load_factor(self):
+        s = Staffing(
+            day={"nurse": 1},
+            night={"nurse": 1},
+            start_hour=20,
+        )
+        self.assertEqual(s.load_factor(8, 0), 2.0)
+        self.assertEqual(s.patients_per_nurse(8, 0), 8.0)
+        self.assertFalse(s.summary(0, 8)["adequate"])
+        s.escalation_nurses = 1
+        self.assertEqual(s.patients_per_nurse(8, 0), 4.0)
+        self.assertEqual(s.load_factor(8, 0), 1.0)
+        self.assertTrue(s.summary(0, 8)["adequate"])
+        self.assertEqual(s.summary(0, 8)["escalation_nurses"], 1)
+
+    def test_off_by_default(self):
+        ward = self._ward(config=None)
+        for _ in range(10):
+            snap = ward.tick()
+        self.assertEqual(snap["staffing"]["load_factor"], 2.0)
+        self.assertEqual(snap["staffing"]["escalation_nurses"], 0)
+        esc = snap["staffing"]["escalation"]
+        self.assertEqual(esc["configured"], False)
+        self.assertEqual(esc["escalations_raised"], 0)
+        self.assertEqual(esc["escalations"], [])
+        for bed in snap["early_warning"]["beds"]:
+            for episode in bed["episodes"]:
+                self.assertFalse(episode["staffing_escalated"])
+
+    def test_escalation_activates_at_threshold(self):
+        ward = self._ward()
+        for _ in range(4):
+            snap = ward.tick()
+        self.assertFalse(snap["staffing"]["escalation"]["active"])
+        snap = ward.tick()
+        esc = snap["staffing"]["escalation"]
+        self.assertTrue(esc["active"])
+        self.assertEqual(esc["escalations_raised"], 1)
+        self.assertEqual(esc["open_high_episodes"], 2)
+        self.assertEqual(snap["staffing"]["escalation_nurses"], 1)
+        self.assertEqual(snap["staffing"]["load_factor"], 1.0)
+        self.assertEqual(
+            esc["escalations"],
+            [
+                {
+                    "raised_t": 5.0,
+                    "cleared_t": None,
+                    "open_high_at_raise": 2,
+                    "peak_open_high": 2,
+                    "extra_nurses": 1,
+                    "beds": [0, 1],
+                }
+            ],
+        )
+        # Both high episodes are flagged as covered; the
+        # medium-only episodes are not.
+        high = [
+            e
+            for b in snap["early_warning"]["beds"]
+            for e in b["episodes"]
+            if e["peak_risk"] == "high"
+        ]
+        self.assertEqual(len(high), 2)
+        for episode in high:
+            self.assertTrue(episode["staffing_escalated"])
+        medium = [
+            e
+            for b in snap["early_warning"]["beds"]
+            for e in b["episodes"]
+            if e["peak_risk"] == "medium"
+        ]
+        self.assertGreater(len(medium), 0)
+        for episode in medium:
+            self.assertFalse(episode["staffing_escalated"])
+
+    def test_no_escalation_below_threshold(self):
+        ward = self._ward(
+            config={
+                "threshold_high": 3,
+                "extra_nurses": 1,
+                "cooldown_s": 60,
+            }
+        )
+        for _ in range(40):
+            snap = ward.tick()
+        esc = snap["staffing"]["escalation"]
+        self.assertFalse(esc["active"])
+        self.assertEqual(esc["escalations_raised"], 0)
+        self.assertEqual(snap["staffing"]["load_factor"], 2.0)
+
+    def test_cooldown_holds_then_clears(self):
+        ward = self._ward()
+        for _ in range(40):
+            snap = ward.tick()
+        # The storm ends at 35 s and both beds leave high risk,
+        # but the 60 s cooldown holds the escalation.
+        self.assertTrue(snap["staffing"]["escalation"]["active"])
+        self.assertEqual(snap["staffing"]["load_factor"], 1.0)
+        for _ in range(54):
+            snap = ward.tick()
+        self.assertTrue(snap["staffing"]["escalation"]["active"])
+        snap = ward.tick()
+        esc = snap["staffing"]["escalation"]
+        self.assertFalse(esc["active"])
+        self.assertEqual(snap["staffing"]["load_factor"], 2.0)
+        self.assertEqual(snap["staffing"]["escalation_nurses"], 0)
+        self.assertEqual(
+            esc["escalations"],
+            [
+                {
+                    "raised_t": 5.0,
+                    "cleared_t": 95.0,
+                    "open_high_at_raise": 2,
+                    "peak_open_high": 2,
+                    "extra_nurses": 1,
+                    "beds": [0, 1],
+                }
+            ],
+        )
+
+    def test_escalation_returns_when_the_count_climbs_back(self):
+        ward = self._ward()
+        for _ in range(40):
+            ward.tick()
+        # The count is 0 and the cooldown is running; a second
+        # storm pushes both beds high again before it expires.
+        ward.chaos.events.append(
+            ChaosEvent("alarm_storm", 50, 30, beds=[0, 1])
+        )
+        for _ in range(60):
+            snap = ward.tick()
+        esc = snap["staffing"]["escalation"]
+        self.assertTrue(esc["active"])
+        self.assertEqual(esc["escalations_raised"], 1)
+        self.assertIsNone(esc["escalations"][0]["cleared_t"])
+
+    def test_scenario(self):
+        cfg = load_scenario(
+            os.path.join(
+                HERE, "..", "scenarios", "news2-staffing-escalation.json"
+            )
+        )
+        ward = build_ward(cfg, seed=42)
+        for _ in range(40):
+            snap = ward.tick()
+        esc = snap["staffing"]["escalation"]
+        self.assertTrue(esc["configured"])
+        self.assertTrue(esc["active"])
+        self.assertEqual(esc["escalations_raised"], 1)
+        self.assertEqual(esc["escalations"][0]["raised_t"], 5.0)
+        self.assertEqual(esc["escalations"][0]["beds"], [0, 1])
+        self.assertEqual(snap["staffing"]["load_factor"], 1.0)
+        self.assertEqual(snap["staffing"]["on_shift"]["nurse"], 1)
+        self.assertEqual(snap["staffing"]["escalation_nurses"], 1)
+
+    def test_snapshot_endpoint_and_websocket_carry_escalation(self):
+        ward = self._ward()
+        for _ in range(5):
+            snap = ward.tick()
+        self.assertIn("escalation", snap["staffing"])
+        self.assertTrue(snap["staffing"]["escalation"]["active"])
+        server, port = serve_in_thread(ward)
+        try:
+            status, body = get(port, "/staffing")
+            self.assertEqual(status, 200)
+            data = json.loads(body)
+            self.assertTrue(data["escalation"]["active"])
+            self.assertEqual(
+                data["escalation"]["escalations_raised"], 1
+            )
+            ward.partitioned = True
+            status, _ = get(port, "/staffing")
+            self.assertEqual(status, 503)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_recorder_summary_carries_escalation(self):
+        ward = self._ward()
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".jsonl", delete=False
+        ) as f:
+            path = f.name
+        try:
+            with Recorder(path, ward.beds, ward.rate_hz, seed=42) as rec:
+                ward.recorder = rec
+                for _ in range(40):
+                    ward.tick()
+            summary = summarize(path)
+            staffing = summary["staffing"]
+            self.assertEqual(staffing["load_factor"], 1.0)
+            self.assertEqual(staffing["escalation_nurses"], 1)
+            self.assertTrue(staffing["escalation"]["active"])
+            self.assertEqual(
+                staffing["escalation"]["escalations_raised"], 1
+            )
+            self.assertEqual(
+                staffing["escalation"]["escalations"][0]["raised_t"],
+                5.0,
+            )
+        finally:
+            os.unlink(path)
+
+    def test_scenario_rejects_bad_escalation_config(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(
+                {"beds": 1, "news2_staffing_escalation": {"threshold_high": 0}},
+                f,
+            )
+            path = f.name
+        try:
+            with self.assertRaises(ValueError):
+                load_scenario(path)
         finally:
             os.unlink(path)
 

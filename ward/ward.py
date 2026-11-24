@@ -13,6 +13,10 @@ from .alert_hooks import (
 )
 from .chaos import ChaosEngine
 from .discharge import DischargePlanner
+from .escalation import (
+    StaffingEscalation,
+    validate_news2_staffing_escalation,
+)
 from .monitor import Monitor
 from .news2 import (
     validate_consciousness,
@@ -40,7 +44,7 @@ class Ward:
     snapshot to a JSONL file.
     """
 
-    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None, cleaning_s=30.0, meds=None, triage=None, discharge_planning=None, cleaning_capacity=None, discharge_readiness=None, oxygen=None, consciousness=None, consciousness_dynamics=None, news2_trend=None, trend_alert_hooks=None, escalation_hooks=None, boarding_full_hooks=None, wait_time_hooks=None, missed_dose_hooks=None):
+    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None, cleaning_s=30.0, meds=None, triage=None, discharge_planning=None, cleaning_capacity=None, discharge_readiness=None, oxygen=None, consciousness=None, consciousness_dynamics=None, news2_trend=None, trend_alert_hooks=None, escalation_hooks=None, boarding_full_hooks=None, wait_time_hooks=None, missed_dose_hooks=None, news2_staffing_escalation=None):
         if not 1 <= beds <= 64:
             raise ValueError("beds must be 1..64")
         if rate_hz <= 0:
@@ -69,6 +73,17 @@ class Ward:
                 % (discharge_readiness,)
             )
         self.news2_trend = validate_news2_trend(news2_trend)
+        # NEWS2-driven staffing escalation: when enough
+        # deterioration episodes are open at high risk, the ward
+        # calls in extra nurses. Off by default — a ward with no
+        # config never escalates and behaves exactly as before.
+        _escalation_cfg = validate_news2_staffing_escalation(
+            news2_staffing_escalation
+        )
+        if _escalation_cfg is None:
+            self.staffing_escalation = StaffingEscalation(enabled=False)
+        else:
+            self.staffing_escalation = StaffingEscalation(**_escalation_cfg)
         # Trend-alert hooks: one shared object for the whole ward
         # (a webhook URL and/or an in-process callback), invoked
         # when a NEWS2 trend alert fires. Off by default.
@@ -275,6 +290,22 @@ class Ward:
                 )
                 readings.append(r)
                 online.append(m.bed_id)
+        # NEWS2-driven staffing escalation: with this tick's
+        # scores in, count the deterioration episodes open at
+        # high risk — at the threshold the ward calls in extra
+        # nurses, so the load factor (and the ack, check, and
+        # response clocks that run on it) improves from this tick
+        # on, and every open high episode is flagged as covered.
+        # Runs before the staffing tick, so the checks scheduled
+        # now already use the improved factor.
+        open_high = self.open_high_episodes()
+        self.staffing_escalation.tick(self.elapsed, open_high)
+        self.staffing.escalation_nurses = (
+            self.staffing_escalation.extra_nurses_now
+        )
+        if self.staffing_escalation.active:
+            for bed_id in open_high:
+                self.monitors[bed_id].mark_staffing_escalated()
         self.staffing.tick(self.elapsed, occupied, online)
         for m in self.monitors:
             for alarm in m.raised_this_tick:
@@ -314,7 +345,7 @@ class Ward:
                         lead_time_s=self.readiness.auto_order_lead_time_s,
                         source="auto",
                     )
-        snap = {"t": self.elapsed, "beds": readings, "staffing": self.staffing.summary(self.elapsed, occupied), "turnover": self.turnover_summary(), "meds": self.meds_summary(), "triage": self.triage_summary(), "arrivals": self.arrivals_summary(), "discharge": self.discharge_summary(), "discharge_readiness": self.readiness_summary(), "early_warning": self.early_warning_summary()}
+        snap = {"t": self.elapsed, "beds": readings, "staffing": self.staffing_summary(), "turnover": self.turnover_summary(), "meds": self.meds_summary(), "triage": self.triage_summary(), "arrivals": self.arrivals_summary(), "discharge": self.discharge_summary(), "discharge_readiness": self.readiness_summary(), "early_warning": self.early_warning_summary()}
         with self._lock:
             self.latest = snap
         if self.recorder is not None:
@@ -589,10 +620,27 @@ class Ward:
             "missed_dose_hooks": self.missed_dose_hooks.summary(),
         }
 
+    def open_high_episodes(self):
+        """Beds with a deterioration episode open at high NEWS2
+        risk — the count a staffing escalation is decided on."""
+        return [
+            m.bed_id for m in self.monitors if m.open_high_episode()
+        ]
+
     def staffing_summary(self):
-        """Current staffing state and care metrics."""
+        """Current staffing state and care metrics.
+
+        ``escalation`` carries the NEWS2 staffing-escalation
+        state: whether one is configured and active, the
+        threshold and extra nurses in force, how many high-risk
+        episodes are open, and every escalation raised so far.
+        """
         occupied = sum(1 for m in self.monitors if m.admitted)
-        return self.staffing.summary(self.elapsed, occupied)
+        summary = self.staffing.summary(self.elapsed, occupied)
+        summary["escalation"] = self.staffing_escalation.summary(
+            self.elapsed, self.open_high_episodes()
+        )
+        return summary
 
     def triage_summary(self):
         """Current intake queue state and wait metrics."""

@@ -153,6 +153,13 @@ python3 -m ward.cli scenarios/news2-escalation-hooks.json --seed 42
 # 1 unresponded, mean 30.0 s
 python3 -m ward.cli scenarios/news2-response.json --seed 42
 
+# NEWS2-driven staffing escalation: two febrile beds go high
+# under an alarm storm on a thin night (one nurse for eight
+# beds), the ward calls in one extra nurse at 5 s, and the load
+# factor falls from 2.0 to 1.0 — 9 of 14 alarms acknowledged by
+# 40 s at a mean of 30.0 s, against 0 without the escalation
+python3 -m ward.cli scenarios/news2-staffing-escalation.json --seed 42
+
 # Reproducible run
 python3 -m ward.cli scenarios/example.json --seed 42
 ```
@@ -1389,6 +1396,59 @@ stays unresponded, and its high episode under the storm gets
 its response at 40 s, the very tick the risk returns to low —
 2 responded, 1 unresponded, a mean and max of 30.0 s.
 
+## NEWS2-driven staffing escalation
+
+An escalation says a patient needs a response; a ward full of
+high-risk patients says the roster itself needs help. When the
+number of deterioration episodes open at high NEWS2 risk
+reaches a threshold, the ward calls in extra nurses — the
+effective roster grows, so the load factor falls and alarms are
+acknowledged faster, vitals checks run on time again, and
+escalation responses are due sooner, because all three clocks
+run on the load factor. The escalation is hysteresis, not a
+switch: once active it holds while the count stays at or above
+the threshold, and after the count drops below it the extra
+nurses stay for a cooldown before standing down, so a ward
+hovering at the threshold does not flap staff in and out every
+tick.
+
+```json
+{"news2_staffing_escalation": {"threshold_high": 2, "extra_nurses": 1, "cooldown_s": 60}}
+```
+
+`threshold_high` is how many open high-risk episodes trigger
+an escalation (2 by default), `extra_nurses` is how many
+additional nurses join the effective roster while one is active
+(1 by default), and `cooldown_s` is how long the escalation
+holds after the count drops below the threshold (60 seconds by
+default). The staffing summary (`GET /staffing`, every snapshot
+and WebSocket frame) carries the escalation state — whether one
+is configured and active, the threshold and extra nurses in
+force, how many high-risk episodes are open, and every
+escalation raised so far, with when it raised and cleared, how
+many high episodes were open when it raised and at their worst,
+and which beds they were — and the run summary (`--summary`)
+reports the same totals from the last tick. Each open high
+episode is flagged as covered (`"staffing_escalated"` on the
+episode in `GET /news2`), so a client can see which patients
+the extra staff were called in for. The rostered staff in the
+summary stay the roster (`"on_shift"`), and
+`"escalation_nurses"` says how many extra nurses are on the
+effective roster — the ratio and the load factor count both.
+Off by default, so a ward with no config behaves exactly as
+before, and like every other NEWS2 feature the escalation never
+touches the vital-sign alarm list or the scores themselves — it
+only changes how fast the ward responds to them. See
+`scenarios/news2-staffing-escalation.json` for a runnable
+example: over a seeded 40-tick run on a thin night (one nurse
+for eight beds, a load factor of 2.0) two febrile beds go high
+under an alarm storm at 5 s, the ward calls in one extra nurse
+at 5 s and the load factor falls to 1.0 — 9 of 14 alarms
+acknowledged by 40 s at a mean of 30.0 s, against 0
+acknowledged without the escalation — and the escalation is
+still active at the end, the 60 s cooldown holding it past the
+storm until 95 s.
+
 ## Recording a run
 
 `--record FILE` writes every tick to a JSONL file: a header line with
@@ -1412,7 +1472,7 @@ endpoints returned 503 while it lasted, the ticks did not stop.
 make test
 ```
 
-315 tests: vitals stay inside plausible ranges, dropout actually stops a
+326 tests: vitals stay inside plausible ranges, dropout actually stops a
 monitor's stream, an alarm storm produces alarms, stale readings freeze,
 a partition blocks the snapshot endpoint, the HTTP endpoints serve valid
 JSON, the stream serves JSON lines, scenario files validate, alarm
@@ -1689,6 +1749,23 @@ to a dead port failing without stopping the ward and being
 counted, a given dose firing nothing, and the
 `missed-dose-hooks.json` scenario POSTing both missed doses to a
 stub server with the run summary carrying the hook totals.
+NEWS2-staffing-escalation tests cover validation of the
+escalation config (including bad thresholds, extra-nurse counts,
+and cooldowns), the escalation off by default with the load
+factor unchanged and no episode flagged, extra nurses lowering
+the load factor and the patients-per-nurse ratio at the
+`Staffing` level, an escalation raising at the threshold with
+the extra nurse applied, the load factor falling, and both high
+episodes flagged (and medium ones not), no escalation below the
+threshold, the cooldown holding the escalation after the count
+drops and then standing it down with the load factor returning,
+a second storm before the cooldown expires cancelling the
+stand-down without raising a second escalation, the escalation
+in snapshots, the `GET /staffing` endpoint (503 while
+partitioned), and the run summary, and the
+`news2-staffing-escalation.json` scenario raising 1 escalation
+at 5 s with the load factor falling from 2.0 to 1.0 over a seeded
+run.
 
 ## Roadmap
 
@@ -1886,3 +1963,17 @@ stub server with the run summary carrying the hook totals.
   WebSocket frame, `GET /meds`, and the run summary carry the
   missed-dose-hook totals; off by default, configured per ward with
   `missed_dose_hooks` in the scenario) — done in v0.35.0
+- NEWS2-driven staffing escalation (when the number of
+  deterioration episodes open at high NEWS2 risk reaches a
+  configurable threshold, the ward calls in extra nurses — the
+  effective roster grows, so the load factor falls and alarms are
+  acknowledged faster, vitals checks run on time, and escalation
+  responses are due sooner; the escalation holds for a configurable
+  cooldown after the count drops below the threshold before
+  standing down, so a ward hovering at the threshold does not flap;
+  every escalation is recorded with raised/cleared times, the open-high
+  count at raise and at its worst, and the beds involved, each open
+  high episode is flagged as covered, and the state rides in the
+  staffing summary — every snapshot, WebSocket frame, `GET /staffing`,
+  and the run summary; off by default, configured per ward with
+  `news2_staffing_escalation` in the scenario) — done in v0.36.0

@@ -91,6 +91,12 @@ class Staffing:
         self.checks_delayed = 0
         self._next_check_at = {}  # bed_id -> elapsed of next due check
         self._last_check_at = {}  # bed_id -> elapsed of last check
+        # Extra nurses called in by a NEWS2 staffing escalation
+        # (see ward.escalation): set by the ward each tick, 0
+        # when no escalation is active. They count toward the
+        # nurse-to-patient ratio exactly like rostered nurses, so
+        # an escalation lowers the load factor from the next tick.
+        self.escalation_nurses = 0
 
     def shift_at(self, elapsed):
         """Which shift is on at ``elapsed`` seconds into the run."""
@@ -111,9 +117,19 @@ class Staffing:
         """True during the first 15 minutes of a shift."""
         return self._seconds_since_shift_start(elapsed) < HANDOVER_WINDOW_S
 
+    def effective_nurses(self, elapsed):
+        """Nurses on duty at ``elapsed``, roster plus any called in
+        by a NEWS2 staffing escalation."""
+        return self.on_shift(elapsed)["nurse"] + self.escalation_nurses
+
     def patients_per_nurse(self, occupied_beds, elapsed):
-        """Occupied beds per nurse on shift, or None with no nurse."""
-        nurses = self.on_shift(elapsed)["nurse"]
+        """Occupied beds per nurse on shift, or None with no nurse.
+
+        Counts escalation nurses: a ward that called in extra
+        staff has more nurses on the effective roster than the
+        shift roster alone.
+        """
+        nurses = self.effective_nurses(elapsed)
         if nurses <= 0:
             return None
         return occupied_beds / nurses
@@ -174,13 +190,20 @@ class Staffing:
         return round(sum(self._acked_times) / len(self._acked_times), 3)
 
     def summary(self, now, occupied_beds):
-        """Staffing state and care metrics as plain JSON data."""
+        """Staffing state and care metrics as plain JSON data.
+
+        ``on_shift`` is the rostered staff; ``escalation_nurses``
+        is how many extra nurses a NEWS2 staffing escalation has
+        called in (0 without one) — the ratio and the load factor
+        count both.
+        """
         ppn = self.patients_per_nurse(occupied_beds, now)
         return {
             "t": round(now, 3),
             "shift": self.shift_at(now),
             "handover": self.in_handover(now),
             "on_shift": self.on_shift(now),
+            "escalation_nurses": self.escalation_nurses,
             "occupied_beds": occupied_beds,
             "patients_per_nurse": None if ppn is None else round(ppn, 2),
             "adequate": ppn is not None and ppn <= ADEQUATE_PATIENTS_PER_NURSE,

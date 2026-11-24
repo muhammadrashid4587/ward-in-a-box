@@ -13,6 +13,7 @@ from .alert_hooks import (
 )
 from .chaos import ChaosEvent
 from .discharge import DischargePlanner
+from .escalation import validate_news2_staffing_escalation
 from .news2 import (
     validate_consciousness,
     validate_consciousness_dynamics,
@@ -173,6 +174,18 @@ def load_scenario(path):
             news2_trend = validate_news2_trend(data["news2_trend"])
         except ValueError as e:
             raise ValueError("news2_trend: %s" % e)
+    news2_staffing_escalation = None
+    if "news2_staffing_escalation" in data:
+        if not isinstance(data["news2_staffing_escalation"], dict):
+            raise ValueError("news2_staffing_escalation must be an object")
+        try:
+            news2_staffing_escalation = (
+                validate_news2_staffing_escalation(
+                    data["news2_staffing_escalation"]
+                )
+            )
+        except ValueError as e:
+            raise ValueError("news2_staffing_escalation: %s" % e)
     trend_alert_hooks = None
     if "trend_alert_hooks" in data:
         if not isinstance(data["trend_alert_hooks"], dict):
@@ -240,6 +253,7 @@ def load_scenario(path):
         "discharge_planning": discharge_planning,
         "discharge_readiness": discharge_readiness,
         "news2_trend": news2_trend,
+        "news2_staffing_escalation": news2_staffing_escalation,
         "trend_alert_hooks": trend_alert_hooks,
         "escalation_hooks": escalation_hooks,
         "boarding_full_hooks": boarding_full_hooks,
@@ -270,6 +284,7 @@ def build_ward(cfg, seed=None, recorder=None):
         discharge_planning=cfg.get("discharge_planning"),
         discharge_readiness=cfg.get("discharge_readiness"),
         news2_trend=cfg.get("news2_trend"),
+        news2_staffing_escalation=cfg.get("news2_staffing_escalation"),
         trend_alert_hooks=cfg.get("trend_alert_hooks"),
         escalation_hooks=cfg.get("escalation_hooks"),
         boarding_full_hooks=cfg.get("boarding_full_hooks"),
