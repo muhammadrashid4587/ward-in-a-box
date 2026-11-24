@@ -216,6 +216,16 @@ def summarize(path):
                 "boarding_full_diverted": last_triage.get(
                     "boarding_full_diverted", 0
                 ),
+                "boarding_full_hooks": last_triage.get(
+                    "boarding_full_hooks",
+                    {
+                        "configured": False,
+                        "invoked": 0,
+                        "failed": 0,
+                        "retries": 0,
+                        "delivered": 0,
+                    },
+                ),
             }
             if last_triage is not None
             else None

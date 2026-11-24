@@ -30,6 +30,7 @@ Boarding off means no alarm: a diversion with no boarding capacity
 is a plain diversion, not a boarding failure.
 """
 
+from .alert_hooks import validate_boarding_full_hooks
 from .arrivals import ArrivalModel
 from .vitals import PROFILES, validate_acuity
 
@@ -51,7 +52,7 @@ DEFAULT_WAIT_THRESHOLDS = {1: 300.0, 2: 900.0, 3: 1800.0, 4: 3600.0}
 class TriageQueue:
     """The ED intake queue for one ward."""
 
-    def __init__(self, capacity=DEFAULT_CAPACITY, boarding_capacity=DEFAULT_BOARDING_CAPACITY, arrivals=None, wait_thresholds=None, poisson=None, rng=None, seed=None):
+    def __init__(self, capacity=DEFAULT_CAPACITY, boarding_capacity=DEFAULT_BOARDING_CAPACITY, arrivals=None, wait_thresholds=None, poisson=None, rng=None, seed=None, boarding_full_hooks=None):
         if not isinstance(capacity, int) or capacity < 1:
             raise ValueError("triage capacity must be an int >= 1, got %r" % (capacity,))
         if (
@@ -65,6 +66,12 @@ class TriageQueue:
             )
         self.capacity = capacity
         self.boarding_capacity = boarding_capacity
+        # Boarding-full alarm hooks: a webhook URL and/or an
+        # in-process callback, invoked when a boarding-full alarm
+        # episode raises. Off by default.
+        self.boarding_full_hooks = validate_boarding_full_hooks(
+            boarding_full_hooks
+        )
         self.wait_thresholds = self._validate_thresholds(wait_thresholds)
         # Optional walk-in arrival model (a Poisson process): a dict
         # configures one, an ArrivalModel is used as-is. ``rng`` is
@@ -264,10 +271,31 @@ class TriageQueue:
         if active is not None:
             active["diverted"] += 1
             return
-        self.boarding_full_alarm_history.append(
-            {"raised_t": now, "cleared_t": None, "diverted": 1}
-        )
+        episode = {"raised_t": now, "cleared_t": None, "diverted": 1}
+        self.boarding_full_alarm_history.append(episode)
         self.boarding_full_alarms_raised += 1
+        # A raising episode invokes the ward's boarding-full hooks,
+        # if any are configured — a webhook POST (dispatched in a
+        # daemon thread, so it never blocks the tick) and/or an
+        # in-process callback — and the episode records whether the
+        # hook was invoked, so a snapshot, a recording, or the run
+        # summary can say whether the alarm reached the outside
+        # world. A hook failure is logged and counted, never fatal
+        # to the tick. A failed webhook POST is retried with
+        # backoff in the delivery thread, and the episode records
+        # the retries and the final delivery outcome
+        # (``hook_retries``, ``hook_final_status``), updated when
+        # the delivery settles — so an episode read right after it
+        # raises may still say "pending".
+        result = self.boarding_full_hooks.fire(
+            {
+                "event": "boarding_full_alarm",
+                **episode,
+            },
+            record=episode,
+        )
+        episode["hook_invoked"] = result["invoked"]
+        episode["hook_errors"] = result["errors"]
 
     def _clear_boarding_full_alarm(self, now):
         """Clear the active boarding-full alarm, if any.
@@ -533,6 +561,11 @@ class TriageQueue:
             "boarding_full_diverted": sum(
                 e["diverted"] for e in self.boarding_full_alarm_history
             ),
+            # Boarding-full alarm hook totals: whether any hook is
+            # configured, how many deliveries were invoked, how
+            # many failed, how many retries were spent, and how
+            # many deliveries eventually landed.
+            "boarding_full_hooks": self.boarding_full_hooks.summary(),
             "arrival_rate_per_hour": self._current_rate,
             "arrivals_generated": (
                 self.poisson.generated if self.poisson is not None else 0

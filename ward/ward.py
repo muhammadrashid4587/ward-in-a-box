@@ -4,7 +4,11 @@ import random
 import threading
 import time
 
-from .alert_hooks import validate_escalation_hooks, validate_trend_alert_hooks
+from .alert_hooks import (
+    validate_boarding_full_hooks,
+    validate_escalation_hooks,
+    validate_trend_alert_hooks,
+)
 from .chaos import ChaosEngine
 from .discharge import DischargePlanner
 from .monitor import Monitor
@@ -34,7 +38,7 @@ class Ward:
     snapshot to a JSONL file.
     """
 
-    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None, cleaning_s=30.0, meds=None, triage=None, discharge_planning=None, cleaning_capacity=None, discharge_readiness=None, oxygen=None, consciousness=None, consciousness_dynamics=None, news2_trend=None, trend_alert_hooks=None, escalation_hooks=None):
+    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None, cleaning_s=30.0, meds=None, triage=None, discharge_planning=None, cleaning_capacity=None, discharge_readiness=None, oxygen=None, consciousness=None, consciousness_dynamics=None, news2_trend=None, trend_alert_hooks=None, escalation_hooks=None, boarding_full_hooks=None):
         if not 1 <= beds <= 64:
             raise ValueError("beds must be 1..64")
         if rate_hz <= 0:
@@ -71,6 +75,16 @@ class Ward:
         # (a webhook URL and/or an in-process callback), invoked
         # when a deterioration episode opens. Off by default.
         self.escalation_hooks = validate_escalation_hooks(escalation_hooks)
+        # Boarding-full hooks: one shared object for the whole ward
+        # (a webhook URL and/or an in-process callback), invoked
+        # when a boarding-full alarm episode raises. Off by default.
+        # The triage queue owns the object from here on: a queue
+        # built with its own hooks keeps them unless this ward
+        # configures its own, and ``self.boarding_full_hooks``
+        # always points at the queue's object.
+        self.boarding_full_hooks = validate_boarding_full_hooks(
+            boarding_full_hooks
+        )
         if discharge_planning is None:
             self.discharge_planner = DischargePlanner()
         elif isinstance(discharge_planning, DischargePlanner):
@@ -90,7 +104,10 @@ class Ward:
                 )
         self.rng = random.Random(seed)
         if triage is None:
-            self.triage = TriageQueue(rng=self.rng)
+            self.triage = TriageQueue(
+                rng=self.rng,
+                boarding_full_hooks=self.boarding_full_hooks,
+            )
         elif isinstance(triage, TriageQueue):
             self.triage = triage
             # A triage queue built elsewhere (e.g. by load_scenario)
@@ -98,12 +115,18 @@ class Ward:
             # so a seeded run reproduces the same arrivals.
             if self.triage.poisson is not None:
                 self.triage.poisson.rng = self.rng
+            if self.boarding_full_hooks.configured:
+                self.triage.boarding_full_hooks = self.boarding_full_hooks
         elif isinstance(triage, dict):
             kwargs = dict(triage)
             kwargs.setdefault("rng", self.rng)
+            kwargs.setdefault(
+                "boarding_full_hooks", self.boarding_full_hooks
+            )
             self.triage = TriageQueue(**kwargs)
         else:
             raise ValueError("triage must be a TriageQueue or a dict, got %r" % (triage,))
+        self.boarding_full_hooks = self.triage.boarding_full_hooks
         self.cleaning_s = float(cleaning_s)
         profiles = profiles or []
         for p in profiles:

@@ -74,6 +74,12 @@ python3 -m ward.cli scenarios/boarding.json --seed 42
 # the boarded patient takes the bed freed at 15 s
 python3 -m ward.cli scenarios/boarding-full.json --seed 42
 
+# Boarding-full alarm hooks: the same ward, with the boarding-full
+# alarm episode also POSTed to a webhook (here a placeholder URL —
+# point it at your own endpoint; a dead endpoint is logged, never
+# fatal)
+python3 -m ward.cli scenarios/boarding-full-hooks.json --seed 42
+
 # Discharge planning: three orders, one cleaning slot — two
 # discharges wait for a slot and land 10 s and 8 s late
 python3 -m ward.cli scenarios/discharge.json --seed 42
@@ -661,6 +667,42 @@ seeded 20-tick run boarding fills at 1 s, two arrivals divert at
 2 s and 3 s inside a single episode, the boarded patient takes the
 bed freed at 15 s and the alarm clears, and the queued patient
 takes the bed freed at 18 s.
+
+## Boarding-full alarm hooks
+
+A boarding-full alarm says the ED is turning patients away for lack
+of anywhere to put them; the hook makes sure something outside the
+ward hears about it. A ward that wants the outside world to hear
+about that moment — a pager, a dashboard, a bed manager — configures
+boarding-full hooks, the same channels as the NEWS2 hooks (webhook
+and/or in-process callback), on the same best-effort, never-fatal
+terms:
+
+```json
+{"boarding_full_hooks": {"webhook_url": "http://127.0.0.1:18099/hooks"}}
+```
+
+The hook fires once, in the tick the boarding-full alarm episode
+raises, with a `boarding_full_alarm` event payload: when it raised,
+how many patients were diverted during the episode so far, and when
+it cleared (null while it is active). The episode records whether
+the hook was invoked (`"hook_invoked"`, False with no hooks) and any
+synchronous error (`"hook_errors"`), and the triage summary carries
+the ward boarding-full-hook totals (`"boarding_full_hooks"`: whether
+any hook is configured, how many deliveries were invoked, how many
+failed, how many retries were spent, and how many deliveries
+eventually landed) — in `GET /triage`, every snapshot and WebSocket
+frame, and the run summary (`--summary`). The same retry rules as
+the NEWS2 hooks apply — a failed webhook POST is retried with
+backoff up to `"max_retries"` times, and the episode records
+`"hook_retries"` and `"hook_final_status"` alongside
+`"hook_invoked"`. Further diversions during the episode fire
+nothing: one episode, one notification. Hooks are off by default,
+so a ward with none configured behaves exactly as before. See
+`scenarios/boarding-full-hooks.json` for a runnable example: over a
+seeded 20-tick run the same 1 boarding-full episode raises as in
+`boarding-full.json`, POSTed to the configured webhook, with 1 hook
+delivery invoked and 0 failed against a stub server.
 
 ## Discharge planning
 
@@ -1279,7 +1321,7 @@ endpoints returned 503 while it lasted, the ticks did not stop.
 make test
 ```
 
-289 tests: vitals stay inside plausible ranges, dropout actually stops a
+297 tests: vitals stay inside plausible ranges, dropout actually stops a
 monitor's stream, an alarm storm produces alarms, stale readings freeze,
 a partition blocks the snapshot endpoint, the HTTP endpoints serve valid
 JSON, the stream serves JSON lines, scenario files validate, alarm
@@ -1386,7 +1428,17 @@ admitted, a second episode raising after boarding refills, no alarm
 when boarding is off, the alarm in snapshots and the `GET /arrivals`
 and `GET /triage` endpoints, the run summary carrying the alarm
 totals, and the `boarding-full.json` scenario raising one episode
-at 2 s with two diversions and clearing it at 15 s. Discharge planning tests cover a
+at 2 s with two diversions and clearing it at 15 s. Boarding-full
+hook tests cover validation of the hook config, hooks off by
+default with the episode recording no invocation, a callback
+receiving the alarm payload exactly once when the episode raises
+(and again for a second episode after boarding refills), a
+callback that raises being caught with the tick completing and
+the failure counted, a webhook POST reaching a local stub server
+with the alarm payload as JSON, a webhook to a dead port failing
+without stopping the ward and being counted, and the
+`boarding-full-hooks.json` scenario POSTing the one episode to a
+stub server with the run summary carrying the hook totals. Discharge planning tests cover a
 planned discharge firing at its expected time, a discharge
 delayed when the cleaning roster is full (the patient stays in
 the bed, still monitored, until a slot frees up), an order
@@ -1700,3 +1752,13 @@ to a stub server with the run summary carrying the hook totals.
   and `hook_final_status`, and the ward hook totals carry retries
   and deliveries; callbacks that raise are not retried) — done
   in v0.32.0
+- Boarding-full alarm hooks (when a boarding-full alarm episode
+  raises — a patient diverted while ED boarding is full — the ward's
+  configured webhook URL gets a `boarding_full_alarm` event payload
+  POSTed to it in a daemon thread and/or an in-process Python callback
+  is called in the raising tick, reusing the NEWS2 hook machinery,
+  best effort and never fatal; each episode records whether the hook
+  was invoked, and the triage summary, every snapshot, WebSocket
+  frame, `GET /triage`, and the run summary carry the
+  boarding-full-hook totals; off by default, configured per ward
+  with `boarding_full_hooks` in the scenario) — done in v0.33.0

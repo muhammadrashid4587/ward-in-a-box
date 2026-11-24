@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from ward.alert_hooks import (
     TrendAlertHooks,
+    validate_boarding_full_hooks,
     validate_escalation_hooks,
     validate_trend_alert_hooks,
 )
@@ -2028,7 +2029,17 @@ class TestBoardingFullAlarm(unittest.TestCase):
         self.assertEqual(summary["boarding_full_diverted"], 1)
         self.assertEqual(
             summary["boarding_full_alarm_history"],
-            [{"raised_t": 2.0, "cleared_t": None, "diverted": 1}],
+            [
+                {
+                    "raised_t": 2.0,
+                    "cleared_t": None,
+                    "diverted": 1,
+                    "hook_retries": 0,
+                    "hook_final_status": "not_invoked",
+                    "hook_invoked": False,
+                    "hook_errors": [],
+                }
+            ],
         )
 
     def test_further_diversions_count_against_active_episode(self):
@@ -2042,7 +2053,17 @@ class TestBoardingFullAlarm(unittest.TestCase):
         self.assertEqual(summary["boarding_full_diverted"], 3)
         self.assertEqual(
             summary["boarding_full_alarm_history"],
-            [{"raised_t": 2.0, "cleared_t": None, "diverted": 3}],
+            [
+                {
+                    "raised_t": 2.0,
+                    "cleared_t": None,
+                    "diverted": 3,
+                    "hook_retries": 0,
+                    "hook_final_status": "not_invoked",
+                    "hook_invoked": False,
+                    "hook_errors": [],
+                }
+            ],
         )
         self.assertEqual(summary["diverted"], 3)
 
@@ -2062,7 +2083,17 @@ class TestBoardingFullAlarm(unittest.TestCase):
         self.assertEqual(summary["boarding_full_diverted"], 1)
         self.assertEqual(
             summary["boarding_full_alarm_history"],
-            [{"raised_t": 2.0, "cleared_t": 12.0, "diverted": 1}],
+            [
+                {
+                    "raised_t": 2.0,
+                    "cleared_t": 12.0,
+                    "diverted": 1,
+                    "hook_retries": 0,
+                    "hook_final_status": "not_invoked",
+                    "hook_invoked": False,
+                    "hook_errors": [],
+                }
+            ],
         )
 
     def test_second_episode_raises_after_boarding_refills(self):
@@ -2087,8 +2118,24 @@ class TestBoardingFullAlarm(unittest.TestCase):
         self.assertEqual(
             summary["boarding_full_alarm_history"],
             [
-                {"raised_t": 2.0, "cleared_t": 12.0, "diverted": 1},
-                {"raised_t": 12.0, "cleared_t": None, "diverted": 1},
+                {
+                    "raised_t": 2.0,
+                    "cleared_t": 12.0,
+                    "diverted": 1,
+                    "hook_retries": 0,
+                    "hook_final_status": "not_invoked",
+                    "hook_invoked": False,
+                    "hook_errors": [],
+                },
+                {
+                    "raised_t": 12.0,
+                    "cleared_t": None,
+                    "diverted": 1,
+                    "hook_retries": 0,
+                    "hook_final_status": "not_invoked",
+                    "hook_invoked": False,
+                    "hook_errors": [],
+                },
             ],
         )
 
@@ -2161,7 +2208,17 @@ class TestBoardingFullAlarm(unittest.TestCase):
         self.assertTrue(summary["boarding_full_alarm_active"])
         self.assertEqual(
             summary["boarding_full_alarm_history"],
-            [{"raised_t": 2.0, "cleared_t": None, "diverted": 1}],
+            [
+                {
+                    "raised_t": 2.0,
+                    "cleared_t": None,
+                    "diverted": 1,
+                    "hook_retries": 0,
+                    "hook_final_status": "not_invoked",
+                    "hook_invoked": False,
+                    "hook_errors": [],
+                }
+            ],
         )
         ward.tick()  # t=3: fourth arrival diverted: same episode
         summary = ward.triage_summary()
@@ -2178,7 +2235,17 @@ class TestBoardingFullAlarm(unittest.TestCase):
         self.assertFalse(summary["boarding_full_alarm_active"])
         self.assertEqual(
             summary["boarding_full_alarm_history"],
-            [{"raised_t": 2.0, "cleared_t": 15.0, "diverted": 2}],
+            [
+                {
+                    "raised_t": 2.0,
+                    "cleared_t": 15.0,
+                    "diverted": 2,
+                    "hook_retries": 0,
+                    "hook_final_status": "not_invoked",
+                    "hook_invoked": False,
+                    "hook_errors": [],
+                }
+            ],
         )
         self.assertFalse(snap["arrivals"]["boarding_full_alarm"])
         for _ in range(2):
@@ -6122,6 +6189,253 @@ class TestHookRetries(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+
+class TestBoardingFullHooks(unittest.TestCase):
+    def _ward(self, beds=2, cleaning_s=10.0, **kw):
+        ward = Ward(beds=beds, cleaning_s=cleaning_s, seed=42, **kw)
+        ward.tick()
+        return ward
+
+    def _full_ward(self, hooks=None):
+        # Queue of 1, boarding of 1, both occupied: one patient
+        # waiting (t=1), one boarding (t=2).
+        ward = self._ward(
+            triage={"capacity": 1, "boarding_capacity": 1},
+            boarding_full_hooks=hooks,
+        )
+        self.assertTrue(ward.triage_arrive(3, "stable"))  # t=1, queue
+        ward.tick()  # t=2
+        self.assertTrue(ward.triage_arrive(3, "febrile"))  # t=2, boards
+        return ward
+
+    def test_validate_boarding_full_hooks(self):
+        hooks = validate_boarding_full_hooks(None)
+        self.assertIsInstance(hooks, TrendAlertHooks)
+        self.assertFalse(hooks.configured)
+        self.assertEqual(hooks.kind, "boarding-full")
+        custom = validate_boarding_full_hooks(
+            {"webhook_url": "https://example.invalid/hooks", "timeout_s": 2}
+        )
+        self.assertTrue(custom.configured)
+        self.assertEqual(custom.kind, "boarding-full")
+        self.assertEqual(custom.timeout_s, 2.0)
+        seen = []
+        append = seen.append
+        cb = validate_boarding_full_hooks({"callback": append})
+        self.assertTrue(cb.configured)
+        self.assertIs(cb.callback, append)
+        with self.assertRaises(ValueError):
+            validate_boarding_full_hooks({"webhook_url": "ftp://x/hooks"})
+        with self.assertRaises(ValueError):
+            validate_boarding_full_hooks({"callback": "not callable"})
+        with self.assertRaises(ValueError):
+            validate_boarding_full_hooks({"timeout_s": 0})
+        with self.assertRaises(ValueError):
+            validate_boarding_full_hooks({"url": "http://x/hooks"})
+        with self.assertRaises(ValueError):
+            validate_boarding_full_hooks("http://x/hooks")
+
+    def test_hooks_off_by_default(self):
+        # No hooks configured: the episode still raises, and it
+        # records that no hook was invoked.
+        ward = self._full_ward()
+        self.assertFalse(ward.boarding_full_hooks.configured)
+        self.assertFalse(ward.triage_arrive(1, "hypoxic"))  # t=2, diverted
+        summary = ward.triage_summary()
+        self.assertEqual(
+            summary["boarding_full_hooks"],
+            {"configured": False, "invoked": 0, "failed": 0, "retries": 0, "delivered": 0},
+        )
+        episode = summary["boarding_full_alarm_history"][0]
+        self.assertFalse(episode["hook_invoked"])
+        self.assertEqual(episode["hook_errors"], [])
+        self.assertEqual(episode["hook_retries"], 0)
+        self.assertEqual(episode["hook_final_status"], "not_invoked")
+        self.assertEqual(
+            ward.snapshot()["triage"]["boarding_full_hooks"],
+            summary["boarding_full_hooks"],
+        )
+
+    def test_callback_hook_invoked_on_boarding_full_alarm(self):
+        seen = []
+        ward = self._full_ward({"callback": seen.append})
+        self.assertTrue(ward.boarding_full_hooks.configured)
+        self.assertFalse(ward.triage_arrive(1, "hypoxic"))  # t=2, diverted
+        self.assertEqual(len(seen), 1)
+        payload = seen[0]
+        self.assertEqual(payload["event"], "boarding_full_alarm")
+        self.assertEqual(payload["raised_t"], 2.0)
+        self.assertEqual(payload["diverted"], 1)
+        self.assertIsNone(payload["cleared_t"])
+        # The episode itself records the invocation.
+        episode = ward.triage_summary()["boarding_full_alarm_history"][0]
+        self.assertTrue(episode["hook_invoked"])
+        self.assertEqual(episode["hook_errors"], [])
+        self.assertEqual(episode["hook_final_status"], "delivered")
+        # One invocation, no failure, in the ward totals.
+        summary = ward.triage_summary()["boarding_full_hooks"]
+        self.assertEqual(
+            summary, {"configured": True, "invoked": 1, "failed": 0, "retries": 0, "delivered": 1}
+        )
+        # Further diversions during the episode do not fire again.
+        ward.triage_arrive(4)  # t=2, diverted: same episode
+        self.assertEqual(len(seen), 1)
+        # A second episode, after boarding refills, fires again.
+        ward.discharge(0)  # t=2, bed 0 free at t=12 (cleaning is 10 s)
+        for _ in range(10):
+            ward.tick()
+        # t=12: boarded patient admitted, first episode cleared.
+        self.assertFalse(ward.triage_summary()["boarding_full_alarm_active"])
+        self.assertTrue(ward.triage_arrive(3))  # boards
+        self.assertFalse(ward.triage_arrive(4))  # diverted: second episode
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(seen[1]["raised_t"], 12.0)
+        self.assertEqual(
+            ward.triage.boarding_full_hooks.summary()["invoked"], 2
+        )
+
+    def test_callback_failure_is_not_fatal(self):
+        def boom(payload):
+            raise ValueError("pager is down")
+
+        ward = self._full_ward({"callback": boom})
+        self.assertFalse(ward.triage_arrive(1, "hypoxic"))  # t=2, diverted
+        snap = ward.tick()  # t=3: the tick still completes
+        self.assertTrue(snap["beds"][0]["online"])
+        episode = ward.triage_summary()["boarding_full_alarm_history"][0]
+        self.assertTrue(episode["hook_invoked"])
+        self.assertEqual(episode["hook_errors"], ["pager is down"])
+        self.assertEqual(episode["hook_final_status"], "failed")
+        summary = ward.triage_summary()["boarding_full_hooks"]
+        self.assertEqual(summary["invoked"], 1)
+        self.assertEqual(summary["failed"], 1)
+
+    def test_webhook_hook_posts_to_stub_server(self):
+        server, port, received = capture_server()
+        try:
+            ward = self._full_ward(
+                {"webhook_url": "http://127.0.0.1:%d/hooks" % port}
+            )
+            self.assertFalse(ward.triage_arrive(1, "hypoxic"))
+            self.assertTrue(ward.boarding_full_hooks.wait(timeout=5))
+            self.assertEqual(len(received), 1)
+            path, content_type, body = received[0]
+            self.assertEqual(path, "/hooks")
+            self.assertEqual(content_type, "application/json")
+            payload = json.loads(body)
+            self.assertEqual(payload["event"], "boarding_full_alarm")
+            self.assertEqual(payload["raised_t"], 2.0)
+            self.assertEqual(payload["diverted"], 1)
+            episode = ward.triage_summary()["boarding_full_alarm_history"][0]
+            self.assertTrue(episode["hook_invoked"])
+            self.assertEqual(episode["hook_errors"], [])
+            self.assertEqual(episode["hook_final_status"], "delivered")
+            summary = ward.triage_summary()["boarding_full_hooks"]
+            self.assertEqual(
+                summary, {"configured": True, "invoked": 1, "failed": 0, "retries": 0, "delivered": 1}
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_webhook_failure_is_not_fatal(self):
+        # A port with nothing listening: the POST fails, the ward
+        # keeps ticking, and the failure is counted, not raised.
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        ward = self._full_ward(
+            {
+                "webhook_url": "http://127.0.0.1:%d/hooks" % port,
+                "timeout_s": 2,
+            }
+        )
+        self.assertFalse(ward.triage_arrive(1, "hypoxic"))
+        snap = ward.tick()  # t=3: the tick still completes
+        self.assertTrue(snap["beds"][0]["online"])
+        # The hook was invoked (dispatched), even though the
+        # delivery failed.
+        self.assertTrue(
+            ward.triage_summary()["boarding_full_alarm_history"][0][
+                "hook_invoked"
+            ]
+        )
+        self.assertTrue(ward.boarding_full_hooks.wait(timeout=5))
+        episode = ward.triage_summary()["boarding_full_alarm_history"][0]
+        self.assertEqual(episode["hook_final_status"], "failed")
+        summary = ward.triage_summary()["boarding_full_hooks"]
+        self.assertEqual(summary["invoked"], 1)
+        self.assertEqual(summary["failed"], 1)
+
+    def test_scenario_boarding_full_hooks(self):
+        cfg = load_scenario(
+            os.path.join(
+                HERE, "..", "scenarios", "boarding-full-hooks.json"
+            )
+        )
+        self.assertTrue(cfg["boarding_full_hooks"].configured)
+        server, port, received = capture_server()
+        try:
+            # The scenario's URL is a placeholder; point it at
+            # the stub server for this run.
+            cfg["boarding_full_hooks"] = validate_boarding_full_hooks(
+                {"webhook_url": "http://127.0.0.1:%d/hooks" % port}
+            )
+            ward = build_ward(cfg, seed=42)
+            for _ in range(20):
+                snap = ward.tick()
+            self.assertTrue(ward.boarding_full_hooks.wait(timeout=5))
+            # One boarding-full episode over the run, one POST.
+            self.assertEqual(len(received), 1)
+            payload = json.loads(received[0][2])
+            self.assertEqual(payload["event"], "boarding_full_alarm")
+            self.assertEqual(payload["raised_t"], 2.0)
+            # Every episode records that its hook was invoked.
+            for episode in snap["triage"]["boarding_full_alarm_history"]:
+                self.assertTrue(episode["hook_invoked"])
+            # The totals are read from a fresh summary after the
+            # wait: the snapshot from the last tick was taken
+            # before the last delivery settled.
+            self.assertEqual(
+                ward.triage_summary()["boarding_full_hooks"],
+                {"configured": True, "invoked": 1, "failed": 0, "retries": 0, "delivered": 1},
+            )
+            self.assertEqual(
+                snap["triage"]["boarding_full_alarms_raised"], 1
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_recorder_summary_carries_hook_totals(self):
+        cfg = load_scenario(
+            os.path.join(
+                HERE, "..", "scenarios", "boarding-full-hooks.json"
+            )
+        )
+        seen = []
+        cfg["boarding_full_hooks"] = validate_boarding_full_hooks(
+            {"callback": seen.append}
+        )
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".jsonl", delete=False
+        ) as f:
+            path = f.name
+        try:
+            with Recorder(path, cfg["beds"], cfg["rate_hz"], seed=42) as rec:
+                ward = build_ward(cfg, seed=42, recorder=rec)
+                for _ in range(20):
+                    ward.tick()
+            self.assertEqual(len(seen), 1)
+            summary = summarize(path)
+            hooks = summary["triage"]["boarding_full_hooks"]
+            self.assertEqual(
+                hooks, {"configured": True, "invoked": 1, "failed": 0, "retries": 0, "delivered": 1}
+            )
+        finally:
+            os.unlink(path)
 
 
 if __name__ == "__main__":

@@ -13,11 +13,13 @@ A hook is configured per ward, off by default, in one of two ways:
   raises is caught, logged, and counted as a failure — the tick
   still completes.
 
-Two events use hooks. A trend alert (a NEWS2 score rising fast
+Three events use hooks. A trend alert (a NEWS2 score rising fast
 enough to trip the jump or creep rule) fires the ward's
 ``trend_alert_hooks``; a deterioration episode opening (a
 patient's NEWS2 risk leaving low) fires the ward's
-``escalation_hooks``. Both share the same ``AlertHooks``
+``escalation_hooks``; a boarding-full alarm episode raising (a
+patient diverted while ED boarding is full) fires the ward's
+``boarding_full_hooks``. All three share the same ``AlertHooks``
 machinery — the same webhook and callback channels, the same
 best-effort delivery — just a different event payload.
 
@@ -126,11 +128,22 @@ def validate_escalation_hooks(value):
     return _validate_hooks(value, "escalation", "escalation_hooks")
 
 
+def validate_boarding_full_hooks(value):
+    """Normalize a boarding-full hook config (see :func:`_validate_hooks`).
+
+    Fires when a boarding-full alarm episode raises — a patient
+    diverted while ED boarding is full — rather than when a NEWS2
+    event fires.
+    """
+    return _validate_hooks(value, "boarding-full", "boarding_full_hooks")
+
+
 class AlertHooks:
     """The configured hooks for one ward event, shared by its monitors.
 
-    ``kind`` labels the event in log messages (``"trend-alert"``
-    or ``"escalation"``); it changes nothing about delivery.
+    ``kind`` labels the event in log messages (``"trend-alert"``,
+    ``"escalation"``, or ``"boarding-full"``); it changes nothing
+    about delivery.
     """
 
     def __init__(self, webhook_url=None, callback=None,

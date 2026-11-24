@@ -1,10 +1,11 @@
 """ward-in-a-box: a simulated hospital ward as a load/chaos generator."""
 
-__version__ = "0.32.0"
+__version__ = "0.33.0"
 
 from .alert_hooks import (
     AlertHooks,
     TrendAlertHooks,
+    validate_boarding_full_hooks,
     validate_escalation_hooks,
     validate_trend_alert_hooks,
 )
@@ -42,6 +43,7 @@ __all__ = [
     "interaction_warnings",
     "iter_ticks",
     "summarize",
+    "validate_boarding_full_hooks",
     "validate_escalation_hooks",
     "validate_med",
     "validate_trend_alert_hooks",
