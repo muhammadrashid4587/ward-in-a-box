@@ -19,7 +19,9 @@ enough to trip the jump or creep rule) fires the ward's
 patient's NEWS2 risk leaving low) fires the ward's
 ``escalation_hooks``; a boarding-full alarm episode raising (a
 patient diverted while ED boarding is full) fires the ward's
-``boarding_full_hooks``. All three share the same ``AlertHooks``
+``boarding_full_hooks``; a wait-time alarm raising (a waiting
+patient passing their acuity's wait threshold) fires the ward's
+``wait_time_hooks``. All four share the same ``AlertHooks``
 machinery — the same webhook and callback channels, the same
 best-effort delivery — just a different event payload.
 
@@ -138,12 +140,22 @@ def validate_boarding_full_hooks(value):
     return _validate_hooks(value, "boarding-full", "boarding_full_hooks")
 
 
+def validate_wait_time_hooks(value):
+    """Normalize a wait-time hook config (see :func:`_validate_hooks`).
+
+    Fires when a wait-time alarm raises — a waiting patient
+    passing their acuity's wait threshold — rather than when a
+    NEWS2 event fires.
+    """
+    return _validate_hooks(value, "wait-time", "wait_time_hooks")
+
+
 class AlertHooks:
     """The configured hooks for one ward event, shared by its monitors.
 
     ``kind`` labels the event in log messages (``"trend-alert"``,
-    ``"escalation"``, or ``"boarding-full"``); it changes nothing
-    about delivery.
+    ``"escalation"``, ``"boarding-full"``, or ``"wait-time"``); it
+    changes nothing about delivery.
     """
 
     def __init__(self, webhook_url=None, callback=None,

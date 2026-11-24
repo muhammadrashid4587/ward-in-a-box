@@ -226,6 +226,16 @@ def summarize(path):
                         "delivered": 0,
                     },
                 ),
+                "wait_time_hooks": last_triage.get(
+                    "wait_time_hooks",
+                    {
+                        "configured": False,
+                        "invoked": 0,
+                        "failed": 0,
+                        "retries": 0,
+                        "delivered": 0,
+                    },
+                ),
             }
             if last_triage is not None
             else None

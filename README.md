@@ -80,6 +80,12 @@ python3 -m ward.cli scenarios/boarding-full.json --seed 42
 # fatal)
 python3 -m ward.cli scenarios/boarding-full-hooks.json --seed 42
 
+# Wait-time alarm hooks: the same ward as wait-alarm, with each
+# wait-time alarm also POSTed to a webhook (here a placeholder URL —
+# point it at your own endpoint; a dead endpoint is logged, never
+# fatal)
+python3 -m ward.cli scenarios/wait-time-hooks.json --seed 42
+
 # Discharge planning: three orders, one cleaning slot — two
 # discharges wait for a slot and land 10 s and 8 s late
 python3 -m ward.cli scenarios/discharge.json --seed 42
@@ -703,6 +709,42 @@ so a ward with none configured behaves exactly as before. See
 seeded 20-tick run the same 1 boarding-full episode raises as in
 `boarding-full.json`, POSTed to the configured webhook, with 1 hook
 delivery invoked and 0 failed against a stub server.
+
+## Wait-time alarm hooks
+
+A wait-time alarm says a patient has waited too long for a bed; the
+hook makes sure something outside the ward hears about it. A ward
+that wants the outside world to hear about that moment — a pager, a
+dashboard, a bed manager — configures wait-time hooks, the same
+channels as the NEWS2 hooks (webhook and/or in-process callback),
+on the same best-effort, never-fatal terms:
+
+```json
+{"wait_time_hooks": {"webhook_url": "http://127.0.0.1:18099/hooks"}}
+```
+
+The hook fires once per wait-time alarm, in the tick the alarm
+raises, with a `wait_time_alarm` event payload: the patient's
+acuity and profile, when they arrived, when the alarm raised, when
+it cleared (null while they still wait), and whether they are
+boarding. The alarm event records whether the hook was invoked
+(`"hook_invoked"`, False with no hooks) and any synchronous error
+(`"hook_errors"`), and the triage summary carries the ward
+wait-time-hook totals (`"wait_time_hooks"`: whether any hook is
+configured, how many deliveries were invoked, how many failed, how
+many retries were spent, and how many deliveries eventually
+landed) — in `GET /triage`, every snapshot and WebSocket frame,
+and the run summary (`--summary`). The same retry rules as the
+NEWS2 hooks apply — a failed webhook POST is retried with backoff
+up to `"max_retries"` times, and the event records
+`"hook_retries"` and `"hook_final_status"` alongside
+`"hook_invoked"`. A queued patient and a boarded one fire alike:
+one alarm, one notification. Hooks are off by default, so a ward
+with none configured behaves exactly as before. See
+`scenarios/wait-time-hooks.json` for a runnable example: over a
+seeded 25-tick run the same 2 wait-time alarms raise as in
+`wait-alarm.json`, POSTed to the configured webhook, with 2 hook
+deliveries invoked and 0 failed against a stub server.
 
 ## Discharge planning
 
@@ -1762,3 +1804,13 @@ to a stub server with the run summary carrying the hook totals.
   frame, `GET /triage`, and the run summary carry the
   boarding-full-hook totals; off by default, configured per ward
   with `boarding_full_hooks` in the scenario) — done in v0.33.0
+- Wait-time alarm hooks (when a wait-time alarm raises — a waiting
+  patient passing their acuity's wait threshold — the ward's
+  configured webhook URL gets a `wait_time_alarm` event payload
+  POSTed to it in a daemon thread and/or an in-process Python
+  callback is called in the raising tick, reusing the NEWS2 hook
+  machinery, best effort and never fatal; each alarm event records
+  whether the hook was invoked, and the triage summary, every
+  snapshot, WebSocket frame, `GET /triage`, and the run summary
+  carry the wait-time-hook totals; off by default, configured per
+  ward with `wait_time_hooks` in the scenario) — done in v0.34.0

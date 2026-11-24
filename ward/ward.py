@@ -8,6 +8,7 @@ from .alert_hooks import (
     validate_boarding_full_hooks,
     validate_escalation_hooks,
     validate_trend_alert_hooks,
+    validate_wait_time_hooks,
 )
 from .chaos import ChaosEngine
 from .discharge import DischargePlanner
@@ -38,7 +39,7 @@ class Ward:
     snapshot to a JSONL file.
     """
 
-    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None, cleaning_s=30.0, meds=None, triage=None, discharge_planning=None, cleaning_capacity=None, discharge_readiness=None, oxygen=None, consciousness=None, consciousness_dynamics=None, news2_trend=None, trend_alert_hooks=None, escalation_hooks=None, boarding_full_hooks=None):
+    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None, cleaning_s=30.0, meds=None, triage=None, discharge_planning=None, cleaning_capacity=None, discharge_readiness=None, oxygen=None, consciousness=None, consciousness_dynamics=None, news2_trend=None, trend_alert_hooks=None, escalation_hooks=None, boarding_full_hooks=None, wait_time_hooks=None):
         if not 1 <= beds <= 64:
             raise ValueError("beds must be 1..64")
         if rate_hz <= 0:
@@ -85,6 +86,12 @@ class Ward:
         self.boarding_full_hooks = validate_boarding_full_hooks(
             boarding_full_hooks
         )
+        # Wait-time hooks: one shared object for the whole ward
+        # (a webhook URL and/or an in-process callback), invoked
+        # when a wait-time alarm raises. Off by default. The
+        # triage queue owns the object from here on, exactly like
+        # the boarding-full hooks above.
+        self.wait_time_hooks = validate_wait_time_hooks(wait_time_hooks)
         if discharge_planning is None:
             self.discharge_planner = DischargePlanner()
         elif isinstance(discharge_planning, DischargePlanner):
@@ -107,6 +114,7 @@ class Ward:
             self.triage = TriageQueue(
                 rng=self.rng,
                 boarding_full_hooks=self.boarding_full_hooks,
+                wait_time_hooks=self.wait_time_hooks,
             )
         elif isinstance(triage, TriageQueue):
             self.triage = triage
@@ -117,16 +125,20 @@ class Ward:
                 self.triage.poisson.rng = self.rng
             if self.boarding_full_hooks.configured:
                 self.triage.boarding_full_hooks = self.boarding_full_hooks
+            if self.wait_time_hooks.configured:
+                self.triage.wait_time_hooks = self.wait_time_hooks
         elif isinstance(triage, dict):
             kwargs = dict(triage)
             kwargs.setdefault("rng", self.rng)
             kwargs.setdefault(
                 "boarding_full_hooks", self.boarding_full_hooks
             )
+            kwargs.setdefault("wait_time_hooks", self.wait_time_hooks)
             self.triage = TriageQueue(**kwargs)
         else:
             raise ValueError("triage must be a TriageQueue or a dict, got %r" % (triage,))
         self.boarding_full_hooks = self.triage.boarding_full_hooks
+        self.wait_time_hooks = self.triage.wait_time_hooks
         self.cleaning_s = float(cleaning_s)
         profiles = profiles or []
         for p in profiles:

@@ -30,7 +30,10 @@ Boarding off means no alarm: a diversion with no boarding capacity
 is a plain diversion, not a boarding failure.
 """
 
-from .alert_hooks import validate_boarding_full_hooks
+from .alert_hooks import (
+    validate_boarding_full_hooks,
+    validate_wait_time_hooks,
+)
 from .arrivals import ArrivalModel
 from .vitals import PROFILES, validate_acuity
 
@@ -52,7 +55,7 @@ DEFAULT_WAIT_THRESHOLDS = {1: 300.0, 2: 900.0, 3: 1800.0, 4: 3600.0}
 class TriageQueue:
     """The ED intake queue for one ward."""
 
-    def __init__(self, capacity=DEFAULT_CAPACITY, boarding_capacity=DEFAULT_BOARDING_CAPACITY, arrivals=None, wait_thresholds=None, poisson=None, rng=None, seed=None, boarding_full_hooks=None):
+    def __init__(self, capacity=DEFAULT_CAPACITY, boarding_capacity=DEFAULT_BOARDING_CAPACITY, arrivals=None, wait_thresholds=None, poisson=None, rng=None, seed=None, boarding_full_hooks=None, wait_time_hooks=None):
         if not isinstance(capacity, int) or capacity < 1:
             raise ValueError("triage capacity must be an int >= 1, got %r" % (capacity,))
         if (
@@ -72,6 +75,11 @@ class TriageQueue:
         self.boarding_full_hooks = validate_boarding_full_hooks(
             boarding_full_hooks
         )
+        # Wait-time alarm hooks: a webhook URL and/or an in-process
+        # callback, invoked when a wait-time alarm raises — once
+        # per alarm, for a queued patient and a boarded one alike.
+        # Off by default.
+        self.wait_time_hooks = validate_wait_time_hooks(wait_time_hooks)
         self.wait_thresholds = self._validate_thresholds(wait_thresholds)
         # Optional walk-in arrival model (a Poisson process): a dict
         # configures one, an ArrivalModel is used as-is. ``rng`` is
@@ -367,17 +375,41 @@ class TriageQueue:
             if now - patient["arrival_t"] >= threshold:
                 raised_t = round(patient["arrival_t"] + threshold, 3)
                 patient["wait_alarm_t"] = raised_t
-                self.wait_alarm_history.append(
-                    {
-                        "acuity": patient["acuity"],
-                        "profile": patient["profile"],
-                        "arrival_t": patient["arrival_t"],
-                        "raised_t": raised_t,
-                        "cleared_t": None,
-                        "boarding": boarding,
-                    }
-                )
+                event = {
+                    "acuity": patient["acuity"],
+                    "profile": patient["profile"],
+                    "arrival_t": patient["arrival_t"],
+                    "raised_t": raised_t,
+                    "cleared_t": None,
+                    "boarding": boarding,
+                }
+                self.wait_alarm_history.append(event)
                 self.wait_alarms_raised += 1
+                # A raising wait-time alarm invokes the ward's
+                # wait-time hooks, if any are configured — a
+                # webhook POST (dispatched in a daemon thread, so
+                # it never blocks the tick) and/or an in-process
+                # callback — and the alarm event records whether
+                # the hook was invoked, so a snapshot, a
+                # recording, or the run summary can say whether
+                # the alarm reached the outside world. A hook
+                # failure is logged and counted, never fatal to
+                # the tick. A failed webhook POST is retried with
+                # backoff in the delivery thread, and the event
+                # records the retries and the final delivery
+                # outcome (``hook_retries``,
+                # ``hook_final_status``), updated when the
+                # delivery settles — so an event read right
+                # after it raises may still say "pending".
+                result = self.wait_time_hooks.fire(
+                    {
+                        "event": "wait_time_alarm",
+                        **event,
+                    },
+                    record=event,
+                )
+                event["hook_invoked"] = result["invoked"]
+                event["hook_errors"] = result["errors"]
                 raised.append(patient)
         return raised
 
@@ -548,6 +580,11 @@ class TriageQueue:
                 if p["wait_alarm_t"] is not None
             ),
             "wait_alarm_history": [dict(e) for e in self.wait_alarm_history],
+            # Wait-time alarm hook totals: whether any hook is
+            # configured, how many deliveries were invoked, how
+            # many failed, how many retries were spent, and how
+            # many deliveries eventually landed.
+            "wait_time_hooks": self.wait_time_hooks.summary(),
             # Boarding-full alarm: episodes raised when a patient was
             # diverted while boarding was full, each with how many
             # diversions happened during it and when it cleared.

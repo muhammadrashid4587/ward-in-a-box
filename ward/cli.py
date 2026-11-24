@@ -8,6 +8,7 @@ from .alert_hooks import (
     validate_boarding_full_hooks,
     validate_escalation_hooks,
     validate_trend_alert_hooks,
+    validate_wait_time_hooks,
 )
 from .chaos import ChaosEvent
 from .discharge import DischargePlanner
@@ -201,6 +202,16 @@ def load_scenario(path):
             )
         except ValueError as e:
             raise ValueError("boarding_full_hooks: %s" % e)
+    wait_time_hooks = None
+    if "wait_time_hooks" in data:
+        if not isinstance(data["wait_time_hooks"], dict):
+            raise ValueError("wait_time_hooks must be an object")
+        try:
+            wait_time_hooks = validate_wait_time_hooks(
+                data["wait_time_hooks"]
+            )
+        except ValueError as e:
+            raise ValueError("wait_time_hooks: %s" % e)
     return {
         "beds": beds,
         "rate_hz": rate,
@@ -221,6 +232,7 @@ def load_scenario(path):
         "trend_alert_hooks": trend_alert_hooks,
         "escalation_hooks": escalation_hooks,
         "boarding_full_hooks": boarding_full_hooks,
+        "wait_time_hooks": wait_time_hooks,
         "triage": triage,
         "host": data.get("host", "127.0.0.1"),
         "port": data.get("port", 8080),
@@ -249,6 +261,7 @@ def build_ward(cfg, seed=None, recorder=None):
         trend_alert_hooks=cfg.get("trend_alert_hooks"),
         escalation_hooks=cfg.get("escalation_hooks"),
         boarding_full_hooks=cfg.get("boarding_full_hooks"),
+        wait_time_hooks=cfg.get("wait_time_hooks"),
         triage=cfg.get("triage"),
         recorder=recorder,
     )

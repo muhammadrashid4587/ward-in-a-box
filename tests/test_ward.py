@@ -23,6 +23,7 @@ from ward.alert_hooks import (
     validate_boarding_full_hooks,
     validate_escalation_hooks,
     validate_trend_alert_hooks,
+    validate_wait_time_hooks,
 )
 from ward.chaos import ChaosEvent
 from ward.cli import build_ward, load_scenario, main
@@ -6433,6 +6434,295 @@ class TestBoardingFullHooks(unittest.TestCase):
             hooks = summary["triage"]["boarding_full_hooks"]
             self.assertEqual(
                 hooks, {"configured": True, "invoked": 1, "failed": 0, "retries": 0, "delivered": 1}
+            )
+        finally:
+            os.unlink(path)
+
+
+class TestWaitTimeHooks(unittest.TestCase):
+    def _ward(self, beds=2, cleaning_s=10.0, **kw):
+        ward = Ward(beds=beds, cleaning_s=cleaning_s, seed=42, **kw)
+        ward.tick()
+        return ward
+
+    def _waiting_ward(self, hooks=None):
+        # A full 2-bed ward, a queue of 3: patients wait here,
+        # they never take a bed.
+        ward = self._ward(
+            triage={
+                "capacity": 3,
+                "wait_thresholds": {"1": 5, "4": 20},
+            },
+            wait_time_hooks=hooks,
+        )
+        return ward
+
+    def test_validate_wait_time_hooks(self):
+        hooks = validate_wait_time_hooks(None)
+        self.assertIsInstance(hooks, TrendAlertHooks)
+        self.assertFalse(hooks.configured)
+        self.assertEqual(hooks.kind, "wait-time")
+        custom = validate_wait_time_hooks(
+            {"webhook_url": "https://example.invalid/hooks", "timeout_s": 2}
+        )
+        self.assertTrue(custom.configured)
+        self.assertEqual(custom.kind, "wait-time")
+        self.assertEqual(custom.timeout_s, 2.0)
+        seen = []
+        append = seen.append
+        cb = validate_wait_time_hooks({"callback": append})
+        self.assertTrue(cb.configured)
+        self.assertIs(cb.callback, append)
+        with self.assertRaises(ValueError):
+            validate_wait_time_hooks({"webhook_url": "ftp://x/hooks"})
+        with self.assertRaises(ValueError):
+            validate_wait_time_hooks({"callback": "not callable"})
+        with self.assertRaises(ValueError):
+            validate_wait_time_hooks({"timeout_s": 0})
+        with self.assertRaises(ValueError):
+            validate_wait_time_hooks({"url": "http://x/hooks"})
+        with self.assertRaises(ValueError):
+            validate_wait_time_hooks("http://x/hooks")
+
+    def test_hooks_off_by_default(self):
+        # No hooks configured: the alarm still raises, and it
+        # records that no hook was invoked.
+        ward = self._waiting_ward()
+        self.assertFalse(ward.wait_time_hooks.configured)
+        self.assertTrue(ward.triage_arrive(1, "hypoxic"))  # t=1
+        for _ in range(5):
+            ward.tick()  # t=6: threshold 5 s from arrival
+        summary = ward.triage_summary()
+        self.assertEqual(
+            summary["wait_time_hooks"],
+            {"configured": False, "invoked": 0, "failed": 0, "retries": 0, "delivered": 0},
+        )
+        event = summary["wait_alarm_history"][0]
+        self.assertFalse(event["hook_invoked"])
+        self.assertEqual(event["hook_errors"], [])
+        self.assertEqual(event["hook_retries"], 0)
+        self.assertEqual(event["hook_final_status"], "not_invoked")
+        self.assertEqual(
+            ward.snapshot()["triage"]["wait_time_hooks"],
+            summary["wait_time_hooks"],
+        )
+
+    def test_callback_hook_invoked_on_wait_time_alarm(self):
+        seen = []
+        ward = self._waiting_ward({"callback": seen.append})
+        self.assertTrue(ward.wait_time_hooks.configured)
+        self.assertTrue(ward.triage_arrive(1, "hypoxic"))  # t=1
+        for _ in range(5):
+            ward.tick()  # t=6
+        self.assertEqual(len(seen), 1)
+        payload = seen[0]
+        self.assertEqual(payload["event"], "wait_time_alarm")
+        self.assertEqual(payload["acuity"], 1)
+        self.assertEqual(payload["profile"], "hypoxic")
+        self.assertEqual(payload["arrival_t"], 1.0)
+        self.assertEqual(payload["raised_t"], 6.0)
+        self.assertIsNone(payload["cleared_t"])
+        self.assertFalse(payload["boarding"])
+        # The alarm event itself records the invocation.
+        event = ward.triage_summary()["wait_alarm_history"][0]
+        self.assertTrue(event["hook_invoked"])
+        self.assertEqual(event["hook_errors"], [])
+        self.assertEqual(event["hook_final_status"], "delivered")
+        # One invocation, no failure, in the ward totals.
+        summary = ward.triage_summary()["wait_time_hooks"]
+        self.assertEqual(
+            summary, {"configured": True, "invoked": 1, "failed": 0, "retries": 0, "delivered": 1}
+        )
+        # A second alarm, for a different patient, fires again.
+        self.assertTrue(ward.triage_arrive(4, "stable"))  # t=6
+        for _ in range(20):
+            ward.tick()  # t=26: threshold 20 s from arrival
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(seen[1]["raised_t"], 26.0)
+        self.assertEqual(seen[1]["acuity"], 4)
+        self.assertEqual(
+            ward.triage.wait_time_hooks.summary()["invoked"], 2
+        )
+
+    def test_boarded_wait_time_alarm_fires_hook(self):
+        # A boarded patient raises the same wait-time alarm as a
+        # queued one, and the hook fires for it too.
+        seen = []
+        ward = self._ward(
+            triage={
+                "capacity": 1,
+                "boarding_capacity": 1,
+                "wait_thresholds": {"1": 5, "3": 5},
+            },
+            wait_time_hooks={"callback": seen.append},
+        )
+        self.assertTrue(ward.triage_arrive(3, "stable"))  # t=1, queue
+        ward.tick()  # t=2
+        self.assertTrue(ward.triage_arrive(1, "febrile"))  # t=2, boards
+        for _ in range(6):
+            ward.tick()  # t=8: both alarms raised (6 s and 7 s)
+        self.assertEqual(len(seen), 2)
+        self.assertFalse(seen[0]["boarding"])
+        self.assertEqual(seen[0]["raised_t"], 6.0)
+        self.assertTrue(seen[1]["boarding"])
+        self.assertEqual(seen[1]["raised_t"], 7.0)
+        for event in ward.triage_summary()["wait_alarm_history"]:
+            self.assertTrue(event["hook_invoked"])
+
+    def test_callback_failure_is_not_fatal(self):
+        def boom(payload):
+            raise ValueError("pager is down")
+
+        ward = self._waiting_ward({"callback": boom})
+        self.assertTrue(ward.triage_arrive(1, "hypoxic"))  # t=1
+        for _ in range(5):
+            ward.tick()  # t=6
+        snap = ward.tick()  # t=7: the tick still completes
+        self.assertTrue(snap["beds"][0]["online"])
+        event = ward.triage_summary()["wait_alarm_history"][0]
+        self.assertTrue(event["hook_invoked"])
+        self.assertEqual(event["hook_errors"], ["pager is down"])
+        self.assertEqual(event["hook_final_status"], "failed")
+        summary = ward.triage_summary()["wait_time_hooks"]
+        self.assertEqual(summary["invoked"], 1)
+        self.assertEqual(summary["failed"], 1)
+
+    def test_webhook_hook_posts_to_stub_server(self):
+        server, port, received = capture_server()
+        try:
+            ward = self._waiting_ward(
+                {"webhook_url": "http://127.0.0.1:%d/hooks" % port}
+            )
+            self.assertTrue(ward.triage_arrive(1, "hypoxic"))  # t=1
+            for _ in range(5):
+                ward.tick()  # t=6
+            self.assertTrue(ward.wait_time_hooks.wait(timeout=5))
+            self.assertEqual(len(received), 1)
+            path, content_type, body = received[0]
+            self.assertEqual(path, "/hooks")
+            self.assertEqual(content_type, "application/json")
+            payload = json.loads(body)
+            self.assertEqual(payload["event"], "wait_time_alarm")
+            self.assertEqual(payload["raised_t"], 6.0)
+            self.assertEqual(payload["acuity"], 1)
+            event = ward.triage_summary()["wait_alarm_history"][0]
+            self.assertTrue(event["hook_invoked"])
+            self.assertEqual(event["hook_errors"], [])
+            self.assertEqual(event["hook_final_status"], "delivered")
+            summary = ward.triage_summary()["wait_time_hooks"]
+            self.assertEqual(
+                summary, {"configured": True, "invoked": 1, "failed": 0, "retries": 0, "delivered": 1}
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_webhook_failure_is_not_fatal(self):
+        # A port with nothing listening: the POST fails, the ward
+        # keeps ticking, and the failure is counted, not raised.
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        ward = self._waiting_ward(
+            {
+                "webhook_url": "http://127.0.0.1:%d/hooks" % port,
+                "timeout_s": 2,
+            }
+        )
+        self.assertTrue(ward.triage_arrive(1, "hypoxic"))  # t=1
+        for _ in range(5):
+            ward.tick()  # t=6
+        snap = ward.tick()  # t=7: the tick still completes
+        self.assertTrue(snap["beds"][0]["online"])
+        # The hook was invoked (dispatched), even though the
+        # delivery failed.
+        self.assertTrue(
+            ward.triage_summary()["wait_alarm_history"][0][
+                "hook_invoked"
+            ]
+        )
+        self.assertTrue(ward.wait_time_hooks.wait(timeout=5))
+        event = ward.triage_summary()["wait_alarm_history"][0]
+        self.assertEqual(event["hook_final_status"], "failed")
+        summary = ward.triage_summary()["wait_time_hooks"]
+        self.assertEqual(summary["invoked"], 1)
+        self.assertEqual(summary["failed"], 1)
+
+    def test_scenario_wait_time_hooks(self):
+        cfg = load_scenario(
+            os.path.join(
+                HERE, "..", "scenarios", "wait-time-hooks.json"
+            )
+        )
+        self.assertTrue(cfg["wait_time_hooks"].configured)
+        server, port, received = capture_server()
+        try:
+            # The scenario's URL is a placeholder; point it at
+            # the stub server for this run.
+            cfg["wait_time_hooks"] = validate_wait_time_hooks(
+                {"webhook_url": "http://127.0.0.1:%d/hooks" % port}
+            )
+            ward = build_ward(cfg, seed=42)
+            for _ in range(25):
+                snap = ward.tick()
+            self.assertTrue(ward.wait_time_hooks.wait(timeout=5))
+            # Two wait-time alarms over the run, two POSTs. The
+            # deliveries run in separate daemon threads, so their
+            # arrival order at the stub is not guaranteed — sort
+            # by raised time before asserting.
+            self.assertEqual(len(received), 2)
+            payloads = sorted(
+                (json.loads(r[2]) for r in received),
+                key=lambda p: p["raised_t"],
+            )
+            self.assertEqual(
+                [p["event"] for p in payloads],
+                ["wait_time_alarm", "wait_time_alarm"],
+            )
+            self.assertEqual(payloads[0]["raised_t"], 5.0)
+            self.assertEqual(payloads[1]["raised_t"], 22.0)
+            # Every alarm records that its hook was invoked.
+            for event in snap["triage"]["wait_alarm_history"]:
+                self.assertTrue(event["hook_invoked"])
+            # The totals are read from a fresh summary after the
+            # wait: the snapshot from the last tick was taken
+            # before the last delivery settled.
+            self.assertEqual(
+                ward.triage_summary()["wait_time_hooks"],
+                {"configured": True, "invoked": 2, "failed": 0, "retries": 0, "delivered": 2},
+            )
+            self.assertEqual(
+                snap["triage"]["wait_alarms_raised"], 2
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_recorder_summary_carries_hook_totals(self):
+        cfg = load_scenario(
+            os.path.join(
+                HERE, "..", "scenarios", "wait-time-hooks.json"
+            )
+        )
+        seen = []
+        cfg["wait_time_hooks"] = validate_wait_time_hooks(
+            {"callback": seen.append}
+        )
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".jsonl", delete=False
+        ) as f:
+            path = f.name
+        try:
+            with Recorder(path, cfg["beds"], cfg["rate_hz"], seed=42) as rec:
+                ward = build_ward(cfg, seed=42, recorder=rec)
+                for _ in range(25):
+                    ward.tick()
+            self.assertEqual(len(seen), 2)
+            summary = summarize(path)
+            hooks = summary["triage"]["wait_time_hooks"]
+            self.assertEqual(
+                hooks, {"configured": True, "invoked": 2, "failed": 0, "retries": 0, "delivered": 2}
             )
         finally:
             os.unlink(path)

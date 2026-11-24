@@ -1,0 +1,1 @@
+{"beds":2,"cleaning_s":10,"patients":[{"bed":0,"profile":"stable"},{"bed":1,"profile":"tachycardic"}],"rate_hz":1.0,"triage":{"arrivals":[{"acuity":1,"at":0,"profile":"hypoxic"},{"acuity":4,"at":2,"profile":"stable"}],"capacity":3,"wait_thresholds":{"1":5,"4":20}},"wait_time_hooks":{"webhook_url":"http://127.0.0.1:18099/hooks"}}
