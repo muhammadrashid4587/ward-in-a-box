@@ -361,10 +361,12 @@ def summarize(path):
         # the flip that made it ready, when it flipped, and how
         # long it has been ready — so the run's discharge order is
         # visible without replaying every tick — plus how many
-        # times the order changed this run, and whether the
-        # discharge-priority hooks are configured and how many
-        # hook deliveries were invoked, failed, retried, and
-        # delivered.
+        # times the order changed this run, and the per-bed rank
+        # history — how each bed's rank moved through the queue,
+        # with the NEWS2 at the flip and the tick of each change
+        # — and whether the discharge-priority hooks are
+        # configured and how many hook deliveries were invoked,
+        # failed, retried, and delivered.
         "discharge_priority": (
             {
                 "ready": last_priority["ready"],
@@ -372,6 +374,8 @@ def summarize(path):
                 "priority_changes": last_priority.get(
                     "priority_changes", 0
                 ),
+                "rank_changes": last_priority.get("rank_changes", 0),
+                "rank_history": last_priority.get("rank_history", {}),
                 "discharge_priority_hooks": last_priority.get(
                     "discharge_priority_hooks",
                     {

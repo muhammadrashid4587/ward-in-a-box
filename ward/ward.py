@@ -140,8 +140,20 @@ class Ward:
         # The priority order last sent to the hooks (empty
         # before the first ready bed), and every order change
         # this run — the audit trail for the priority hooks.
+        # ``_last_priority_rank`` maps each bed currently in
+        # the order to its 1-based rank, and
+        # ``_last_priority_flip`` maps it to the NEWS2 at the
+        # flip that made it ready; together they let
+        # :meth:`_check_priority_order` record, per bed, how
+        # its rank changed. ``priority_rank_history`` is the
+        # per-bed history: one entry per rank change, with the
+        # new rank (null when the bed leaves the order), the
+        # NEWS2 at the flip, and when it changed.
         self._last_priority_order = []
+        self._last_priority_rank = {}
+        self._last_priority_flip = {}
         self.priority_events = []
+        self.priority_rank_history = []
         if discharge_planning is None:
             self.discharge_planner = DischargePlanner()
         elif isinstance(discharge_planning, DischargePlanner):
@@ -622,6 +634,36 @@ class Ward:
         if order == self._last_priority_order:
             return
         now = round(self.elapsed, 3)
+        # Per-bed rank history: one entry per bed whose rank
+        # changed in this tick — newly ready (rank 1..n), moved
+        # up or down as the order re-sorted, or dropped out of
+        # the order (rank null, keeping the NEWS2 at the flip
+        # that had made it ready). A bed whose rank did not
+        # change records nothing, so the history stays a
+        # change log, not a per-tick dump.
+        new_rank = {e["bed"]: i + 1 for i, e in enumerate(entries)}
+        new_flip = {e["bed"]: e["news2_at_flip"] for e in entries}
+        for bed in sorted(
+            set(self._last_priority_rank) | set(new_rank)
+        ):
+            old = self._last_priority_rank.get(bed)
+            new = new_rank.get(bed)
+            if old == new:
+                continue
+            self.priority_rank_history.append(
+                {
+                    "bed": bed,
+                    "t": now,
+                    "rank": new,
+                    "news2_at_flip": (
+                        new_flip.get(bed)
+                        if new is not None
+                        else self._last_priority_flip.get(bed)
+                    ),
+                }
+            )
+        self._last_priority_rank = new_rank
+        self._last_priority_flip = new_flip
         event = {
             "event": "discharge_priority_changed",
             "t": now,
@@ -660,19 +702,37 @@ class Ward:
         order it replaced, and whether the ward's hooks were
         invoked for it (``hook_invoked``) and the retries and
         final delivery outcome (``hook_retries``,
-        ``hook_final_status``); ``discharge_priority_hooks``
+        ``hook_final_status``); ``rank_changes`` counts every
+        per-bed rank change this run and ``rank_history`` is
+        that history grouped per bed — each entry the tick it
+        changed, the new 1-based rank (null when the bed left
+        the order), and the NEWS2 at the flip that had made it
+        ready — so a bed manager can see how a bed moved
+        through the queue, not just where it sits now;
+        ``discharge_priority_hooks``
         carries the hook totals: whether any hook is configured,
         how many hook deliveries were invoked, how many failed,
         how many retries were spent, and how many deliveries
         eventually landed.
         """
         entries = self._priority_entries()
+        rank_history = {}
+        for change in self.priority_rank_history:
+            rank_history.setdefault(str(change["bed"]), []).append(
+                {
+                    "t": change["t"],
+                    "rank": change["rank"],
+                    "news2_at_flip": change["news2_at_flip"],
+                }
+            )
         return {
             "t": self.elapsed,
             "beds": entries,
             "ready": len(entries),
             "priority_changes": len(self.priority_events),
             "changes": [dict(e) for e in self.priority_events],
+            "rank_changes": len(self.priority_rank_history),
+            "rank_history": rank_history,
             "discharge_priority_hooks": (
                 self.discharge_priority_hooks.summary()
             ),

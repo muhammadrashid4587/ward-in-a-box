@@ -113,6 +113,12 @@ python3 -m ward.cli scenarios/discharge-readiness-hooks.json --seed 42
 # endpoint; a dead endpoint is logged, never fatal)
 python3 -m ward.cli scenarios/discharge-priority-hooks.json --seed 42
 
+# Discharge-priority history: the same ward shape, with an alarm
+# storm on bed 0 at 10 s — bed 0 drops out of the order at 11 s
+# and returns at 20 s, bed 1 is promoted and demoted in between,
+# and every rank change is recorded per bed
+python3 -m ward.cli scenarios/discharge-priority-history.json --seed 42
+
 # Auto discharge orders: beds flagged ready get a discharge order
 # raised for them at once, and discharge an hour later by default
 python3 -m ward.cli scenarios/discharge-auto-order.json --seed 42
@@ -1131,6 +1137,28 @@ at 49 s and drops out at 50 s, bed 3 drops out at 51 s, and bed 2
 flags ready again at 59 s — POSTed to the configured webhook,
 with 7 hook deliveries invoked and 0 failed against a stub
 server.
+
+## Discharge-priority history
+
+The priority view says where each ready bed sits now; the
+history says how it got there. Every time the ranked order
+changes, each bed whose rank moved records one history entry:
+the tick it changed, its new 1-based rank — null when it drops
+out of the order — and the NEWS2 at the flip that had made it
+ready, so a bed that leaves keeps the score it left with. A bed
+whose rank did not change records nothing, so a ward that stays
+ready for an hour records one entry per bed, not one per tick.
+The history is grouped per bed (`"rank_history"`, keyed by bed
+number) alongside the total count of rank changes
+(`"rank_changes"`), in `GET /discharge-priority`, every snapshot
+and WebSocket frame, and the run summary (`--summary`). See
+`scenarios/discharge-priority-history.json` for a runnable
+example: over a seeded 40-tick run all four beds flag ready at
+5 s in the order 2, 3, 0, 1, an alarm storm on bed 0 at 10 s
+drops it out of the order at 11 s and promotes bed 1 from rank
+4 to 3, and bed 0 flags ready again at 20 s at NEWS2 0 and
+retakes rank 3 while bed 1 falls back to 4 — 3 order changes,
+8 rank changes in total.
 
 ## NEWS2 early-warning scoring
 
@@ -2193,3 +2221,12 @@ run.
   totals and the hook totals; off by default, configured per ward
   with `discharge_priority_hooks` in the scenario) — done in
   v0.40.0
+- Per-bed discharge-priority history (every time the ranked
+  order changes, each bed whose rank moved records one history
+  entry — the tick, its new 1-based rank, null when it drops
+  out, and the NEWS2 at the flip that had made it ready — grouped
+  per bed as `"rank_history"` with a `"rank_changes"` total, in
+  `GET /discharge-priority`, every snapshot, WebSocket frame,
+  and the run summary; a bed whose rank did not change records
+  nothing, so a steady ward logs one entry per bed) — done in
+  v0.41.0

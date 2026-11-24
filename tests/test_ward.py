@@ -2881,6 +2881,149 @@ class TestDischargePriority(unittest.TestCase):
         )
 
 
+class TestDischargePriorityHistory(unittest.TestCase):
+    def _history_ward(self):
+        # The same ward as scenarios/discharge-priority-history.json:
+        # stable, tachycardic, stable, stable, with an alarm storm
+        # on bed 0 at 10 s for 5 s. All four beds flag ready at 5 s;
+        # the storm knocks bed 0 out at 11 s and it flags ready
+        # again at 20 s, so the other beds' ranks move twice.
+        ward = Ward(
+            beds=4,
+            profiles=["stable", "tachycardic", "stable", "stable"],
+            discharge_readiness={"stable_window_s": 5},
+            chaos=[ChaosEvent("alarm_storm", 10, 5, bed=0)],
+            seed=42,
+        )
+        for _ in range(40):
+            ward.tick()
+        return ward
+
+    def test_rank_history_records_entries_moves_and_exits(self):
+        ward = self._history_ward()
+        priority = ward.discharge_priority_summary()
+        self.assertEqual(priority["rank_changes"], 8)
+        history = priority["rank_history"]
+        # Bed 0: rank 3 at 5 s, out at 11 s, back at rank 3 at
+        # 20 s — re-flagged at NEWS2 0, quiet after the storm.
+        self.assertEqual(
+            history["0"],
+            [
+                {"t": 5.0, "rank": 3, "news2_at_flip": 1},
+                {"t": 11.0, "rank": None, "news2_at_flip": 1},
+                {"t": 20.0, "rank": 3, "news2_at_flip": 0},
+            ],
+        )
+        # Bed 1 is promoted 4 -> 3 while bed 0 is out, then
+        # demoted back to 4 when bed 0 returns.
+        self.assertEqual(
+            history["1"],
+            [
+                {"t": 5.0, "rank": 4, "news2_at_flip": 3},
+                {"t": 11.0, "rank": 3, "news2_at_flip": 3},
+                {"t": 20.0, "rank": 4, "news2_at_flip": 3},
+            ],
+        )
+        # Beds 2 and 3 never move: one entry each, rank 1 and 2.
+        self.assertEqual(
+            history["2"],
+            [{"t": 5.0, "rank": 1, "news2_at_flip": 0}],
+        )
+        self.assertEqual(
+            history["3"],
+            [{"t": 5.0, "rank": 2, "news2_at_flip": 0}],
+        )
+
+    def test_unchanged_rank_records_nothing(self):
+        # A ward that stays ready for an hour records one rank
+        # entry per bed, not one per tick.
+        ward = Ward(
+            beds=2,
+            profiles=["stable", "stable"],
+            discharge_readiness={"stable_window_s": 5},
+            seed=42,
+        )
+        for _ in range(60):
+            ward.tick()
+        priority = ward.discharge_priority_summary()
+        self.assertEqual(priority["rank_changes"], 2)
+        self.assertEqual(len(priority["rank_history"]["0"]), 1)
+        self.assertEqual(len(priority["rank_history"]["1"]), 1)
+
+    def test_history_in_snapshot_endpoint_and_recorder_summary(self):
+        ward = self._history_ward()
+        snap = ward.snapshot()
+        self.assertEqual(
+            snap["discharge_priority"]["rank_history"]["0"],
+            [
+                {"t": 5.0, "rank": 3, "news2_at_flip": 1},
+                {"t": 11.0, "rank": None, "news2_at_flip": 1},
+                {"t": 20.0, "rank": 3, "news2_at_flip": 0},
+            ],
+        )
+        server, port = serve_in_thread(ward)
+        try:
+            status, body = get(port, "/discharge-priority")
+            self.assertEqual(status, 200)
+            priority = json.loads(body)
+            self.assertEqual(priority["rank_changes"], 8)
+            self.assertEqual(
+                priority["rank_history"]["1"][1],
+                {"t": 11.0, "rank": 3, "news2_at_flip": 3},
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+        cfg = load_scenario(
+            os.path.join(
+                HERE, "..", "scenarios", "discharge-priority-history.json"
+            )
+        )
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".jsonl", delete=False
+        ) as f:
+            path = f.name
+        try:
+            with Recorder(path, cfg["beds"], cfg["rate_hz"], seed=42) as rec:
+                ward = build_ward(cfg, seed=42, recorder=rec)
+                for _ in range(40):
+                    ward.tick()
+            summary = summarize(path)
+            self.assertEqual(
+                summary["discharge_priority"]["rank_changes"], 8
+            )
+            self.assertEqual(
+                summary["discharge_priority"]["rank_history"]["0"],
+                [
+                    {"t": 5.0, "rank": 3, "news2_at_flip": 1},
+                    {"t": 11.0, "rank": None, "news2_at_flip": 1},
+                    {"t": 20.0, "rank": 3, "news2_at_flip": 0},
+                ],
+            )
+            self.assertEqual(
+                [b["bed"] for b in summary["discharge_priority"]["beds"]],
+                [2, 3, 0, 1],
+            )
+        finally:
+            os.unlink(path)
+
+    def test_scenario_discharge_priority_history(self):
+        cfg = load_scenario(
+            os.path.join(
+                HERE, "..", "scenarios", "discharge-priority-history.json"
+            )
+        )
+        ward = build_ward(cfg, seed=42)
+        for _ in range(40):
+            ward.tick()
+        priority = ward.discharge_priority_summary()
+        self.assertEqual(priority["priority_changes"], 3)
+        self.assertEqual(priority["rank_changes"], 8)
+        self.assertEqual(
+            [b["bed"] for b in priority["beds"]], [2, 3, 0, 1]
+        )
+
+
 class TestDischargeReadinessHooks(unittest.TestCase):
     def _ward(self, hooks=None, **kw):
         kwargs = {
