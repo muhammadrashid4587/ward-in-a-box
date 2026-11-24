@@ -1,16 +1,63 @@
 """Chaos events: device dropout, alarm storms, stale readings, partitions,
 discharges, pharmacy stockouts, slow sensor drift, staff shortages, bed
-blockers, oxygen outages."""
+blockers, oxygen outages, power outages."""
 
 from .staffing import ROLES
 from .vitals import NORMAL, PLAUSIBLE
 
-VALID_TYPES = ("dropout", "alarm_storm", "stale", "partition", "discharge", "stockout", "sensor_drift", "staff_shortage", "bed_blocker", "oxygen_outage")
+VALID_TYPES = ("dropout", "alarm_storm", "stale", "partition", "discharge", "stockout", "sensor_drift", "staff_shortage", "bed_blocker", "oxygen_outage", "power_outage")
 
 # Why a bed is blocked: awaiting a porter to move the patient,
 # an isolation clean after an infectious patient, or an equipment
 # fault on the bed itself.
 BLOCK_REASONS = ("porter", "isolation_clean", "equipment_fault")
+
+
+def validate_power(power):
+    """A power-outage config: ``{"battery_s": ..., "reboot_s": ...}``.
+
+    ``battery_s`` is required: how many seconds of battery backup
+    a bedside monitor has once the mains fails — a positive finite
+    number. While the battery holds the monitor keeps emitting
+    readings, flagged ``on_battery``; once it dies the monitor goes
+    dark until power returns. ``reboot_s`` is how many seconds a
+    monitor that went dark takes to come back once power returns
+    (default 0 — it comes straight back) — a non-negative finite
+    number. A config with no positive battery backup does nothing
+    at all, so it is rejected.
+    """
+    if not isinstance(power, dict):
+        raise ValueError(
+            "power_outage needs a power config, got %r" % (power,)
+        )
+    battery_s = power.get("battery_s")
+    if (
+        not isinstance(battery_s, (int, float))
+        or isinstance(battery_s, bool)
+        or battery_s != battery_s
+        or battery_s in (float("inf"), float("-inf"))
+        or battery_s <= 0
+    ):
+        raise ValueError(
+            "power_outage: battery_s must be a positive finite "
+            "number, got %r" % (battery_s,)
+        )
+    reboot_s = power.get("reboot_s", 0)
+    if (
+        not isinstance(reboot_s, (int, float))
+        or isinstance(reboot_s, bool)
+        or reboot_s != reboot_s
+        or reboot_s in (float("inf"), float("-inf"))
+        or reboot_s < 0
+    ):
+        raise ValueError(
+            "power_outage: reboot_s must be a non-negative finite "
+            "number, got %r" % (reboot_s,)
+        )
+    return {
+        "battery_s": float(battery_s),
+        "reboot_s": float(reboot_s),
+    }
 
 
 def validate_oxygen_outage(oxygen):
@@ -202,10 +249,22 @@ class ChaosEvent:
     patients the supply was feeding feel it. When the supply
     returns the patient recovers at ``recovery_rate`` points per
     second. Without ``bed``/``beds`` it is ward-wide, like
-    ``partition``.
+    ``partition``. ``power_outage`` needs ``power`` (see
+    :func:`validate_power`): while it is active, the mains is
+    down, so every target monitor runs on battery backup for
+    ``battery_s`` seconds — still emitting readings, flagged
+    ``on_battery`` — and then goes dark: no readings at all,
+    alarms neither raise nor clear, exactly like a monitor that
+    dropped out. When power returns, a monitor that went dark
+    takes ``reboot_s`` seconds to come back; one that never went
+    dark is back on mains at once. The patient is untouched —
+    their vitals keep walking, unseen — because the outage is a
+    monitoring failure, not a clinical one. Without
+    ``bed``/``beds`` it is ward-wide, like ``partition``: the
+    mains serves the whole ward.
     """
 
-    def __init__(self, type, at, duration=None, bed=None, beds=None, med=None, drift=None, shortage=None, reason=None, oxygen=None):
+    def __init__(self, type, at, duration=None, bed=None, beds=None, med=None, drift=None, shortage=None, reason=None, oxygen=None, power=None):
         if type not in VALID_TYPES:
             raise ValueError("unknown chaos type: %r" % type)
         if type == "stockout":
@@ -219,6 +278,8 @@ class ChaosEvent:
             reason = validate_block_reason(reason)
         if type == "oxygen_outage":
             oxygen = validate_oxygen_outage(oxygen)
+        if type == "power_outage":
+            power = validate_power(power)
         if type == "discharge":
             duration = 0 if duration is None else duration
             if duration < 0:
@@ -237,6 +298,7 @@ class ChaosEvent:
         self.shortage = shortage
         self.reason = reason
         self.oxygen = oxygen
+        self.power = power
 
     @property
     def end(self):
@@ -343,6 +405,30 @@ class ChaosEngine:
                 for b in ev.targets(ward):
                     ward.monitors[b].oxygen_outage_until = ev.end
                     ward.monitors[b].oxygen_outage_cfg = ev.oxygen
+            elif ev.type == "power_outage":
+                # The mains is down for the window. The monitor
+                # holds the outage end and the config, and when
+                # the outage starts; the battery deadline and the
+                # reboot are computed from those in the monitor
+                # tick (see Monitor._power_state), so a bed that
+                # is offline or stale this tick still runs its
+                # battery down on wall-clock time — the UPS does
+                # not wait for a reading nobody saw. A fresh
+                # outage (no outage currently recorded) restarts
+                # the battery clock and clears the went-dark
+                # flag; an overlapping event only extends the
+                # window, so the battery keeps draining from
+                # when power first failed.
+                for b in ev.targets(ward):
+                    m = ward.monitors[b]
+                    if (
+                        m.power_outage_until is None
+                        or now >= m.power_outage_until
+                    ):
+                        m.power_outage_since = ev.at
+                        m.power_went_dark = False
+                    m.power_outage_until = ev.end
+                    m.power_outage_cfg = ev.power
             elif ev.type == "dropout":
                 for b in ev.targets(ward):
                     ward.monitors[b].offline_until = ev.end

@@ -140,6 +140,11 @@ def make_handler(ward):
                     self._send_json(503, {"error": "partitioned"})
                     return
                 self._send_json(200, ward.oxygen_outage_summary())
+            elif path == "/power-outage":
+                if ward.partitioned:
+                    self._send_json(503, {"error": "partitioned"})
+                    return
+                self._send_json(200, ward.power_outage_summary())
             elif path == "/stream":
                 if ward.partitioned:
                     self._send_json(503, {"error": "partitioned"})
@@ -244,6 +249,7 @@ def make_handler(ward):
                         "sensor_drift": ward.sensor_drift_summary(),
                         "bed_blocker": ward.bed_blocker_summary(),
                         "oxygen_outage": ward.oxygen_outage_summary(),
+                        "power_outage": ward.power_outage_summary(),
                     }
                     send(OP_TEXT, json.dumps(msg))
                     stop.wait(1.0 / ward.rate_hz)

@@ -143,6 +143,29 @@ class Monitor:
         self.oxygen_deficit = 0.0
         self.oxygen_outage_until = None
         self.oxygen_outage_cfg = None
+        # Power outage: the mains failed at ``power_outage_since``
+        # (elapsed seconds) and returns at
+        # ``power_outage_until``, with ``power_outage_cfg``
+        # carrying the event's battery backup and reboot delay.
+        # While the battery holds the monitor keeps emitting
+        # readings, flagged ``on_battery``; once the battery
+        # dies the monitor goes dark — no readings, alarms
+        # neither raise nor clear — until power returns and it
+        # has rebooted. ``power_went_dark`` remembers that the
+        # battery died during this outage, so a monitor that
+        # went dark waits out its reboot even after the mains
+        # returns; ``power_dark_ticks`` counts every tick this
+        # stay the monitor was dark. The battery is a property
+        # of the monitor, not the patient: it drains on
+        # wall-clock time from when power first failed, and a
+        # new admission clears the dark flag but not the
+        # deadline — the UPS does not recharge because the
+        # patient changed.
+        self.power_outage_until = None
+        self.power_outage_cfg = None
+        self.power_outage_since = None
+        self.power_went_dark = False
+        self.power_dark_ticks = 0
         self.seq = 0
         # False until the ward admits this bed (scenario timeline); an
         # unadmitted bed emits no readings at all.
@@ -276,6 +299,115 @@ class Monitor:
             ),
             "deficit": self.oxygen_deficit,
             "desaturating": self.oxygen_deficit > 0,
+        }
+
+    def _power_state(self, now):
+        """The monitor's power state at elapsed time ``now``.
+
+        Pure computation, no side effects: ``"mains"`` while the
+        mains is up, ``"battery"`` while an outage is running and
+        the battery still holds, ``"dark"`` once the battery has
+        died (or while the mains is back but the monitor has not
+        rebooted yet — that is ``"rebooting"``). ``battery_until``
+        is when the battery dies, ``reboot_until`` when a dark
+        monitor comes back. A bed with no patient has no monitor
+        running, so it is never on battery or dark even while the
+        mains is down — though the outage itself is still active
+        for the ward.
+        """
+        if (
+            self.power_outage_until is None
+            or self.power_outage_cfg is None
+            or self.power_outage_since is None
+        ):
+            return {
+                "state": "mains",
+                "outage_active": False,
+                "outage_until": None,
+                "battery_until": None,
+                "reboot_until": None,
+            }
+        cfg = self.power_outage_cfg
+        battery_until = round(
+            self.power_outage_since + cfg["battery_s"], 3
+        )
+        reboot_until = round(
+            self.power_outage_until + cfg["reboot_s"], 3
+        )
+        if now < self.power_outage_until:
+            if not self.admitted:
+                return {
+                    "state": "mains",
+                    "outage_active": True,
+                    "outage_until": self.power_outage_until,
+                    "battery_until": battery_until,
+                    "reboot_until": None,
+                }
+            if self.power_went_dark or now >= battery_until:
+                return {
+                    "state": "dark",
+                    "outage_active": True,
+                    "outage_until": self.power_outage_until,
+                    "battery_until": battery_until,
+                    "reboot_until": None,
+                }
+            return {
+                "state": "battery",
+                "outage_active": True,
+                "outage_until": self.power_outage_until,
+                "battery_until": battery_until,
+                "reboot_until": None,
+            }
+        if self.admitted and self.power_went_dark:
+            if now < reboot_until:
+                return {
+                    "state": "rebooting",
+                    "outage_active": False,
+                    "outage_until": None,
+                    "battery_until": None,
+                    "reboot_until": reboot_until,
+                }
+        return {
+            "state": "mains",
+            "outage_active": False,
+            "outage_until": None,
+            "battery_until": None,
+            "reboot_until": None,
+        }
+
+    def power_dark(self, now):
+        """True while this monitor is dark from a power outage:
+        its battery died, or it is still rebooting after power
+        returned. False on mains, on battery, or with no patient
+        in the bed."""
+        return self._power_state(now)["state"] in ("dark", "rebooting")
+
+    def power_outage_detail(self, now):
+        """Per-bed power-outage state as plain JSON data.
+
+        ``outage_active`` is True while a power-outage event
+        holds the ward's mains, with when it returns;
+        ``on_battery`` is True while the monitor is running on
+        its battery backup, ``dark`` while the battery has died
+        or the monitor is still rebooting, ``rebooting`` while
+        power is back but the monitor has not come up yet, and
+        ``dark_ticks`` counts every tick this stay the monitor
+        was dark — so a client can tell a bed that lost its
+        monitor from one that is merely on battery, and how long
+        the ward has been blind on that bed.
+        """
+        state = self._power_state(now)
+        return {
+            "bed": self.bed_id,
+            "admitted": self.admitted,
+            "outage_active": state["outage_active"],
+            "outage_until": state["outage_until"],
+            "on_battery": state["state"] == "battery",
+            "dark": state["state"] in ("dark", "rebooting"),
+            "rebooting": state["state"] == "rebooting",
+            "battery_until": state["battery_until"],
+            "reboot_until": state["reboot_until"],
+            "dark_ticks": self.power_dark_ticks,
         }
 
     def bed_blocker_detail(self, now):
@@ -453,8 +585,16 @@ class Monitor:
         # deficit goes the same way: the new patient starts
         # fully saturated, and an outage still running starts
         # desaturating them again from zero on the next tick.
+        # A power outage goes the same way for the dark flag:
+        # the new patient starts with a live monitor, and an
+        # outage still running starts draining the battery
+        # again from when power first failed — the UPS does not
+        # recharge because the patient changed, so the deadline
+        # is unchanged, only the dark count restarts.
         self.sensor_drift = {}
         self.oxygen_deficit = 0.0
+        self.power_went_dark = False
+        self.power_dark_ticks = 0
         self.signs = initial_signs(self.profile, self.rng, self.acuity)
         self.seq = 0
         self.last_reading = None
@@ -602,6 +742,35 @@ class Monitor:
             self.blocked_reason = None
         if not self.admitted:
             return None
+        # A power outage runs the monitor on battery until the
+        # battery dies, then the monitor goes dark: no readings,
+        # alarms neither raise nor clear, exactly like a dropout
+        # — and it stays dark through its reboot once power
+        # returns. The battery drains on wall-clock time from
+        # when power first failed, so a bed that is offline or
+        # stale this tick still runs its battery down. The
+        # patient is untouched: their vitals keep walking,
+        # unseen, and the walk resumes from where it was when
+        # the monitor comes back.
+        power = self._power_state(now)
+        if power["state"] in ("dark", "rebooting"):
+            if power["state"] == "dark" and power["outage_active"]:
+                # The battery just died (or died earlier in this
+                # outage): remember it, so the monitor waits out
+                # its reboot once power returns instead of coming
+                # straight back.
+                self.power_went_dark = True
+            self.power_dark_ticks += 1
+            return None
+        if power["state"] == "mains" and self.power_outage_until is not None:
+            # The outage is over and the reboot is done (or the
+            # battery never died): back on mains, clear the
+            # outage state.
+            self.power_outage_until = None
+            self.power_outage_cfg = None
+            self.power_outage_since = None
+            self.power_went_dark = False
+        on_battery = power["state"] == "battery"
         if self.offline_until is not None:
             if now < self.offline_until:
                 return None
@@ -612,6 +781,7 @@ class Monitor:
                 stale = dict(self.last_reading)
                 stale["stale"] = True
                 stale["t"] = round(now, 3)
+                stale["on_battery"] = on_battery
                 self.last_reading = stale
                 return stale
             # No reading yet: fall through and generate one.
@@ -659,6 +829,7 @@ class Monitor:
             "on_oxygen": self.on_oxygen,
             "consciousness": self.consciousness,
             "stale": False,
+            "on_battery": on_battery,
             "sensor_drift": dict(self.sensor_drift),
             "oxygen_deficit": self.oxygen_deficit,
             **reported,

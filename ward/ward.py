@@ -333,6 +333,8 @@ class Ward:
             r = m.tick(self.elapsed, dt, load_factor=load_factor)
             if r is None:
                 entry = {"bed": m.bed_id, "online": False, "t": self.elapsed}
+                if m.power_dark(self.elapsed):
+                    entry["power_dark"] = True
                 if not m.admitted:
                     entry["admitted"] = False
                     entry["state"] = m.state(self.elapsed)
@@ -448,7 +450,7 @@ class Ward:
         # in, and before the snapshot, so the event is in it.
         # A tick where the order is unchanged fires nothing.
         self._check_priority_order()
-        snap = {"t": self.elapsed, "beds": readings, "staffing": self.staffing_summary(), "turnover": self.turnover_summary(), "meds": self.meds_summary(), "triage": self.triage_summary(), "arrivals": self.arrivals_summary(), "discharge": self.discharge_summary(), "discharge_readiness": self.readiness_summary(), "discharge_priority": self.discharge_priority_summary(), "early_warning": self.early_warning_summary(), "sensor_drift": self.sensor_drift_summary(), "bed_blocker": self.bed_blocker_summary(), "oxygen_outage": self.oxygen_outage_summary()}
+        snap = {"t": self.elapsed, "beds": readings, "staffing": self.staffing_summary(), "turnover": self.turnover_summary(), "meds": self.meds_summary(), "triage": self.triage_summary(), "arrivals": self.arrivals_summary(), "discharge": self.discharge_summary(), "discharge_readiness": self.readiness_summary(), "discharge_priority": self.discharge_priority_summary(), "early_warning": self.early_warning_summary(), "sensor_drift": self.sensor_drift_summary(), "bed_blocker": self.bed_blocker_summary(), "oxygen_outage": self.oxygen_outage_summary(), "power_outage": self.power_outage_summary()}
         with self._lock:
             self.latest = snap
         if self.recorder is not None:
@@ -507,6 +509,35 @@ class Ward:
                 1 for b in beds if b["desaturating"]
             ),
             "max_deficit": max((b["deficit"] for b in beds), default=0.0),
+        }
+
+    def power_outage_summary(self):
+        """Per-bed power-outage state and ward totals.
+
+        ``beds`` carries each bed's outage state — whether the
+        mains is down, when it returns, whether the monitor is
+        on battery, dark, or rebooting, and how many ticks this
+        stay it has been dark — ``beds_on_battery`` counts the
+        monitors still running on backup, ``beds_dark`` counts
+        the ones that have gone dark (battery dead or still
+        rebooting), ``beds_rebooting`` counts the ones waiting
+        out a reboot after power returned, and ``dark_ticks``
+        counts every dark tick across the ward, so a client can
+        see at a glance how much of the ward the outage has
+        blinded and for how long.
+        """
+        beds = [m.power_outage_detail(self.elapsed) for m in self.monitors]
+        return {
+            "t": self.elapsed,
+            "beds": beds,
+            "beds_on_battery": sum(
+                1 for b in beds if b["on_battery"]
+            ),
+            "beds_dark": sum(1 for b in beds if b["dark"]),
+            "beds_rebooting": sum(
+                1 for b in beds if b["rebooting"]
+            ),
+            "dark_ticks": sum(b["dark_ticks"] for b in beds),
         }
 
     def bed_blocker_summary(self):

@@ -190,6 +190,12 @@ python3 -m ward.cli scenarios/bed-blocker.json --seed 42
 # 82.0 floor with NEWS2 6, and bed 1 (not on oxygen) is untouched
 python3 -m ward.cli scenarios/oxygen-outage.json --seed 42
 
+# Power outage: the mains fails from 5 s to 35 s — every monitor
+# runs on battery for 10 s, then goes dark until power returns
+# and it has rebooted for 5 s, so no bed emits a reading from
+# 15 s to 39 s and the ward is blind for 25 ticks a bed
+python3 -m ward.cli scenarios/power-outage.json --seed 42
+
 # NEWS2 trend alert hooks: the same ward, with each trend alert
 # also POSTed to a webhook (here a placeholder URL — point it at
 # your own endpoint; a dead endpoint is logged, never fatal)
@@ -284,6 +290,11 @@ python3 -m ward.cli scenarios/example.json --seed 42
   supply is down, when it returns, and how many SpO2 points each
   patient on oxygen has lost to it, as JSON
   (503 while partitioned)
+- `GET /power-outage` — per-bed power-outage state: whether the
+  mains is down, when it returns, whether each monitor is on
+  battery, dark, or rebooting, and how many ticks each bed has
+  been dark, as JSON
+  (503 while partitioned)
 
 A reading looks like:
 
@@ -319,7 +330,8 @@ summary from `/discharge-priority`, the early-warning
 summary from `/news2`, and the sensor-drift summary from
 `/sensor-drift`, the bed-blocker summary from
 `/bed-blocker`, and the oxygen-outage summary from
-`/oxygen-outage`, so a client gets bed occupancy, vitals, alarms, staffing,
+`/oxygen-outage`, and the power-outage summary from
+`/power-outage`, so a client gets bed occupancy, vitals, alarms, staffing,
 medication, and the intake queue in one message. Ping frames are answered with pong, close frames
 are echoed and the connection is then closed; text frames from the
 client are accepted and ignored — the ward pushes ticks, it takes no
@@ -442,6 +454,16 @@ Chaos types:
   escalations all respond — while a patient not on oxygen is
   untouched, because the outage is a supply failure and only the
   patients the supply was feeding feel it; see Oxygen outage below.
+- `power_outage` — the ward's mains power fails for `duration`
+  seconds; needs `"power"`, a map with `"battery_s"` (seconds of
+  battery backup before a monitor goes dark, required) and
+  `"reboot_s"` (seconds a dark monitor takes to come back once
+  power returns, default 0). While the battery holds the monitor
+  keeps emitting readings, flagged `"on_battery"`; once it dies
+  the monitor goes dark — no readings, alarms neither raise nor
+  clear — until power returns and it has rebooted. The patient is
+  untouched: their vitals keep walking, unseen; see Power outage
+  below.
 
 `bed` targets one bed, `beds` targets several, neither targets all beds
 (`partition` is always ward-wide). Times are elapsed seconds from start.
@@ -766,6 +788,56 @@ alarm at 19 s, peaks at NEWS2 4 (medium), and is fully recovered
 by 50 s; bed 2 (hypoxic, on oxygen) sits on the 82.0 floor from
 21 s with NEWS2 6 (medium); bed 1 (stable, not on oxygen) is
 untouched by the outage — its deficit stays 0.0 throughout.
+
+## Power outage
+
+A `power_outage` chaos event fails the ward's mains power for a
+window — a tripped breaker, a cut feed, a generator that did not
+start — so the bedside monitors lose the power that was running
+them:
+
+```json
+{"type": "power_outage", "at": 5, "duration": 30,
+ "power": {"battery_s": 10, "reboot_s": 5}}
+```
+
+While the outage is active, a monitor runs on battery backup
+for `battery_s` seconds: it keeps emitting readings, flagged
+`"on_battery"`, so a client can see the ward is on borrowed
+time. Once the battery dies the monitor goes dark — no reading
+at all, alarms neither raise nor clear, exactly like a monitor
+that dropped out — and it stays dark until power returns and it
+has rebooted, `reboot_s` seconds later; a monitor whose battery
+never died is back on mains at once. The patient is untouched:
+unlike `oxygen_outage`, which really desaturates a patient, the
+power failure is a monitoring failure, not a clinical one — the
+vitals keep walking, unseen, and the walk resumes from where it
+was when the monitor comes back, so a client that watches the
+NEWS2 history sees a hole, not a jump. Without `bed`/`beds` the
+outage is ward-wide, like a partition: the mains serves the whole
+ward. The battery drains on wall-clock time from when power
+first failed, so a bed that is offline or stale still runs its
+battery down, and a new admission starts with a live monitor
+but the same deadline — the UPS does not recharge because the
+patient changed. Every reading carries whether its monitor is on
+battery (`"on_battery"`), a dark bed appears offline with
+`"power_dark": true`, every snapshot carries a `"power_outage"`
+object with the per-bed outage state — whether the mains is down,
+when it returns, whether the monitor is on battery, dark, or
+rebooting, and how many ticks this stay it has been dark — and
+ward totals (how many monitors are on battery, how many are
+dark, how many are rebooting, and the ward's total dark ticks),
+served on its own by `GET /power-outage` and carried in every
+WebSocket frame, and the run summary (`--summary`) reports the
+same totals from the last tick. See `scenarios/power-outage.json`
+for a runnable example: over a seeded 70-tick run every monitor
+runs on battery from 5 s to 14 s, goes dark at 15 s, reboots
+while power is back from 35 s, and is back on mains at 40 s —
+45 readings, 10 on battery, and 25 dark ticks a bed, 75 dark
+ticks across the ward — and no alarm raises or clears while the
+ward is dark: the hypoxic bed's low_spo2 episode cleared at
+11 s, before the outage, and the next one raises at 60 s, after
+the monitors came back.
 
 ## Triage / ED intake queue
 
@@ -2609,3 +2681,13 @@ run.
   `"oxygen_deficit"`, an `"oxygen_outage"` object in every
   snapshot, WebSocket frame, a `GET /oxygen-outage` endpoint,
   and the run summary) — done in v0.48.0
+- Power outage (a `power_outage` chaos event fails the ward's
+  mains power for a window, so every target monitor runs on
+  battery backup for `battery_s` seconds — still emitting
+  readings, flagged `"on_battery"` — and then goes dark until
+  power returns and it has rebooted for `reboot_s` seconds, with
+  alarms and NEWS2 frozen while the monitor is dark and the
+  patient's vitals walking on unseen; a dark bed appears offline
+  with `"power_dark": true`, and the outage state rides in every
+  snapshot, WebSocket frame, a `GET /power-outage` endpoint, and
+  the run summary) — done in v0.49.0

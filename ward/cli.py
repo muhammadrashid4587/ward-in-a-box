@@ -106,6 +106,7 @@ def load_scenario(path):
                     shortage=ev.get("shortage"),
                     reason=ev.get("reason"),
                     oxygen=ev.get("oxygen"),
+                    power=ev.get("power"),
                 )
             )
         except KeyError as e:

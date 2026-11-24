@@ -9987,5 +9987,333 @@ class TestOxygenOutage(unittest.TestCase):
         self.assertEqual(snaps, snaps2)
 
 
+class TestPowerOutage(unittest.TestCase):
+    # A power outage: the mains fails from t=5 for 30 s, so the
+    # monitor runs on battery for 10 s — still emitting readings,
+    # flagged on_battery — and then goes dark until power returns
+    # and it has rebooted for 5 s. The patient is untouched:
+    # their vitals keep walking, unseen, and no alarm raises or
+    # clears while the monitor is dark. A bed the outage does
+    # not target stays on mains throughout.
+    POWER = {"battery_s": 10.0, "reboot_s": 5.0}
+
+    def _outage_ward(self):
+        return Ward(
+            beds=2,
+            profiles=["stable", "stable"],
+            chaos=[
+                ChaosEvent(
+                    "power_outage",
+                    at=5,
+                    duration=30,
+                    bed=0,
+                    power=self.POWER,
+                )
+            ],
+            seed=42,
+            discharge_readiness={"stable_window_s": 5},
+        )
+
+    def test_power_config_validation(self):
+        # A power-outage event needs a power config.
+        with self.assertRaises(ValueError):
+            ChaosEvent("power_outage", at=0, duration=10, bed=0)
+        with self.assertRaises(ValueError):
+            ChaosEvent(
+                "power_outage",
+                at=0,
+                duration=10,
+                bed=0,
+                power="mains",
+            )
+        # The battery backup is required and must be positive.
+        with self.assertRaises(ValueError):
+            ChaosEvent(
+                "power_outage",
+                at=0,
+                duration=10,
+                bed=0,
+                power={},
+            )
+        for bad_battery in (0, -10.0, "long", True, float("nan"), float("inf")):
+            with self.assertRaises(ValueError):
+                ChaosEvent(
+                    "power_outage",
+                    at=0,
+                    duration=10,
+                    bed=0,
+                    power={"battery_s": bad_battery},
+                )
+        # The reboot delay must be non-negative.
+        for bad_reboot in (-1.0, "slow", float("nan")):
+            with self.assertRaises(ValueError):
+                ChaosEvent(
+                    "power_outage",
+                    at=0,
+                    duration=10,
+                    bed=0,
+                    power={"battery_s": 10.0, "reboot_s": bad_reboot},
+                )
+        # Default: a monitor that went dark comes straight back
+        # once power returns.
+        ev = ChaosEvent(
+            "power_outage",
+            at=0,
+            duration=10,
+            bed=0,
+            power={"battery_s": 10.0},
+        )
+        self.assertEqual(
+            ev.power, {"battery_s": 10.0, "reboot_s": 0.0}
+        )
+        ev = ChaosEvent(
+            "power_outage",
+            at=0,
+            duration=10,
+            bed=0,
+            power=self.POWER,
+        )
+        self.assertEqual(ev.power, self.POWER)
+
+    def test_battery_then_dark_then_mains(self):
+        ward = self._outage_ward()
+        snaps = [ward.tick() for _ in range(40)]
+        # On mains before the outage, on battery from t=5.
+        self.assertFalse(snaps[3]["beds"][0]["on_battery"])
+        self.assertTrue(snaps[4]["beds"][0]["on_battery"])
+        self.assertTrue(snaps[13]["beds"][0]["on_battery"])
+        # The battery dies at t=15: no reading, flagged dark.
+        self.assertEqual(
+            snaps[14]["beds"][0],
+            {"bed": 0, "online": False, "t": 15.0, "power_dark": True},
+        )
+        # Dark through the rest of the outage and the reboot:
+        # power returns at t=35 but the monitor is still
+        # rebooting until t=40.
+        self.assertFalse(snaps[33]["beds"][0]["online"])
+        self.assertFalse(snaps[34]["beds"][0]["online"])
+        self.assertFalse(snaps[38]["beds"][0]["online"])
+        self.assertTrue(snaps[39]["beds"][0]["online"])
+        self.assertFalse(snaps[39]["beds"][0]["on_battery"])
+        # The control bed — same profile, not targeted — never
+        # leaves the mains.
+        self.assertTrue(
+            all(s["beds"][1]["online"] for s in snaps)
+        )
+        self.assertTrue(
+            all(not s["beds"][1]["on_battery"] for s in snaps)
+        )
+        self.assertEqual(
+            snaps[39]["power_outage"]["beds"][1]["dark_ticks"], 0
+        )
+        # The summary tracks the outage: on battery at t=14,
+        # dark at t=20, rebooting at t=35, back at t=40 with
+        # 25 dark ticks behind it.
+        self.assertEqual(
+            snaps[13]["power_outage"]["beds_on_battery"], 1
+        )
+        self.assertEqual(snaps[13]["power_outage"]["beds_dark"], 0)
+        self.assertEqual(snaps[19]["power_outage"]["beds_dark"], 1)
+        self.assertEqual(snaps[19]["power_outage"]["dark_ticks"], 6)
+        self.assertEqual(
+            snaps[34]["power_outage"]["beds_rebooting"], 1
+        )
+        self.assertEqual(snaps[34]["power_outage"]["beds_dark"], 1)
+        self.assertEqual(snaps[39]["power_outage"]["beds_dark"], 0)
+        self.assertEqual(snaps[39]["power_outage"]["dark_ticks"], 25)
+        # The per-bed detail: battery deadline and reboot time.
+        detail = snaps[13]["power_outage"]["beds"][0]
+        self.assertTrue(detail["outage_active"])
+        self.assertEqual(detail["outage_until"], 35.0)
+        self.assertEqual(detail["battery_until"], 15.0)
+        self.assertTrue(detail["on_battery"])
+        self.assertFalse(detail["dark"])
+        detail = snaps[34]["power_outage"]["beds"][0]
+        self.assertFalse(detail["outage_active"])
+        self.assertIsNone(detail["outage_until"])
+        self.assertTrue(detail["dark"])
+        self.assertTrue(detail["rebooting"])
+        self.assertEqual(detail["reboot_until"], 40.0)
+        self.assertEqual(detail["dark_ticks"], 21)
+
+    def test_no_reboot_delay_comes_straight_back(self):
+        ward = Ward(
+            beds=1,
+            profiles=["stable"],
+            chaos=[
+                ChaosEvent(
+                    "power_outage",
+                    at=5,
+                    duration=30,
+                    power={"battery_s": 10.0},
+                )
+            ],
+            seed=42,
+        )
+        snaps = [ward.tick() for _ in range(36)]
+        # Dark at t=34, back on mains the tick power returns.
+        self.assertFalse(snaps[33]["beds"][0]["online"])
+        self.assertTrue(snaps[34]["beds"][0]["online"])
+        self.assertFalse(snaps[34]["beds"][0]["on_battery"])
+        self.assertEqual(
+            snaps[34]["power_outage"]["beds"][0]["dark_ticks"], 20
+        )
+
+    def test_alarms_and_news2_freeze_while_dark(self):
+        ward = self._outage_ward()
+        snaps = [ward.tick() for _ in range(40)]
+        # The NEWS2 history has a hole where the monitor was
+        # dark: scored at t=14, then nothing until t=40.
+        ts = [e["t"] for e in ward.monitors[0].news2_history]
+        self.assertEqual(ts[:14], [float(t) for t in range(1, 15)])
+        self.assertEqual(ts[14], 40.0)
+        self.assertEqual(
+            max(b - a for a, b in zip(ts, ts[1:])), 26.0
+        )
+        # And the vitals kept walking while nobody could see
+        # them: the reading at t=40 is not the one from t=14.
+        self.assertNotEqual(
+            snaps[39]["beds"][0]["spo2"], snaps[13]["beds"][0]["spo2"]
+        )
+
+    def test_dark_is_deterministic(self):
+        snaps_a = [self._outage_ward().tick() for _ in range(40)]
+        snaps_b = [self._outage_ward().tick() for _ in range(40)]
+        self.assertEqual(snaps_a, snaps_b)
+
+    def test_dark_resets_on_new_admission(self):
+        ward = Ward(
+            beds=1,
+            profiles=["stable"],
+            chaos=[
+                ChaosEvent(
+                    "power_outage",
+                    at=5,
+                    duration=30,
+                    power=self.POWER,
+                )
+            ],
+            seed=42,
+            cleaning_s=1.0,
+        )
+        for _ in range(20):
+            ward.tick()
+        self.assertEqual(ward.monitors[0].power_dark_ticks, 6)
+        # Discharged while dark, cleaned, and re-admitted — the
+        # new patient starts with a live monitor and a fresh
+        # dark count.
+        ward.discharge(0)
+        ward.tick()
+        ward.admit(0, profile="stable")
+        self.assertEqual(ward.monitors[0].power_dark_ticks, 0)
+        self.assertFalse(ward.monitors[0].power_went_dark)
+        # The outage is still active and the battery deadline
+        # never moved — the UPS does not recharge because the
+        # patient changed — so the new patient goes dark again
+        # on the next tick.
+        self.assertEqual(
+            ward.tick()["beds"][0],
+            {"bed": 0, "online": False, "t": 22.0, "power_dark": True},
+        )
+        self.assertEqual(ward.monitors[0].power_dark_ticks, 1)
+
+    def test_power_outage_summary_and_endpoint(self):
+        ward = self._outage_ward()
+        snaps = [ward.tick() for _ in range(40)]
+        summary = snaps[39]["power_outage"]
+        self.assertEqual(summary["beds_on_battery"], 0)
+        self.assertEqual(summary["beds_dark"], 0)
+        self.assertEqual(summary["dark_ticks"], 25)
+        self.assertEqual(summary["beds"][0]["dark_ticks"], 25)
+        server, port = serve_in_thread(ward)
+        try:
+            status, body = get(port, "/power-outage")
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                json.loads(body)["dark_ticks"], 25
+            )
+            self.assertEqual(
+                json.loads(body)["beds"][0]["dark_ticks"], 25
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_summary_reports_power_outage(self):
+        ward = self._outage_ward()
+        path = os.path.join(tempfile.mkdtemp(), "run.jsonl")
+        with Recorder(path, ward.beds, ward.rate_hz, seed=42) as rec:
+            ward.recorder = rec
+            for _ in range(40):
+                ward.tick()
+        summary = summarize(path)
+        self.assertEqual(
+            summary["power_outage"],
+            {
+                "beds_on_battery": 0,
+                "beds_dark": 0,
+                "beds_rebooting": 0,
+                "beds": {"0": 25},
+                "dark_ticks": 25,
+            },
+        )
+
+    def test_scenario_file_loads_and_runs(self):
+        cfg = load_scenario("scenarios/power-outage.json")
+        self.assertEqual(len(cfg["chaos"]), 1)
+        self.assertEqual(cfg["chaos"][0].type, "power_outage")
+        self.assertEqual(cfg["chaos"][0].power, self.POWER)
+        ward = build_ward(cfg, seed=42)
+        snaps = [ward.tick() for _ in range(70)]
+        # Ward-wide, so every bed runs on battery from t=5 and
+        # goes dark at t=15, and all three are back at t=40.
+        self.assertTrue(
+            all(s["beds"][b]["on_battery"] for s in snaps[4:14] for b in range(3))
+        )
+        self.assertTrue(
+            all(
+                not s["beds"][b]["online"] and s["beds"][b]["power_dark"]
+                for s in snaps[14:39]
+                for b in range(3)
+            )
+        )
+        self.assertTrue(
+            all(s["beds"][b]["online"] for s in snaps[39:] for b in range(3))
+        )
+        # 45 readings, 10 on battery, 25 dark ticks per bed.
+        for b in range(3):
+            online = sum(
+                1 for s in snaps if s["beds"][b].get("online", True)
+            )
+            battery = sum(
+                1 for s in snaps if s["beds"][b].get("on_battery")
+            )
+            self.assertEqual(online, 45)
+            self.assertEqual(battery, 10)
+            self.assertEqual(
+                snaps[69]["power_outage"]["beds"][b]["dark_ticks"], 25
+            )
+        self.assertEqual(snaps[69]["power_outage"]["dark_ticks"], 75)
+        # No alarm raised or cleared while the ward was dark:
+        # the hypoxic bed's low_spo2 episode cleared at 11 s,
+        # before the outage, and the next one raises at 60 s,
+        # after the monitors came back.
+        self.assertEqual(
+            [
+                (e["alarm"], e["raised_t"], e["cleared_t"])
+                for e in ward.monitors[2].alarm_history
+            ],
+            [
+                ("low_spo2", 1.0, 11.0),
+                ("low_spo2", 60.0, 62.0),
+                ("low_spo2", 63.0, 66.0),
+            ],
+        )
+        # Seeded, so a second run reproduces every tick.
+        ward2 = build_ward(cfg, seed=42)
+        snaps2 = [ward2.tick() for _ in range(70)]
+        self.assertEqual(snaps, snaps2)
+
+
 if __name__ == "__main__":
     unittest.main()
