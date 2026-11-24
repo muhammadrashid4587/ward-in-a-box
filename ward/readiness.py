@@ -22,8 +22,13 @@ for that bed (source ``"auto"``), so the patient is discharged
 ``lead_time_s`` later through the normal planning flow. One order
 per stay — a bed with a live order already in flight gets no
 second one, and a new patient admitted to the bed later gets a
-fresh order of their own. Off by default, so wards that do not
-ask for it behave exactly as before.
+fresh order of their own. The order is the ward's own call, so it
+is withdrawn when the reason for it goes away: the first tick the
+bed stops being discharge-ready, a live auto order is cancelled
+(manual and scheduled orders are never cancelled — they are a
+doctor's order), and the bed gets a fresh auto order when it flags
+ready again. Off by default, so wards that do not ask for it behave
+exactly as before.
 
 ``auto_order_lead_time_s`` overrides the lead time for those auto
 orders only: a ward that discharges a stable patient an hour after

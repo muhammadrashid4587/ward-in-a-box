@@ -847,10 +847,12 @@ patient stays in the bed, still monitored and still emitting
 vitals, until a slot frees up, and the delay is recorded — on the
 order, in the per-bed turnover totals, and in the ward totals.
 Every snapshot carries a `"discharge"` object with the orders
-(bed, ordered, expected, and actual times, status, delay, and
-where the order came from — `"source"`: `"manual"`, `"scheduled"`,
-or `"auto"`), how many were planned, discharged, delayed, and
-cancelled, and the total and mean delay, plus the cleaning capacity,
+(bed, ordered, expected, and actual times, status, delay, where
+the order came from — `"source"`: `"manual"`, `"scheduled"`,
+or `"auto"` — and, for a cancelled order, when it was withdrawn
+and why, `cancelled_t` and `cancel_reason`), how many were
+planned, discharged, delayed, and cancelled, and the total and
+mean delay, plus the cleaning capacity,
 how many beds are cleaning, and how many are awaiting a slot. The same
 summary is served by `GET /discharge` and carried in every
 WebSocket frame, and the run summary (`--summary`) reports the
@@ -905,16 +907,31 @@ backlog, so a backed-up roster delays an auto discharge like
 any other. One order per stay: a bed with a live order already
 in flight (planned or delayed, manual, scheduled, or auto) gets
 no second one, and a new patient admitted to the bed later gets
-a fresh order of their own. The per-bed readiness detail carries
+a fresh order of their own. An auto order is the ward's own call,
+so it is withdrawn when the reason for it goes away: the first
+tick its bed stops being discharge-ready — an alarm restarted
+the stability clock, or a dose became outstanding — a live auto
+order is cancelled (stamped with when and why, `cancelled_t`
+and `cancel_reason` `"not_ready"`, counted as `auto_cancelled`),
+and the bed gets a fresh auto order when it flags ready again.
+Manual and scheduled orders are never cancelled this way: they
+are a doctor's order, not the ward's. The per-bed readiness detail carries
 `"auto_ordered"` while such an order is live, and the run
 summary reports `auto_planned` alongside the discharge totals.
 Off by default, so wards that do not ask for it behave exactly
 as before. See `scenarios/discharge-auto-order.json` for a
 runnable example: over a seeded 40-tick run with a 5-second
-window and a 5-second lead time, beds 0 and 3 are quiet from
-admission and auto-discharge at 10 s, bed 1's dose lands at 30 s
-and it auto-discharges at 35 s, and bed 2 (missed insulin) never
-flags ready and gets no order — 3 auto orders, 3 discharges.
+window and a 5-second lead time, bed 0 is quiet from admission
+and auto-discharges at 10 s, bed 3 flags ready at 5 s but alarms
+at 8 s, so its auto order is cancelled and it never leaves, bed
+1's dose lands at 30 s and it auto-discharges at 35 s, and bed 2
+(missed insulin) never flags ready and gets no order — 3 auto
+orders, 2 discharges, 1 cancelled. See
+`scenarios/discharge-auto-order-cancel.json` for the
+cancellation-and-fresh-order case: the same ward with an alarm
+storm on bed 0 at 6 s, whose first alarm at 7 s cancels bed 0's
+order, and a fresh auto order at 16 s discharges it at 21 s —
+4 auto orders, 3 discharges, 1 cancelled.
 
 ## Discharge paperwork timing
 
@@ -937,9 +954,11 @@ goes: every snapshot, WebSocket frame, `GET /discharge`, and
 the run summary (`--summary`). See
 `scenarios/discharge-auto-order.json` for a runnable example:
 over a seeded 40-tick run every order is placed the tick its bed
-flags ready and every patient leaves 5 s after flagging, so the
-timing reports 3 measured orders, a mean ready-to-order time of
-0.0 s, and a mean and max ready-to-discharge time of 5.0 s.
+flags ready and every discharged patient leaves 5 s after
+flagging, so the timing reports 2 measured orders (bed 3's
+cancelled order is not measured — it never discharged), a mean
+ready-to-order time of 0.0 s, and a mean and max
+ready-to-discharge time of 5.0 s.
 
 ## Per-auto-order lead-time override
 
@@ -1667,24 +1686,29 @@ scenario flagging 3 of 4 beds ready over a seeded run.
 Auto-discharge-order tests cover an order raised the tick a bed
 is first flagged ready (with its source, ordered, and expected
 times, and the bed discharging when the lead time elapses), no
-order when the feature is off (the default), no second order
-when readiness returns after an alarm storm while the first
-order is still in flight, no auto order when a scheduled order
-already covers the bed, a fresh auto order for a new patient
-admitted to the same bed later, validation of the `auto_order`
-flag and the order `source`, the auto order and its count in
-snapshots, the `GET /discharge` endpoint (503 while
-partitioned), and the run summary, and the
-`discharge-auto-order.json` scenario raising 3 auto orders and
-discharging 3 beds over a seeded run. Discharge-timing tests cover
+order when the feature is off (the default), a live auto order
+cancelled the tick readiness is lost to an alarm storm — stamped
+with when and why — and a fresh auto order raised when readiness
+returns, a manual order left alone when readiness is lost,
+cancellation touching only live auto orders (planned or delayed,
+never manual, scheduled, or already discharged, and idempotent),
+the auto order and its count in snapshots, the `GET /discharge`
+endpoint (503 while partitioned), and the run summary, and the
+`discharge-auto-order.json` scenario raising 3 auto orders,
+discharging 2 beds and cancelling 1 over a seeded run, and the
+`discharge-auto-order-cancel.json` scenario cancelling one auto
+order in a storm and raising a fresh one when the bed is ready
+again. Discharge-timing tests cover
 an auto order measuring ready-to-order 0 s and ready-to-discharge
 equal to the lead time, a scheduled order placed before its bed
 was ready having no ready-to-order time but a measured
 ready-to-discharge time, a delayed discharge's ready-to-discharge
 time including the cleaning wait, an order for a bed that never
-flagged ready having no timing, the timing aggregates in the
+flagged ready having no timing, a cancelled order keeping no
+ready-to-discharge time and not counting among the measured
+orders, the timing aggregates in the
 snapshot and the run summary, and the
-`discharge-auto-order.json` scenario reporting 3 measured orders
+`discharge-auto-order.json` scenario reporting 2 measured orders
 with a mean ready-to-order time of 0.0 s and a mean and max
 ready-to-discharge time of 5.0 s. Per-auto-order lead-time tests
 cover an override shortening an auto order's lead time while the
@@ -2045,3 +2069,14 @@ run.
   summary carry the flip totals and the hook totals; off by default,
   configured per ward with `discharge_readiness_hooks` in the
   scenario) — done in v0.37.0
+- Readiness-driven cancellation of auto orders (when `auto_order`
+  is on, a live auto order is cancelled the first tick its bed
+  stops being discharge-ready — an alarm restarted the stability
+  clock, or a dose became outstanding — stamped with when it was
+  withdrawn and why (`cancelled_t`, `cancel_reason` `"not_ready"`,
+  counted as `auto_cancelled` in the discharge summary); manual
+  and scheduled orders are never cancelled this way, and a bed
+  whose auto order was cancelled gets a fresh one when it flags
+  ready again; every order now also records when and why it was
+  cancelled when the patient already left, `cancel_reason`
+  `"patient_left"`) — done in v0.38.0

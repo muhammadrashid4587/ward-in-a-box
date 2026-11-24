@@ -349,23 +349,32 @@ class Ward:
         # Discharge-readiness-driven workflow: when auto-ordering is
         # on, a bed flagged discharge-ready gets a discharge-planning
         # order at once — one per stay, never a second while a live
-        # order already covers the bed. Placed after the monitor loop
-        # so this tick's readiness already reflects the latest vitals
-        # and doses, and before the snapshot so the order is in it.
+        # order already covers the bed — and a bed that stops being
+        # ready has its live auto order cancelled, so the ward does
+        # not send home a patient who just deteriorated. Manual and
+        # scheduled orders are never cancelled here: they are a
+        # doctor's order, not the ward's. A cancelled auto order
+        # leaves the bed free to get a fresh one when it flags
+        # ready again. Placed after the monitor loop so this tick's
+        # readiness already reflects the latest vitals and doses,
+        # and before the snapshot so the order is in it.
         if self.readiness.auto_order:
             for m in self.monitors:
-                if (
-                    m.admitted
-                    and m.discharge_ready(
-                        self.elapsed, self.readiness.stable_window_s
-                    )
-                    and not self.discharge_planner.has_live_order(m.bed_id)
+                if not m.admitted:
+                    continue
+                if m.discharge_ready(
+                    self.elapsed, self.readiness.stable_window_s
                 ):
-                    self.discharge_planner.place_order(
-                        m.bed_id,
-                        self.elapsed,
-                        lead_time_s=self.readiness.auto_order_lead_time_s,
-                        source="auto",
+                    if not self.discharge_planner.has_live_order(m.bed_id):
+                        self.discharge_planner.place_order(
+                            m.bed_id,
+                            self.elapsed,
+                            lead_time_s=self.readiness.auto_order_lead_time_s,
+                            source="auto",
+                        )
+                else:
+                    self.discharge_planner.cancel_auto_orders(
+                        m.bed_id, self.elapsed
                     )
         snap = {"t": self.elapsed, "beds": readings, "staffing": self.staffing_summary(), "turnover": self.turnover_summary(), "meds": self.meds_summary(), "triage": self.triage_summary(), "arrivals": self.arrivals_summary(), "discharge": self.discharge_summary(), "discharge_readiness": self.readiness_summary(), "early_warning": self.early_warning_summary()}
         with self._lock:

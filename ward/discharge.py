@@ -13,6 +13,17 @@ monitored, until a cleaning slot frees up, and the delay is recorded
 on the order. An order for a bed whose patient already left (a chaos
 ``discharge`` event fired first, say) is cancelled, not forced.
 
+An auto order is the ward's own call, not a doctor's, so it is
+withdrawn when the reason for it goes away: a live auto order is
+cancelled the first tick its bed stops being discharge-ready — an
+alarm restarted the stability clock, or a dose became outstanding
+— while manual and scheduled orders stand, because a doctor's
+order is not the ward's to withdraw. A bed whose auto order was
+cancelled gets a fresh one when it flags ready again, through the
+normal one-live-order rule. Every cancellation is stamped on the
+order (``cancelled_t``, ``cancel_reason``) and counted in the
+summary (``auto_cancelled`` counts the auto ones).
+
 Paperwork timing: the planner also measures how long the discharge
 paperwork takes, from the moment a bed is first flagged
 discharge-ready — ``ready_t`` on the order — to the order being
@@ -94,9 +105,14 @@ class DischargePlanner:
         self._ready_since = {}
         # Placed orders: {"bed", "ordered_t", "expected_t", "status",
         # "actual_t", "delay_s", "ready_t", "ready_to_order_s",
-        # "ready_to_discharge_s"} — status is "planned" until the
-        # expected time, then "discharged", "delayed" (cleaning backed
-        # up, still waiting), or "cancelled" (patient already gone).
+        # "ready_to_discharge_s", "cancelled_t", "cancel_reason"} —
+        # status is "planned" until the expected time, then
+        # "discharged", "delayed" (cleaning backed up, still
+        # waiting), or "cancelled" (patient already gone, or — for
+        # an auto order — the bed stopped being discharge-ready).
+        # "cancelled_t" is when a cancelled order was withdrawn
+        # and "cancel_reason" why ("patient_left" or "not_ready");
+        # both are None for orders that were never cancelled.
         self.orders = []
 
     def place_order(self, bed, ordered_at, lead_time_s=None, source="manual"):
@@ -142,6 +158,10 @@ class DischargePlanner:
                 else None
             ),
             "ready_to_discharge_s": None,
+            # When a cancelled order was withdrawn and why; None
+            # for orders that were never cancelled.
+            "cancelled_t": None,
+            "cancel_reason": None,
         }
         self.orders.append(order)
         return order
@@ -201,6 +221,32 @@ class DischargePlanner:
             for o in self.orders
         )
 
+    def cancel_auto_orders(self, bed, now):
+        """Cancel ``bed``'s live auto orders at ``now``.
+
+        Only orders the ward raised itself — ``source`` "auto" —
+        are withdrawn, and only while they are still live
+        ("planned" or "delayed"). Manual and scheduled orders
+        are a doctor's order, not the ward's to withdraw, so
+        they are left alone. Each cancelled order is stamped
+        with when it was withdrawn and why (``"not_ready"``:
+        the bed stopped being discharge-ready). Returns the
+        orders cancelled, so the caller can see what changed.
+        """
+        now = round(now, 3)
+        cancelled = []
+        for order in self.orders:
+            if (
+                order["bed"] == bed
+                and order.get("source") == "auto"
+                and order["status"] in ("planned", "delayed")
+            ):
+                order["status"] = "cancelled"
+                order["cancelled_t"] = now
+                order["cancel_reason"] = "not_ready"
+                cancelled.append(order)
+        return cancelled
+
     def tick(self, now, ward):
         """Place due scheduled orders and execute due ones.
 
@@ -233,6 +279,8 @@ class DischargePlanner:
                 order["status"] = "delayed"
             else:
                 order["status"] = "cancelled"
+                order["cancelled_t"] = now
+                order["cancel_reason"] = "patient_left"
 
     def complete(self, bed, now):
         """Mark a delayed order for ``bed`` discharged at ``now``.
@@ -307,6 +355,12 @@ class DischargePlanner:
             "delayed": len(delayed),
             "cancelled": sum(
                 1 for o in self.orders if o["status"] == "cancelled"
+            ),
+            "auto_cancelled": sum(
+                1
+                for o in self.orders
+                if o["status"] == "cancelled"
+                and o.get("source") == "auto"
             ),
             "pending": sum(
                 1

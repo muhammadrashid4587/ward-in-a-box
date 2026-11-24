@@ -79,8 +79,9 @@ def summarize(path):
     the run's load shape over the day is visible, and boarding-full
     alarm episodes — and discharge
     totals from the last tick: planned discharges, how many landed,
-    how many were delayed by a backed-up cleaning roster, and the
-    total delay — and discharge-readiness totals from the last tick:
+    how many were delayed by a backed-up cleaning roster, how many
+    auto orders were cancelled when a bed stopped being ready,
+    and the total delay — and discharge-readiness totals from the last tick:
     how many occupied beds are flagged ready and how many are not,
     how many times the readiness flag flipped this run, and whether
     the discharge-readiness hooks are configured and how many hook
@@ -257,9 +258,11 @@ def summarize(path):
         # how many landed, how many were delayed waiting for a
         # cleaning slot, and the total delay — and how many of the
         # planned orders the ward raised automatically when a bed
-        # was flagged discharge-ready — and the paperwork timing:
-        # how long, on average, from a bed being flagged ready to
-        # the order and to the patient leaving.
+        # was flagged discharge-ready, and how many of those auto
+        # orders were cancelled when a bed stopped being ready —
+        # and the paperwork timing: how long, on average, from a
+        # bed being flagged ready to the order and to the patient
+        # leaving.
         "discharge": (
             {
                 "planned": last_discharge["planned"],
@@ -267,6 +270,7 @@ def summarize(path):
                 "discharged": last_discharge["discharged"],
                 "delayed": last_discharge["delayed"],
                 "cancelled": last_discharge["cancelled"],
+                "auto_cancelled": last_discharge.get("auto_cancelled", 0),
                 "total_delay_s": last_discharge["total_delay_s"],
                 "mean_delay_s": last_discharge["mean_delay_s"],
                 "timing": last_discharge.get(

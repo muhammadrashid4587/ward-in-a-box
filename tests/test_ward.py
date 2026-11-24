@@ -3124,7 +3124,7 @@ class TestAutoDischargeOrders(unittest.TestCase):
             ward.readiness_summary()["beds"][0]["auto_ordered"]
         )
 
-    def test_auto_order_not_raised_twice_after_readiness_returns(self):
+    def test_auto_order_cancelled_when_readiness_lost_then_raised_again(self):
         ward = self._ward(
             discharge_readiness={"stable_window_s": 5, "auto_order": True},
             chaos=[ChaosEvent("alarm_storm", 10, 5, bed=0)],
@@ -3135,14 +3135,80 @@ class TestAutoDischargeOrders(unittest.TestCase):
         self.assertEqual(ward.discharge_summary()["planned"], 1)
         for _ in range(15):
             snap = ward.tick()
-        # The storm (t=10..15) took readiness away; it is back by
-        # t=20, but the live order is still in flight, so no second
-        # order is raised.
+        # The storm (t=10..15) took readiness away: the first
+        # alarm at t=11 cancelled the live auto order, and when
+        # readiness came back at t=20 a fresh auto order was
+        # raised for the same stay — the ward does not send home
+        # a patient who just deteriorated, and it does not leave
+        # the bed without an order once they are ready again.
         self.assertTrue(snap["beds"][0]["discharge_ready"])
         summary = ward.discharge_summary()
+        self.assertEqual(summary["planned"], 2)
+        self.assertEqual(summary["auto_planned"], 2)
+        self.assertEqual(summary["cancelled"], 1)
+        self.assertEqual(summary["auto_cancelled"], 1)
+        first, second = summary["orders"]
+        self.assertEqual(first["ordered_t"], 5.0)
+        self.assertEqual(first["status"], "cancelled")
+        self.assertEqual(first["cancelled_t"], 11.0)
+        self.assertEqual(first["cancel_reason"], "not_ready")
+        self.assertEqual(second["ordered_t"], 20.0)
+        self.assertEqual(second["status"], "planned")
+        self.assertIsNone(second["cancelled_t"])
+        self.assertIsNone(second["cancel_reason"])
+
+    def test_manual_order_not_cancelled_when_readiness_lost(self):
+        ward = self._ward(
+            discharge_readiness={"stable_window_s": 5, "auto_order": True},
+            discharge_planning={"lead_time_s": 3600},
+            chaos=[ChaosEvent("alarm_storm", 10, 5, bed=0)],
+        )
+        # A doctor's order covers the bed, so no auto order is
+        # raised for it — and the storm taking readiness away
+        # must not withdraw it either.
+        ward.discharge_planner.place_order(0, 1.0, source="manual")
+        for _ in range(20):
+            ward.tick()
+        summary = ward.discharge_summary()
         self.assertEqual(summary["planned"], 1)
-        self.assertEqual(summary["auto_planned"], 1)
-        self.assertEqual(summary["orders"][0]["ordered_t"], 5.0)
+        self.assertEqual(summary["auto_planned"], 0)
+        self.assertEqual(summary["cancelled"], 0)
+        self.assertEqual(summary["auto_cancelled"], 0)
+        order = summary["orders"][0]
+        self.assertEqual(order["source"], "manual")
+        self.assertEqual(order["status"], "planned")
+        self.assertIsNone(order["cancelled_t"])
+
+    def test_cancel_auto_orders_only_touches_live_auto_orders(self):
+        planner = DischargePlanner(lead_time_s=3600)
+        auto = planner.place_order(0, 1.0, source="auto")
+        manual = planner.place_order(0, 2.0, source="manual")
+        scheduled = planner.place_order(1, 3.0, source="scheduled")
+        # A delayed auto order — the cleaning roster was full
+        # when its time came — is still live, so it is withdrawn
+        # too; a discharged one is history, not live.
+        delayed = planner.place_order(2, 4.0, source="auto")
+        delayed["status"] = "delayed"
+        done = planner.place_order(3, 5.0, source="auto")
+        done["status"] = "discharged"
+        cancelled = planner.cancel_auto_orders(0, 6.0)
+        self.assertEqual(cancelled, [auto])
+        self.assertEqual(auto["status"], "cancelled")
+        self.assertEqual(auto["cancelled_t"], 6.0)
+        self.assertEqual(auto["cancel_reason"], "not_ready")
+        self.assertEqual(manual["status"], "planned")
+        self.assertEqual(scheduled["status"], "planned")
+        self.assertIsNone(manual["cancelled_t"])
+        cancelled = planner.cancel_auto_orders(2, 7.0)
+        self.assertEqual(cancelled, [delayed])
+        self.assertEqual(delayed["cancelled_t"], 7.0)
+        self.assertEqual(done["status"], "discharged")
+        # Cancelling again finds nothing live to withdraw.
+        self.assertEqual(planner.cancel_auto_orders(0, 8.0), [])
+        self.assertEqual(planner.cancel_auto_orders(2, 8.0), [])
+        summary = planner.summary(8.0)
+        self.assertEqual(summary["cancelled"], 2)
+        self.assertEqual(summary["auto_cancelled"], 2)
 
     def test_auto_order_skipped_when_order_already_exists(self):
         ward = self._ward(
@@ -3240,24 +3306,68 @@ class TestAutoDischargeOrders(unittest.TestCase):
         summary = ward.discharge_summary()
         self.assertEqual(summary["planned"], 3)
         self.assertEqual(summary["auto_planned"], 3)
-        self.assertEqual(summary["discharged"], 3)
+        self.assertEqual(summary["discharged"], 2)
         self.assertEqual(summary["delayed"], 0)
-        self.assertEqual(summary["cancelled"], 0)
+        self.assertEqual(summary["cancelled"], 1)
+        self.assertEqual(summary["auto_cancelled"], 1)
         orders = summary["orders"]
-        # Beds 0 and 3 are quiet from admission: ready at 5 s, gone
-        # at 10 s. Bed 1's dose lands at 30 s: ready then, gone at
+        # Bed 0 is quiet from admission: ready at 5 s, gone at
+        # 10 s. Bed 3 flags ready at 5 s and gets its auto order,
+        # then alarms at 8 s — readiness lost, so the order is
+        # cancelled, and the bed never flags ready again in the
+        # run. Bed 1's dose lands at 30 s: ready then, gone at
         # 35 s. Bed 2's insulin missed, so it never flags ready and
         # never gets an order.
         self.assertEqual(
             [
                 (o["bed"], o["ordered_t"], o["expected_t"], o["status"],
-                 o["source"])
+                 o["source"], o["cancelled_t"], o["cancel_reason"])
                 for o in orders
             ],
             [
-                (0, 5.0, 10.0, "discharged", "auto"),
-                (3, 5.0, 10.0, "discharged", "auto"),
-                (1, 30.0, 35.0, "discharged", "auto"),
+                (0, 5.0, 10.0, "discharged", "auto", None, None),
+                (3, 5.0, 10.0, "cancelled", "auto", 8.0, "not_ready"),
+                (1, 30.0, 35.0, "discharged", "auto", None, None),
+            ],
+        )
+
+    def test_scenario_discharge_auto_order_cancel(self):
+        cfg = load_scenario(
+            os.path.join(
+                HERE, "..", "scenarios", "discharge-auto-order-cancel.json"
+            )
+        )
+        self.assertTrue(cfg["discharge_readiness"].auto_order)
+        ward = build_ward(cfg, seed=42)
+        for _ in range(40):
+            ward.tick()
+        summary = ward.discharge_summary()
+        self.assertEqual(summary["planned"], 4)
+        self.assertEqual(summary["auto_planned"], 4)
+        self.assertEqual(summary["discharged"], 3)
+        self.assertEqual(summary["delayed"], 0)
+        self.assertEqual(summary["cancelled"], 1)
+        self.assertEqual(summary["auto_cancelled"], 1)
+        orders = summary["orders"]
+        # Bed 0 is quiet from admission: ready at 5 s, an auto
+        # order raised — then the storm's first alarm at 7 s
+        # takes readiness away and cancels it, and when the bed
+        # is ready again at 16 s a fresh auto order is raised,
+        # discharging at 21 s. Bed 3 is quiet from admission and
+        # auto-discharges at 10 s. Bed 1's dose lands at 30 s:
+        # ready then, gone at 35 s. Bed 2's insulin missed, so it
+        # never flags ready and never gets an order.
+        self.assertEqual(
+            [
+                (o["bed"], o["ordered_t"], o["expected_t"], o["status"],
+                 o["source"], o["cancelled_t"], o["cancel_reason"])
+                for o in orders
+            ],
+            [
+                (0, 5.0, 10.0, "cancelled", "auto", 7.0, "not_ready"),
+                (3, 5.0, 10.0, "discharged", "auto", None, None),
+                (0, 16.0, 21.0, "discharged", "auto", None, None),
+                (1, 30.0, 35.0, "discharged", "auto", None, None),
             ],
         )
 
@@ -3277,7 +3387,9 @@ class TestAutoDischargeOrders(unittest.TestCase):
             summary = summarize(path)
             self.assertEqual(summary["discharge"]["planned"], 3)
             self.assertEqual(summary["discharge"]["auto_planned"], 3)
-            self.assertEqual(summary["discharge"]["discharged"], 3)
+            self.assertEqual(summary["discharge"]["discharged"], 2)
+            self.assertEqual(summary["discharge"]["cancelled"], 1)
+            self.assertEqual(summary["discharge"]["auto_cancelled"], 1)
             self.assertEqual(summary["discharge"]["total_delay_s"], 0.0)
         finally:
             os.unlink(path)
@@ -3556,22 +3668,24 @@ class TestDischargeTiming(unittest.TestCase):
         for _ in range(40):
             ward.tick()
         summary = ward.discharge_summary()
-        # Beds 0 and 3 ready at 5 s and gone at 10 s, bed 1 ready at
-        # 30 s and gone at 35 s: every order placed the tick its bed
-        # flagged ready, every patient out 5 s after flagging.
+        # Beds 0 and 3 ready at 5 s; bed 0 gone at 10 s, bed 1
+        # ready at 30 s and gone at 35 s. Bed 3 alarms at 8 s,
+        # so its auto order is cancelled and it never discharges:
+        # its ready-to-discharge time stays empty and it is not
+        # counted among the measured orders.
         self.assertEqual(
             [(o["bed"], o["ready_t"], o["ready_to_order_s"],
               o["ready_to_discharge_s"]) for o in summary["orders"]],
             [
                 (0, 5.0, 0.0, 5.0),
-                (3, 5.0, 0.0, 5.0),
+                (3, 5.0, 0.0, None),
                 (1, 30.0, 0.0, 5.0),
             ],
         )
         self.assertEqual(
             summary["timing"],
             {
-                "measured": 3,
+                "measured": 2,
                 "mean_ready_to_order_s": 0.0,
                 "mean_ready_to_discharge_s": 5.0,
                 "max_ready_to_discharge_s": 5.0,
@@ -3595,7 +3709,7 @@ class TestDischargeTiming(unittest.TestCase):
             self.assertEqual(
                 summary["discharge"]["timing"],
                 {
-                    "measured": 3,
+                    "measured": 2,
                     "mean_ready_to_order_s": 0.0,
                     "mean_ready_to_discharge_s": 5.0,
                     "max_ready_to_discharge_s": 5.0,
