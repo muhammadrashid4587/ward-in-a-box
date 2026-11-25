@@ -8,8 +8,10 @@ A pure Python 3 (stdlib only) simulator of a small ward — 12 beds by
 default, each with a virtual monitor emitting vitals (heart rate, SpO2,
 blood pressure, temperature, respiratory rate) at a configurable rate.
 A chaos engine injects the failures real ward software has to survive:
-device dropout, alarm storms, stale readings, and network partitions
-between the ward and the server. An HTTP endpoint streams the vitals as
+device dropout, alarm storms, stale readings, network partitions
+between the ward and the server, and network outages that cut the
+link to the central station while the monitors keep recording
+locally. An HTTP endpoint streams the vitals as
 JSON lines so real health software can be tested against it, and a small
 CLI runs a scenario file.
 
@@ -243,6 +245,13 @@ python3 -m ward.cli scenarios/news2-response.json --seed 42
 # 40 s at a mean of 30.0 s, against 0 without the escalation
 python3 -m ward.cli scenarios/news2-staffing-escalation.json --seed 42
 
+# Network outage: the link to the central station is down
+# from 5 s to 35 s — every bed buffers 30 readings in a
+# 10-reading backlog (20 dropped a bed) and syncs 10 a bed at
+# 35 s, while the hypoxic bed's alarm storm raises 5 alarms
+# that never reach the dashboard until the sync
+python3 -m ward.cli scenarios/network-outage.json --seed 42
+
 # Reproducible run
 python3 -m ward.cli scenarios/example.json --seed 42
 ```
@@ -315,6 +324,11 @@ python3 -m ward.cli scenarios/example.json --seed 42
   battery, dark, or rebooting, and how many ticks each bed has
   been dark, as JSON
   (503 while partitioned)
+- `GET /network-outage` — per-bed network-outage state: whether
+  the link to the central station is down, when it returns, how
+  many readings are buffered locally, and this stay's buffered /
+  synced / dropped counts and undelivered alarms, as JSON
+  (503 while partitioned)
 
 A reading looks like:
 
@@ -350,8 +364,9 @@ summary from `/discharge-priority`, the early-warning
 summary from `/news2`, and the sensor-drift summary from
 `/sensor-drift`, the bed-blocker summary from
 `/bed-blocker`, and the oxygen-outage summary from
-`/oxygen-outage`, and the power-outage summary from
-`/power-outage`, so a client gets bed occupancy, vitals, alarms, staffing,
+`/oxygen-outage`, the power-outage summary from
+`/power-outage`, and the network-outage summary from
+`/network-outage`, so a client gets bed occupancy, vitals, alarms, staffing,
 medication, and the intake queue in one message. Ping frames are answered with pong, close frames
 are echoed and the connection is then closed; text frames from the
 client are accepted and ignored — the ward pushes ticks, it takes no
@@ -484,6 +499,15 @@ Chaos types:
   clear — until power returns and it has rebooted. The patient is
   untouched: their vitals keep walking, unseen; see Power outage
   below.
+- `network_outage` — the ward's link to the central station /
+  EHR fails for `duration` seconds; takes an optional
+  `"network"` map with `"backlog_cap"` (how many readings a
+  monitor buffers locally while down, per bed, default 300).
+  While it is active the monitors keep taking readings —
+  flagged `"delivered": false` and buffered in a per-bed
+  backlog, the oldest dropping off when the cap fills — and
+  alarms raised while down never reach the dashboard; on
+  recovery the backlog syncs at once. See Network outage below.
 
 `bed` targets one bed, `beds` targets several, neither targets all beds
 (`partition` is always ward-wide). Times are elapsed seconds from start.
@@ -962,6 +986,60 @@ ticks across the ward — and no alarm raises or clears while the
 ward is dark: the hypoxic bed's low_spo2 episode cleared at
 11 s, before the outage, and the next one raises at 60 s, after
 the monitors came back.
+
+## Network outage
+
+A `network_outage` chaos event cuts the ward's link to the
+central station / EHR for a window — a dead switch, a cut
+cable, a failed VPN — so the bedside monitors cannot report
+their readings:
+
+```json
+{"type": "network_outage", "at": 5, "duration": 30,
+ "network": {"backlog_cap": 10}}
+```
+
+While the outage is active, a monitor keeps taking readings —
+the vitals keep walking, the alarms keep raising locally, the
+NEWS2 score keeps being computed — but none of it reaches the
+central station: every reading is flagged `"delivered": false`
+and buffered in a per-bed backlog, and every alarm raised
+while the link is down counts as undelivered instead of
+reaching the dashboard. The backlog is the monitor's local
+store, capped at `backlog_cap` readings a bed (300 by default,
+ten minutes at 1 Hz): when it fills, the oldest buffered
+reading drops off and the drop is counted, so a long outage
+loses readings instead of growing without bound. On recovery
+the backlog syncs at once — the buffered readings and the
+undelivered alarms are delivered on the first tick after the
+outage ends, the backlog empties, and readings are delivered
+live again. Without `bed`/`beds` the outage is ward-wide, like
+a partition: the link serves the whole ward. A stale reading
+never grows the backlog — it is a repeat, not a new reading —
+and a new admission starts with an empty backlog and fresh
+counters, though an outage still running starts buffering the
+new patient again from zero on the next tick. Every reading
+carries whether it was delivered (`"delivered"`), every
+snapshot carries a `"network_outage"` object with the per-bed
+outage state — whether the link is down, when it returns, how
+many readings are buffered, and this stay's buffered / synced /
+dropped counts and undelivered alarms — and ward totals (how
+many beds are down, the backlog across the ward, and the
+buffered, synced, dropped, and alarm totals), served on its own
+by `GET /network-outage` and carried in every WebSocket frame,
+and the run summary (`--summary`) reports the same totals from
+the last tick. One honest limitation: the sync is instant, not
+rate-limited — a real EHR backfill would trickle the backlog in
+over minutes, but here the whole buffer lands on the first tick
+after the link returns. See `scenarios/network-outage.json`
+for a runnable example: over a seeded 70-tick run every bed's
+link is down from 5 s to 35 s, each bed buffers 30 readings,
+its 10-reading backlog holding the last 10 and dropping 20,
+and at 35 s the backlog syncs — 10 readings a bed, 30 across
+the ward — and readings are delivered live again; the hypoxic
+bed's alarm storm at 10 s raises 4 storm alarms, and a
+low_spo2 at 33 s makes 5 alarms undelivered until the sync,
+while the stable beds raise none.
 
 ## Power-outage hooks
 
@@ -2261,7 +2339,7 @@ endpoints returned 503 while it lasted, the ticks did not stop.
 make test
 ```
 
-387 tests: vitals stay inside plausible ranges, dropout actually stops a
+454 tests: vitals stay inside plausible ranges, dropout actually stops a
 monitor's stream, an alarm storm produces alarms, stale readings freeze,
 a partition blocks the snapshot endpoint, the HTTP endpoints serve valid
 JSON, the stream serves JSON lines, scenario files validate, alarm
@@ -2575,7 +2653,23 @@ with the tick completing and the failure counted, a webhook POST
 reaching a local stub server with the event payloads as JSON, and
 the `oxygen-outage-hooks.json` scenario POSTing all 4 events to
 a stub server with the run summary carrying the event count and
-the hook totals.
+the hook totals. Network-outage tests cover validation of the
+network config (including the default 300-reading cap and bad
+caps), readings flagged undelivered and buffered while the link
+is down, the backlog cap dropping the oldest readings (the last
+10 of 30 buffered with a cap of 10), the backlog syncing at once
+on the first tick after the outage ends, alarms raised while
+down counting as undelivered and syncing with the backlog, a
+bed the outage does not target keeping on delivering, a seeded
+run reproducing exactly, a new admission starting with an empty
+backlog and fresh counters while an outage still running buffers
+the new patient again, the network-outage summary in snapshots,
+the `GET /network-outage` endpoint (200, and 503 while
+partitioned) and WebSocket frames, the run summary carrying the
+network-outage totals, and the `network-outage.json` scenario
+buffering 30 readings a bed, dropping 20 a bed, syncing 10 a
+bed at 35 s, and delivering 5 undelivered alarms from the
+hypoxic bed over a seeded run.
 
 ## Roadmap
 
@@ -2975,3 +3069,15 @@ the hook totals.
   frame, a `GET /bed-blocker` endpoint, and the run summary;
   off by default, configured per ward with
   `bed_blocker_hooks` in the scenario) — done in v0.53.0
+- Network outage (a `network_outage` chaos event cuts the
+  ward's link to the central station / EHR for a window, so the
+  monitors keep taking readings — flagged `"delivered": false`
+  and buffered in a per-bed backlog capped at `backlog_cap`
+  readings, the oldest dropping off when it fills — and alarms
+  raised while down count as undelivered instead of reaching
+  the dashboard, and on recovery the backlog syncs at once: the
+  buffered readings and the undelivered alarms are delivered on
+  the first tick after the outage ends; the outage state rides
+  in every reading, a `"network_outage"` object in every
+  snapshot, WebSocket frame, a `GET /network-outage` endpoint,
+  and the run summary) — done in v0.54.0

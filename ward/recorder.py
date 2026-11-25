@@ -115,7 +115,12 @@ def summarize(path):
     largest loss on any bed — and power-outage totals from the
     last tick: how many monitors are on battery, how many have
     gone dark, how many are rebooting, each dark bed's dark
-    ticks, and the ward's total dark ticks — and medication totals from the last tick:
+    ticks, and the ward's total dark ticks — and network-outage
+    totals from the last tick: how many beds have their link
+    down, how many readings are buffered locally waiting to
+    sync, how many were buffered, synced, and dropped, and how
+    many alarms raised while down are still undelivered and how
+    many have since synced — and medication totals from the last tick:
     doses given, late, missed, and skipped for a stockout, and
     whether the missed-dose hooks are configured and how many hook
     deliveries were invoked and failed — and staffing totals from
@@ -143,6 +148,7 @@ def summarize(path):
     last_bed_blocker = None
     last_oxygen_outage = None
     last_power_outage = None
+    last_network_outage = None
     with open(path) as f:
         for line in f:
             line = line.strip()
@@ -210,6 +216,8 @@ def summarize(path):
                 last_oxygen_outage = obj["oxygen_outage"]
             if isinstance(obj.get("power_outage"), dict):
                 last_power_outage = obj["power_outage"]
+            if isinstance(obj.get("network_outage"), dict):
+                last_network_outage = obj["network_outage"]
             for bed in obj["beds"]:
                 b = bed["bed"]
                 if not bed.get("online", True):
@@ -679,6 +687,33 @@ def summarize(path):
                 ),
             }
             if last_staffing is not None
+            else None
+        ),
+        # Network-outage totals from the last tick: how many
+        # beds have their link down, how many readings are
+        # buffered locally waiting to sync, how many were
+        # buffered, synced, and dropped over the run, and how
+        # many alarms raised while down are still undelivered
+        # and how many have since synced — so a run's cut-off
+        # link is visible without replaying every tick.
+        "network_outage": (
+            {
+                "beds_down": last_network_outage["beds_down"],
+                "backlog": last_network_outage["backlog"],
+                "buffered": last_network_outage["buffered"],
+                "synced": last_network_outage["synced"],
+                "dropped": last_network_outage["dropped"],
+                "alarms_undelivered": last_network_outage[
+                    "alarms_undelivered"
+                ],
+                "alarms_synced": last_network_outage["alarms_synced"],
+                "beds": {
+                    str(b["bed"]): b["backlog"]
+                    for b in last_network_outage["beds"]
+                    if b["backlog"] > 0
+                },
+            }
+            if last_network_outage is not None
             else None
         ),
     }

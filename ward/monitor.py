@@ -9,6 +9,7 @@ from .alert_hooks import (
     validate_missed_dose_hooks,
     validate_trend_alert_hooks,
 )
+from .chaos import DEFAULT_NETWORK_BACKLOG_CAP
 from .meds import MedSchedule
 from .news2 import (
     ACVPU_LEVELS,
@@ -175,6 +176,35 @@ class Monitor:
         self.power_outage_since = None
         self.power_went_dark = False
         self.power_dark_ticks = 0
+        # Network outage: the link to the central station / EHR
+        # is down until ``network_outage_until`` (elapsed
+        # seconds), with ``network_outage_cfg`` carrying the
+        # event's backlog cap. While it is down the monitor keeps
+        # taking readings, but they are not delivered: each fresh
+        # reading is buffered in ``network_backlog`` — the reading
+        # dicts themselves, oldest first, bounded by the cap, so
+        # a long outage drops the oldest instead of growing
+        # without bound (counted in ``network_dropped``) — and
+        # flagged ``delivered: False`` in the reading, and alarms
+        # raised while down count in
+        # ``network_alarms_undelivered`` instead of reaching the
+        # dashboard. When the link returns the backlog syncs at
+        # once: the buffered readings and the undelivered alarms
+        # move to ``network_synced`` and
+        # ``network_alarms_synced`` and the backlog empties. The
+        # counters are per stay: a new admission starts with an
+        # empty backlog — the previous stay's undelivered readings
+        # are discarded with it — but the outage deadline is
+        # unchanged, so an outage still running starts buffering
+        # the new patient again from zero on the next tick.
+        self.network_outage_until = None
+        self.network_outage_cfg = None
+        self.network_backlog = deque()
+        self.network_buffered = 0
+        self.network_synced = 0
+        self.network_dropped = 0
+        self.network_alarms_undelivered = 0
+        self.network_alarms_synced = 0
         self.seq = 0
         # False until the ward admits this bed (scenario timeline); an
         # unadmitted bed emits no readings at all.
@@ -419,6 +449,100 @@ class Monitor:
             "dark_ticks": self.power_dark_ticks,
         }
 
+    def _network_down(self, now):
+        """True while a network-outage event holds this bed's link
+        to the central station down: its readings are taken
+        locally but not delivered."""
+        return (
+            self.network_outage_until is not None
+            and now < self.network_outage_until
+        )
+
+    def _sync_network_backlog(self, now):
+        """Sync the buffered readings when the link returns.
+
+        On the first tick after a network outage ends, the
+        buffered readings are delivered at once — the backlog
+        empties into ``network_synced`` — and the alarms raised
+        while down are delivered with them. A no-op with no
+        outage recorded or an outage still running, so an
+        overlapping event that extends the window never syncs
+        early. Runs at the top of the tick, so a monitor that is
+        dark, offline, or unadmitted still flushes its buffer
+        when the network returns: the buffer is local storage,
+        not a reading, and the link returning is what frees it.
+        """
+        if (
+            self.network_outage_until is None
+            or now < self.network_outage_until
+        ):
+            return
+        self.network_synced += len(self.network_backlog)
+        self.network_backlog.clear()
+        self.network_alarms_synced += self.network_alarms_undelivered
+        self.network_alarms_undelivered = 0
+        self.network_outage_until = None
+        self.network_outage_cfg = None
+
+    def _buffer_reading(self, reading):
+        """Buffer one fresh reading while the network is down.
+
+        The reading is already flagged ``delivered: False`` by
+        the caller. When the backlog is full the oldest buffered
+        reading drops off — the monitor's local store is finite —
+        and the drop is counted, so a long outage loses readings
+        instead of growing without bound. A shallow copy is
+        stored, so later ticks never rewrite a buffered reading.
+        """
+        cap = (
+            self.network_outage_cfg["backlog_cap"]
+            if self.network_outage_cfg is not None
+            else DEFAULT_NETWORK_BACKLOG_CAP
+        )
+        if len(self.network_backlog) >= cap:
+            self.network_backlog.popleft()
+            self.network_dropped += 1
+        self.network_backlog.append(dict(reading))
+        self.network_buffered += 1
+
+    def network_outage_detail(self, now):
+        """Per-bed network-outage state as plain JSON data.
+
+        ``outage_active`` is True while a network-outage event
+        holds this bed's link to the central station down, with
+        when it returns; ``backlog`` is how many readings are
+        buffered locally waiting to sync, ``backlog_cap`` the
+        most the monitor will hold; ``buffered`` / ``synced`` /
+        ``dropped`` are this stay's totals — readings buffered
+        while down, delivered on recovery, and lost when the
+        backlog filled — and ``alarms_undelivered`` /
+        ``alarms_synced`` are the alarms raised while down and
+        still waiting, and since delivered, so a client can tell
+        a bed whose readings are flowing from one whose data is
+        piling up locally, and how much of it the outage has
+        already cost.
+        """
+        active = self._network_down(now)
+        return {
+            "bed": self.bed_id,
+            "admitted": self.admitted,
+            "outage_active": active,
+            "outage_until": (
+                self.network_outage_until if active else None
+            ),
+            "backlog": len(self.network_backlog),
+            "backlog_cap": (
+                self.network_outage_cfg["backlog_cap"]
+                if self.network_outage_cfg is not None
+                else DEFAULT_NETWORK_BACKLOG_CAP
+            ),
+            "buffered": self.network_buffered,
+            "synced": self.network_synced,
+            "dropped": self.network_dropped,
+            "alarms_undelivered": self.network_alarms_undelivered,
+            "alarms_synced": self.network_alarms_synced,
+        }
+
     def bed_blocker_detail(self, now):
         """Per-bed bed-blocker state as plain JSON data.
 
@@ -605,6 +729,18 @@ class Monitor:
         self.oxygen_floor_hit = False
         self.power_went_dark = False
         self.power_dark_ticks = 0
+        # A new admission starts with an empty network backlog:
+        # the previous stay's undelivered readings are discarded
+        # with it, like the drift bias and the oxygen deficit.
+        # The outage deadline is unchanged — an outage still
+        # running starts buffering the new patient again from
+        # zero on the next tick.
+        self.network_backlog.clear()
+        self.network_buffered = 0
+        self.network_synced = 0
+        self.network_dropped = 0
+        self.network_alarms_undelivered = 0
+        self.network_alarms_synced = 0
         self.signs = initial_signs(self.profile, self.rng, self.acuity)
         self.seq = 0
         self.last_reading = None
@@ -755,6 +891,11 @@ class Monitor:
         }
 
     def tick(self, now, dt=1.0, load_factor=1.0):
+        # A network outage ending this tick flushes the buffer
+        # first, whatever else the monitor is doing: the link
+        # returning delivers the buffered readings even for a
+        # monitor that is dark, offline, or between patients.
+        self._sync_network_backlog(now)
         self.raised_this_tick = []
         if self.cleaning_until is not None and now >= self.cleaning_until:
             self.cleaning_until = None
@@ -803,6 +944,11 @@ class Monitor:
                 stale["stale"] = True
                 stale["t"] = round(now, 3)
                 stale["on_battery"] = on_battery
+                # A stale repeat is a re-transmission of the last
+                # reading, not a new one: it is delivered only if
+                # the link is up this tick, and it never grows the
+                # backlog — the original reading already did.
+                stale["delivered"] = not self._network_down(now)
                 self.last_reading = stale
                 return stale
             # No reading yet: fall through and generate one.
@@ -868,6 +1014,15 @@ class Monitor:
         reading["news2"] = score_signs(
             reported, self.on_oxygen, self.consciousness
         )
+        # A network outage buffers the reading instead of
+        # delivering it: the monitor keeps taking readings, but
+        # the central station does not see them until the link
+        # returns and the backlog syncs. The flag rides in the
+        # reading so a client watching the stream can tell a
+        # delivered reading from one that is only local.
+        reading["delivered"] = not self._network_down(now)
+        if not reading["delivered"]:
+            self._buffer_reading(reading)
         self._track_escalation(reading["news2"], now, load_factor)
         # This tick's score joins the bed's history, so a client can
         # see how the patient got here, not just where they are now.
@@ -967,6 +1122,11 @@ class Monitor:
                 {"alarm": name, "raised_t": now, "cleared_t": None}
             )
             self.total_raised += 1
+            if self._network_down(now):
+                # Raised while the link was down: the central
+                # dashboard never heard about it — the alarm
+                # waits with the buffered readings for the sync.
+                self.network_alarms_undelivered += 1
         for name in sorted(self._active_alarms - current):
             for event in reversed(self.alarm_history):
                 if event["alarm"] == name and event["cleared_t"] is None:

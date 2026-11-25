@@ -11596,5 +11596,355 @@ class TestPowerOutage(unittest.TestCase):
         self.assertEqual(snaps, snaps2)
 
 
+class TestNetworkOutage(unittest.TestCase):
+    # A network outage: the link to the central station is down
+    # from t=5 for 30 s, so the monitor keeps taking readings but
+    # they are not delivered — they buffer locally in a per-bed
+    # backlog, capped, and sync at once when the link returns.
+    # Alarms raised while down never reach the dashboard until
+    # the sync. A bed the outage does not target keeps
+    # delivering throughout.
+    NETWORK = {"backlog_cap": 10}
+
+    def _outage_ward(self):
+        return Ward(
+            beds=2,
+            profiles=["stable", "stable"],
+            chaos=[
+                ChaosEvent(
+                    "network_outage",
+                    at=5,
+                    duration=30,
+                    bed=0,
+                    network=self.NETWORK,
+                )
+            ],
+            seed=42,
+        )
+
+    def test_network_config_validation(self):
+        # No network config: the default cap applies.
+        ev = ChaosEvent("network_outage", at=0, duration=10, bed=0)
+        self.assertEqual(ev.network, {"backlog_cap": 300})
+        ev = ChaosEvent(
+            "network_outage",
+            at=0,
+            duration=10,
+            bed=0,
+            network={"backlog_cap": 10},
+        )
+        self.assertEqual(ev.network, self.NETWORK)
+        with self.assertRaises(ValueError):
+            ChaosEvent(
+                "network_outage",
+                at=0,
+                duration=10,
+                bed=0,
+                network="link",
+            )
+        # The backlog cap must be a positive int.
+        for bad_cap in (0, -5, 1.5, "many", True):
+            with self.assertRaises(ValueError):
+                ChaosEvent(
+                    "network_outage",
+                    at=0,
+                    duration=10,
+                    bed=0,
+                    network={"backlog_cap": bad_cap},
+                )
+
+    def test_readings_buffered_while_down(self):
+        ward = self._outage_ward()
+        snaps = [ward.tick() for _ in range(40)]
+        # Delivered before the outage, undelivered from t=5.
+        self.assertTrue(snaps[3]["beds"][0]["delivered"])
+        self.assertFalse(snaps[4]["beds"][0]["delivered"])
+        self.assertFalse(snaps[33]["beds"][0]["delivered"])
+        # The backlog grows one reading a tick until the cap.
+        self.assertEqual(snaps[13]["network_outage"]["backlog"], 10)
+        self.assertEqual(snaps[13]["network_outage"]["buffered"], 10)
+        self.assertEqual(snaps[13]["network_outage"]["dropped"], 0)
+        self.assertEqual(snaps[13]["network_outage"]["beds_down"], 1)
+        # The per-bed detail: the outage window and the cap.
+        detail = snaps[13]["network_outage"]["beds"][0]
+        self.assertTrue(detail["outage_active"])
+        self.assertEqual(detail["outage_until"], 35.0)
+        self.assertEqual(detail["backlog_cap"], 10)
+        self.assertEqual(detail["backlog"], 10)
+
+    def test_backlog_cap_drops_oldest(self):
+        ward = self._outage_ward()
+        for _ in range(34):
+            ward.tick()
+        # 30 readings buffered (t=5..34) with a cap of 10: the
+        # backlog holds the last 10, the first 20 dropped.
+        m = ward.monitors[0]
+        self.assertEqual(m.network_buffered, 30)
+        self.assertEqual(m.network_dropped, 20)
+        self.assertEqual(len(m.network_backlog), 10)
+        self.assertEqual(
+            [r["seq"] for r in m.network_backlog],
+            list(range(25, 35)),
+        )
+        self.assertEqual(m.network_backlog[0]["t"], 25.0)
+        self.assertTrue(
+            all(not r["delivered"] for r in m.network_backlog)
+        )
+
+    def test_backlog_syncs_on_recovery(self):
+        ward = self._outage_ward()
+        snaps = [ward.tick() for _ in range(40)]
+        # Still buffered at t=34, synced on the first tick after
+        # the outage ends — t=35 — and delivered live from then.
+        self.assertEqual(snaps[33]["network_outage"]["backlog"], 10)
+        self.assertEqual(snaps[33]["network_outage"]["synced"], 0)
+        self.assertEqual(snaps[34]["network_outage"]["backlog"], 0)
+        self.assertEqual(snaps[34]["network_outage"]["synced"], 10)
+        self.assertEqual(snaps[34]["network_outage"]["dropped"], 20)
+        self.assertEqual(snaps[34]["network_outage"]["buffered"], 30)
+        self.assertTrue(snaps[34]["beds"][0]["delivered"])
+        self.assertTrue(snaps[39]["beds"][0]["delivered"])
+        self.assertEqual(snaps[39]["network_outage"]["beds_down"], 0)
+
+    def test_alarms_undelivered_while_down(self):
+        ward = Ward(
+            beds=1,
+            profiles=["stable"],
+            chaos=[
+                ChaosEvent(
+                    "network_outage",
+                    at=5,
+                    duration=30,
+                    network=self.NETWORK,
+                ),
+                ChaosEvent("alarm_storm", at=10, duration=10, bed=0),
+            ],
+            seed=42,
+        )
+        snaps = [ward.tick() for _ in range(40)]
+        # The storm raises 5 alarms at t=11-13, all while the
+        # link is down: none of them reach the dashboard.
+        self.assertEqual(
+            [e["alarm"] for e in ward.monitors[0].alarm_history],
+            [
+                "low_spo2",
+                "tachypnea",
+                "fever",
+                "tachycardia",
+                "hypertension",
+            ],
+        )
+        self.assertEqual(
+            snaps[19]["network_outage"]["alarms_undelivered"], 5
+        )
+        self.assertEqual(
+            snaps[19]["network_outage"]["alarms_synced"], 0
+        )
+        # The sync at t=35 delivers them with the backlog.
+        self.assertEqual(
+            snaps[34]["network_outage"]["alarms_undelivered"], 0
+        )
+        self.assertEqual(
+            snaps[34]["network_outage"]["alarms_synced"], 5
+        )
+
+    def test_untargeted_bed_keeps_delivering(self):
+        ward = self._outage_ward()
+        snaps = [ward.tick() for _ in range(40)]
+        # The control bed — same profile, not targeted — delivers
+        # every reading and buffers nothing.
+        self.assertTrue(
+            all(s["beds"][1]["delivered"] for s in snaps)
+        )
+        detail = snaps[39]["network_outage"]["beds"][1]
+        self.assertFalse(detail["outage_active"])
+        self.assertEqual(detail["buffered"], 0)
+        self.assertEqual(detail["synced"], 0)
+        self.assertEqual(detail["dropped"], 0)
+
+    def test_network_outage_is_deterministic(self):
+        snaps_a = [self._outage_ward().tick() for _ in range(40)]
+        snaps_b = [self._outage_ward().tick() for _ in range(40)]
+        self.assertEqual(snaps_a, snaps_b)
+
+    def test_backlog_resets_on_new_admission(self):
+        ward = Ward(
+            beds=1,
+            profiles=["stable"],
+            chaos=[
+                ChaosEvent(
+                    "network_outage",
+                    at=5,
+                    duration=30,
+                    network=self.NETWORK,
+                )
+            ],
+            seed=42,
+            cleaning_s=1.0,
+        )
+        for _ in range(20):
+            ward.tick()
+        m = ward.monitors[0]
+        self.assertEqual(m.network_buffered, 16)
+        self.assertEqual(m.network_dropped, 6)
+        self.assertEqual(len(m.network_backlog), 10)
+        # Discharged while down, cleaned, and re-admitted — the
+        # new patient starts with an empty backlog and fresh
+        # counters.
+        ward.discharge(0)
+        ward.tick()
+        ward.admit(0, profile="stable")
+        self.assertEqual(len(m.network_backlog), 0)
+        self.assertEqual(m.network_buffered, 0)
+        self.assertEqual(m.network_synced, 0)
+        self.assertEqual(m.network_dropped, 0)
+        # The outage is still active and the deadline never
+        # moved, so the new patient buffers again from zero on
+        # the next tick.
+        self.assertFalse(ward.tick()["beds"][0]["delivered"])
+        self.assertEqual(len(m.network_backlog), 1)
+        self.assertEqual(m.network_buffered, 1)
+
+    def test_network_outage_summary_and_endpoint(self):
+        ward = self._outage_ward()
+        snaps = [ward.tick() for _ in range(40)]
+        summary = snaps[39]["network_outage"]
+        self.assertEqual(summary["beds_down"], 0)
+        self.assertEqual(summary["backlog"], 0)
+        self.assertEqual(summary["buffered"], 30)
+        self.assertEqual(summary["synced"], 10)
+        self.assertEqual(summary["dropped"], 20)
+        self.assertEqual(summary["alarms_undelivered"], 0)
+        self.assertEqual(summary["alarms_synced"], 0)
+        server, port = serve_in_thread(ward)
+        try:
+            status, body = get(port, "/network-outage")
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                json.loads(body)["synced"], 10
+            )
+            self.assertEqual(
+                json.loads(body)["beds"][0]["dropped"], 20
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+        # 503 while partitioned, like the other live endpoints.
+        partitioned = Ward(
+            beds=2,
+            chaos=[ChaosEvent("partition", at=1, duration=5)],
+            seed=4,
+        )
+        partitioned.tick()  # t=1: partitioned
+        server, port = serve_in_thread(partitioned)
+        try:
+            status, body = get(port, "/network-outage")
+            self.assertEqual(status, 503)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_summary_reports_network_outage(self):
+        ward = self._outage_ward()
+        path = os.path.join(tempfile.mkdtemp(), "run.jsonl")
+        with Recorder(path, ward.beds, ward.rate_hz, seed=42) as rec:
+            ward.recorder = rec
+            for _ in range(40):
+                ward.tick()
+        summary = summarize(path)
+        self.assertEqual(
+            summary["network_outage"],
+            {
+                "beds_down": 0,
+                "backlog": 0,
+                "buffered": 30,
+                "synced": 10,
+                "dropped": 20,
+                "alarms_undelivered": 0,
+                "alarms_synced": 0,
+                "beds": {},
+            },
+        )
+
+    def test_websocket_carries_network_outage(self):
+        ward = self._outage_ward()
+        for _ in range(5):
+            ward.tick()  # t=5: the outage is active
+        server, port = serve_in_thread(ward)
+        try:
+            ws = WsClient(port)
+            try:
+                msg = json.loads(ws.read_until_opcode(1))
+                self.assertEqual(
+                    msg["network_outage"]["beds_down"], 1
+                )
+                self.assertTrue(
+                    msg["network_outage"]["beds"][0][
+                        "outage_active"
+                    ]
+                )
+                self.assertFalse(msg["beds"][0]["delivered"])
+            finally:
+                ws.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_scenario_file_loads_and_runs(self):
+        cfg = load_scenario("scenarios/network-outage.json")
+        self.assertEqual(len(cfg["chaos"]), 2)
+        self.assertEqual(cfg["chaos"][0].type, "network_outage")
+        self.assertEqual(cfg["chaos"][0].network, self.NETWORK)
+        self.assertEqual(cfg["chaos"][1].type, "alarm_storm")
+        ward = build_ward(cfg, seed=42)
+        snaps = [ward.tick() for _ in range(70)]
+        # Ward-wide, so every bed's link is down from t=5 to
+        # t=35 and every reading in the window is buffered.
+        self.assertTrue(
+            all(
+                not s["beds"][b]["delivered"]
+                for s in snaps[4:34]
+                for b in range(3)
+            )
+        )
+        self.assertTrue(
+            all(
+                s["beds"][b]["delivered"]
+                for s in snaps[34:]
+                for b in range(3)
+            )
+        )
+        # 30 readings buffered a bed, the 10-reading backlog
+        # holding the last 10, 20 dropped a bed — and 10 a bed
+        # synced when the link returned at t=35.
+        for b in range(3):
+            detail = snaps[69]["network_outage"]["beds"][b]
+            self.assertEqual(detail["buffered"], 30)
+            self.assertEqual(detail["synced"], 10)
+            self.assertEqual(detail["dropped"], 20)
+            self.assertEqual(detail["backlog"], 0)
+        self.assertEqual(snaps[69]["network_outage"]["buffered"], 90)
+        self.assertEqual(snaps[69]["network_outage"]["synced"], 30)
+        self.assertEqual(snaps[69]["network_outage"]["dropped"], 60)
+        # The hypoxic bed's alarm storm raised 5 alarms while
+        # down — 4 from the storm, 1 low_spo2 at 33 s — and all
+        # 5 synced at t=35; the stable beds raised none.
+        self.assertEqual(
+            snaps[69]["network_outage"]["alarms_synced"], 5
+        )
+        self.assertEqual(
+            snaps[69]["network_outage"]["beds"][2]["alarms_synced"],
+            5,
+        )
+        self.assertEqual(
+            snaps[69]["network_outage"]["beds"][0]["alarms_synced"],
+            0,
+        )
+        # Seeded, so a second run reproduces every tick.
+        ward2 = build_ward(cfg, seed=42)
+        snaps2 = [ward2.tick() for _ in range(70)]
+        self.assertEqual(snaps, snaps2)
+
+
 if __name__ == "__main__":
     unittest.main()

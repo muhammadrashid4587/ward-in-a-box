@@ -510,7 +510,7 @@ class Ward:
         # in, and before the snapshot, so the event is in it.
         # A tick where the order is unchanged fires nothing.
         self._check_priority_order()
-        snap = {"t": self.elapsed, "beds": readings, "staffing": self.staffing_summary(), "turnover": self.turnover_summary(), "meds": self.meds_summary(), "triage": self.triage_summary(), "arrivals": self.arrivals_summary(), "discharge": self.discharge_summary(), "discharge_readiness": self.readiness_summary(), "discharge_priority": self.discharge_priority_summary(), "early_warning": self.early_warning_summary(), "sensor_drift": self.sensor_drift_summary(), "bed_blocker": self.bed_blocker_summary(), "oxygen_outage": self.oxygen_outage_summary(), "power_outage": self.power_outage_summary()}
+        snap = {"t": self.elapsed, "beds": readings, "staffing": self.staffing_summary(), "turnover": self.turnover_summary(), "meds": self.meds_summary(), "triage": self.triage_summary(), "arrivals": self.arrivals_summary(), "discharge": self.discharge_summary(), "discharge_readiness": self.readiness_summary(), "discharge_priority": self.discharge_priority_summary(), "early_warning": self.early_warning_summary(), "sensor_drift": self.sensor_drift_summary(), "bed_blocker": self.bed_blocker_summary(), "oxygen_outage": self.oxygen_outage_summary(), "power_outage": self.power_outage_summary(), "network_outage": self.network_outage_summary()}
         with self._lock:
             self.latest = snap
         if self.recorder is not None:
@@ -886,6 +886,36 @@ class Ward:
             "power_outage_hooks": (
                 self.power_outage_hooks.summary()
             ),
+        }
+
+    def network_outage_summary(self):
+        """Per-bed network-outage state and ward totals.
+
+        ``beds`` carries each bed's outage state — whether the
+        link to the central station is down, when it returns,
+        how many readings are buffered locally, and this stay's
+        buffered / synced / dropped counts and undelivered
+        alarms — ``beds_down`` counts the beds whose link is
+        down, ``backlog`` is the buffered readings across the
+        ward, and ``buffered`` / ``synced`` / ``dropped`` /
+        ``alarms_undelivered`` / ``alarms_synced`` are the ward
+        totals, so a client can see at a glance how much of the
+        ward the outage has cut off, how much data is waiting to
+        sync, and how much the outage has already cost.
+        """
+        beds = [m.network_outage_detail(self.elapsed) for m in self.monitors]
+        return {
+            "t": self.elapsed,
+            "beds": beds,
+            "beds_down": sum(1 for b in beds if b["outage_active"]),
+            "backlog": sum(b["backlog"] for b in beds),
+            "buffered": sum(b["buffered"] for b in beds),
+            "synced": sum(b["synced"] for b in beds),
+            "dropped": sum(b["dropped"] for b in beds),
+            "alarms_undelivered": sum(
+                b["alarms_undelivered"] for b in beds
+            ),
+            "alarms_synced": sum(b["alarms_synced"] for b in beds),
         }
 
     def bed_blocker_summary(self):

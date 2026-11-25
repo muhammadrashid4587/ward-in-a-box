@@ -1,16 +1,55 @@
 """Chaos events: device dropout, alarm storms, stale readings, partitions,
 discharges, pharmacy stockouts, slow sensor drift, staff shortages, bed
-blockers, oxygen outages, power outages."""
+blockers, oxygen outages, power outages, network outages."""
 
 from .staffing import ROLES
 from .vitals import NORMAL, PLAUSIBLE
 
-VALID_TYPES = ("dropout", "alarm_storm", "stale", "partition", "discharge", "stockout", "sensor_drift", "staff_shortage", "bed_blocker", "oxygen_outage", "power_outage")
+VALID_TYPES = ("dropout", "alarm_storm", "stale", "partition", "discharge", "stockout", "sensor_drift", "staff_shortage", "bed_blocker", "oxygen_outage", "power_outage", "network_outage")
+
+# Default readings a monitor buffers locally while the network is
+# down, per bed, before the oldest drops off — ten minutes at
+# 1 Hz, so an ordinary outage loses nothing.
+DEFAULT_NETWORK_BACKLOG_CAP = 300
 
 # Why a bed is blocked: awaiting a porter to move the patient,
 # an isolation clean after an infectious patient, or an equipment
 # fault on the bed itself.
 BLOCK_REASONS = ("porter", "isolation_clean", "equipment_fault")
+
+
+def validate_network(network):
+    """A network-outage config: ``{"backlog_cap": ...}``.
+
+    ``backlog_cap`` is how many readings a monitor buffers
+    locally while the link to the central station is down, per
+    bed — a positive int (default
+    ``DEFAULT_NETWORK_BACKLOG_CAP``). When the buffer is full the
+    oldest reading drops off, counted as dropped, so a long
+    outage loses readings instead of growing without bound. The
+    config is optional: an outage with no config buffers with
+    the default cap, because the outage itself — readings taken
+    locally but not delivered — is meaningful without one.
+    """
+    if network is None:
+        return {"backlog_cap": DEFAULT_NETWORK_BACKLOG_CAP}
+    if not isinstance(network, dict):
+        raise ValueError(
+            "network_outage needs a network config, got %r" % (network,)
+        )
+    backlog_cap = network.get(
+        "backlog_cap", DEFAULT_NETWORK_BACKLOG_CAP
+    )
+    if (
+        not isinstance(backlog_cap, int)
+        or isinstance(backlog_cap, bool)
+        or backlog_cap < 1
+    ):
+        raise ValueError(
+            "network_outage: backlog_cap must be a positive int, "
+            "got %r" % (backlog_cap,)
+        )
+    return {"backlog_cap": backlog_cap}
 
 
 def validate_power(power):
@@ -261,10 +300,21 @@ class ChaosEvent:
     their vitals keep walking, unseen — because the outage is a
     monitoring failure, not a clinical one. Without
     ``bed``/``beds`` it is ward-wide, like ``partition``: the
-    mains serves the whole ward.
+    mains serves the whole ward. ``network_outage`` takes an
+    optional ``network`` config (see :func:`validate_network`):
+    while it is active, the target monitors cannot report to the
+    central station / EHR — the readings keep being taken
+    locally, flagged ``delivered: False``, and buffered in a
+    per-bed backlog capped at ``backlog_cap`` readings (the
+    oldest drops off when it fills), and alarms raised while
+    down never reach the dashboard — and on recovery the backlog
+    syncs at once: the buffered readings and the undelivered
+    alarms are delivered, and the backlog empties. Without
+    ``bed``/``beds`` it is ward-wide, like ``partition``: the
+    link serves the whole ward.
     """
 
-    def __init__(self, type, at, duration=None, bed=None, beds=None, med=None, drift=None, shortage=None, reason=None, oxygen=None, power=None):
+    def __init__(self, type, at, duration=None, bed=None, beds=None, med=None, drift=None, shortage=None, reason=None, oxygen=None, power=None, network=None):
         if type not in VALID_TYPES:
             raise ValueError("unknown chaos type: %r" % type)
         if type == "stockout":
@@ -280,6 +330,8 @@ class ChaosEvent:
             oxygen = validate_oxygen_outage(oxygen)
         if type == "power_outage":
             power = validate_power(power)
+        if type == "network_outage":
+            network = validate_network(network)
         if type == "discharge":
             duration = 0 if duration is None else duration
             if duration < 0:
@@ -299,6 +351,7 @@ class ChaosEvent:
         self.reason = reason
         self.oxygen = oxygen
         self.power = power
+        self.network = network
 
     @property
     def end(self):
@@ -526,6 +579,22 @@ class ChaosEngine:
                         m.power_went_dark = False
                     m.power_outage_until = ev.end
                     m.power_outage_cfg = ev.power
+            elif ev.type == "network_outage":
+                # The link to the central station is down for the
+                # window. The monitor holds the outage end and
+                # the config; the buffering and the sync happen
+                # in the monitor tick (see Monitor._buffer_reading
+                # and Monitor._sync_network_backlog), so a bed
+                # that is offline or stale this tick buffers
+                # nothing — there is no fresh reading to hold —
+                # while its backlog still syncs when the link
+                # returns. An overlapping event only extends the
+                # window, so the backlog keeps growing from when
+                # the link first failed.
+                for b in ev.targets(ward):
+                    m = ward.monitors[b]
+                    m.network_outage_until = ev.end
+                    m.network_outage_cfg = ev.network
             elif ev.type == "dropout":
                 for b in ev.targets(ward):
                     ward.monitors[b].offline_until = ev.end
