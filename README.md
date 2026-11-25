@@ -252,6 +252,13 @@ python3 -m ward.cli scenarios/news2-staffing-escalation.json --seed 42
 # that never reach the dashboard until the sync
 python3 -m ward.cli scenarios/network-outage.json --seed 42
 
+# Medication stockout: metoprolol runs out from 5 s to 60 s —
+# the two doses due inside the window are skipped, a missed_dose
+# alarm raises at 10 s, and the patient's heart rate climbs
+# 0.5 bpm a tick to +25.0 by 59 s, then recovers 1.0 bpm a tick
+# once the stock returns and is back to zero at 84 s
+python3 -m ward.cli scenarios/medication-stockout.json --seed 42
+
 # Reproducible run
 python3 -m ward.cli scenarios/example.json --seed 42
 ```
@@ -329,6 +336,11 @@ python3 -m ward.cli scenarios/example.json --seed 42
   many readings are buffered locally, and this stay's buffered /
   synced / dropped counts and undelivered alarms, as JSON
   (503 while partitioned)
+- `GET /medication-stockout` — per-bed medication-stockout state:
+  whether the pharmacy is out of a medication, which one, when
+  the stock returns, and how far each vital has drifted for want
+  of the drug, plus ward totals, as JSON
+  (503 while partitioned)
 
 A reading looks like:
 
@@ -365,8 +377,9 @@ summary from `/news2`, and the sensor-drift summary from
 `/sensor-drift`, the bed-blocker summary from
 `/bed-blocker`, and the oxygen-outage summary from
 `/oxygen-outage`, the power-outage summary from
-`/power-outage`, and the network-outage summary from
-`/network-outage`, so a client gets bed occupancy, vitals, alarms, staffing,
+`/power-outage`, the network-outage summary from
+`/network-outage`, and the medication-stockout summary from
+`/medication-stockout`, so a client gets bed occupancy, vitals, alarms, staffing,
 medication, and the intake queue in one message. Ping frames are answered with pong, close frames
 are echoed and the connection is then closed; text frames from the
 client are accepted and ignored — the ward pushes ticks, it takes no
@@ -508,6 +521,23 @@ Chaos types:
   backlog, the oldest dropping off when the cap fills — and
   alarms raised while down never reach the dashboard; on
   recovery the backlog syncs at once. See Network outage below.
+- `medication_stockout` — the pharmacy runs out of a medication
+  for `duration` seconds; needs `"medication"`, a map with
+  `"med"` (the medication, required), `"drift"` (a map of vital
+  to drift rate per second, required — for example
+  `{"heart_rate": 0.5}`), and `"recovery_rate"` (how fast each
+  vital's drift shrinks back per second once the stock returns,
+  default the largest absolute drift rate). Doses of that
+  medication that fall due while the stock is out are skipped,
+  recorded with status `stockout`, and flagged with a
+  `missed_dose` alarm, exactly like a plain `stockout` — and
+  the patients who actually miss a dose drift: their true
+  vitals move by the configured rates per second while the
+  stock is out, so the alarms, the NEWS2 score, trend alerts,
+  and escalations all respond. A patient with no dose due
+  inside the window misses nothing and never drifts. Once the
+  stock returns the drift recovers at `recovery_rate` per
+  second. See Medication stockout below.
 
 `bed` targets one bed, `beds` targets several, neither targets all beds
 (`partition` is always ward-wide). Times are elapsed seconds from start.
@@ -1040,6 +1070,70 @@ the ward — and readings are delivered live again; the hypoxic
 bed's alarm storm at 10 s raises 4 storm alarms, and a
 low_spo2 at 33 s makes 5 alarms undelivered until the sync,
 while the stable beds raise none.
+
+## Medication stockout
+
+A `medication_stockout` chaos event runs the pharmacy out of
+one medication for a window — a supplier delay, a fridge
+failure, a miscounted shelf — so the patients on that drug
+miss doses and deteriorate off it:
+
+```json
+{"type": "medication_stockout", "at": 5, "duration": 55,
+ "medication": {"med": "metoprolol",
+                "drift": {"heart_rate": 0.5},
+                "recovery_rate": 1.0}}
+```
+
+Doses of that medication that fall due while the stock is out
+are skipped, exactly like a plain `stockout`: recorded in the
+dose history with status `stockout`, counted in the medication
+metrics, and flagged with a `missed_dose` alarm until the
+medication's next dose is given. Doses already pending when the
+stock runs out still resolve normally; only doses that fall due
+inside the window are skipped. What sets this dimension apart
+is the drift: a patient who has actually missed a dose of the
+stocked-out drug has their true vitals move by the configured
+`drift` rates per second while the stock is out — a missed
+beta-blocker lets the heart rate climb, a missed
+antihypertensive lets the pressure rise — so the low or high
+alarms, the NEWS2 score, trend alerts, and escalations all
+respond exactly as they would to a patient genuinely
+deteriorating off their drug. It is a real change, not a sensor
+error: the drift is added to the patient's walked vitals, like
+the oxygen deficit, and the reported reading is still clamped
+inside the plausible envelope. A patient prescribed the
+medication but with no dose due inside the window misses
+nothing and never drifts, and a bed with the drug never
+prescribed is untouched. Once the stock returns the drift
+shrinks back toward zero at `recovery_rate` per second — the
+replenishment is the recovery, so a patient still waiting on
+their next dose starts recovering when the stock comes back,
+not when the dose is finally given. The drift is cleared on a
+new admission, like the oxygen deficit. Every reading carries
+its drift (`"med_stockout_drift"`), every snapshot carries a
+`"medication_stockout"` object with the per-bed stockout state
+— whether the pharmacy is out, which medication, when the
+stock returns, and how far each vital has drifted — and ward
+totals (how many beds are affected, how many are drifting,
+which medications are out, and the largest drift per vital),
+served on its own by `GET /medication-stockout` and carried in
+every WebSocket frame, and the run summary (`--summary`)
+reports the same totals from the last tick. One honest
+limitation: the drift has no cap of its own — a very long
+stockout of a drug dosed very rarely keeps drifting the patient
+until the stock returns, and only the plausible-envelope clamp
+on the reported reading bounds it, so a scenario with a long
+window should use a modest rate. See
+`scenarios/medication-stockout.json` for a runnable example:
+over a seeded 130-tick run metoprolol is out from 5 s to 60 s,
+the doses due at 10 s and 40 s are skipped, the `missed_dose`
+alarm raises at 10 s and clears at 100 s when the next dose is
+given, and the patient's heart rate climbs 0.5 bpm a tick from
+the first missed dose to +25.0 at 59 s — reading 100.36 with
+the NEWS2 heart-rate component at 1 — then recovers 1.0 bpm a
+tick once the stock returns and is back to zero at 84 s, while
+the control bed, with no metoprolol prescribed, never drifts.
 
 ## Power-outage hooks
 
@@ -2339,7 +2433,7 @@ endpoints returned 503 while it lasted, the ticks did not stop.
 make test
 ```
 
-454 tests: vitals stay inside plausible ranges, dropout actually stops a
+464 tests: vitals stay inside plausible ranges, dropout actually stops a
 monitor's stream, an alarm storm produces alarms, stale readings freeze,
 a partition blocks the snapshot endpoint, the HTTP endpoints serve valid
 JSON, the stream serves JSON lines, scenario files validate, alarm
@@ -2395,7 +2489,17 @@ requiring a medication name, a dose skipped at once with status
 `stockout` and a `missed_dose` alarm that clears on the next given
 dose, a stockout affecting only that medication, and the
 `stockout.json` scenario skipping 2 insulin doses and giving 4 over
-a seeded run. Triage tests cover a patient waiting while the ward is
+a seeded run. Medication-stockout tests cover config validation
+and the recovery-rate default, doses skipped with status
+`stockout` and a `missed_dose` alarm that clears on the next given
+dose, the heart-rate drift ramping exactly 0.5 bpm a tick from the
+first missed dose to +25.0 and recovering 1.0 bpm a tick once the
+stock returns, no drift for a patient with no dose due inside the
+window, the drift clearing on a new admission, the
+`/medication-stockout` endpoint (503 while partitioned), the run
+summary, the WebSocket frame, and the
+`medication-stockout.json` scenario skipping 2 metoprolol doses
+and giving 2 over a seeded run. Triage tests cover a patient waiting while the ward is
 full, admission with fresh vitals when a bed frees up, a critical
 patient jumping the queue, FIFO order within one acuity, diversion
 when the queue is full, wait metrics (mean, max, longest current
@@ -3081,3 +3185,17 @@ hypoxic bed over a seeded run.
   in every reading, a `"network_outage"` object in every
   snapshot, WebSocket frame, a `GET /network-outage` endpoint,
   and the run summary) — done in v0.54.0
+- Medication stockout (a `medication_stockout` chaos event runs
+  the pharmacy out of a named medication for a window, so doses
+  of it that fall due are skipped — recorded with status
+  `stockout` and flagged with a `missed_dose` alarm, like a
+  plain `stockout` — and the patients who actually miss a dose
+  drift: their true vitals move by the configured `drift` rates
+  per second while the stock is out, so the alarms, the NEWS2
+  score, trend alerts, and escalations all respond, and once
+  the stock returns the drift recovers at `recovery_rate` per
+  second; a patient with no dose due inside the window never
+  drifts; the drift rides in every reading, a
+  `"medication_stockout"` object in every snapshot, WebSocket
+  frame, a `GET /medication-stockout` endpoint, and the run
+  summary) — done in v0.55.0

@@ -510,7 +510,7 @@ class Ward:
         # in, and before the snapshot, so the event is in it.
         # A tick where the order is unchanged fires nothing.
         self._check_priority_order()
-        snap = {"t": self.elapsed, "beds": readings, "staffing": self.staffing_summary(), "turnover": self.turnover_summary(), "meds": self.meds_summary(), "triage": self.triage_summary(), "arrivals": self.arrivals_summary(), "discharge": self.discharge_summary(), "discharge_readiness": self.readiness_summary(), "discharge_priority": self.discharge_priority_summary(), "early_warning": self.early_warning_summary(), "sensor_drift": self.sensor_drift_summary(), "bed_blocker": self.bed_blocker_summary(), "oxygen_outage": self.oxygen_outage_summary(), "power_outage": self.power_outage_summary(), "network_outage": self.network_outage_summary()}
+        snap = {"t": self.elapsed, "beds": readings, "staffing": self.staffing_summary(), "turnover": self.turnover_summary(), "meds": self.meds_summary(), "triage": self.triage_summary(), "arrivals": self.arrivals_summary(), "discharge": self.discharge_summary(), "discharge_readiness": self.readiness_summary(), "discharge_priority": self.discharge_priority_summary(), "early_warning": self.early_warning_summary(), "sensor_drift": self.sensor_drift_summary(), "bed_blocker": self.bed_blocker_summary(), "oxygen_outage": self.oxygen_outage_summary(), "power_outage": self.power_outage_summary(), "network_outage": self.network_outage_summary(), "medication_stockout": self.medication_stockout_summary()}
         with self._lock:
             self.latest = snap
         if self.recorder is not None:
@@ -916,6 +916,41 @@ class Ward:
                 b["alarms_undelivered"] for b in beds
             ),
             "alarms_synced": sum(b["alarms_synced"] for b in beds),
+        }
+
+    def medication_stockout_summary(self):
+        """Per-bed medication-stockout state and ward totals.
+
+        ``beds`` carries each bed's stockout state — whether the
+        pharmacy is out of a medication, which one, when the stock
+        returns, and how far each vital has drifted for want of
+        the drug — ``beds_affected`` counts the beds whose stock
+        is out, ``beds_drifting`` counts the ones whose vitals
+        are currently off (including a patient still recovering
+        after the stock returned), ``meds`` lists the medications
+        currently stocked out across the ward, and ``max_drift``
+        is the largest absolute drift on any bed per vital, so a
+        client can see at a glance how far the ward's patients
+        have drifted off their drugs and how far they still have
+        to recover.
+        """
+        beds = [m.med_stockout_detail(self.elapsed) for m in self.monitors]
+        max_drift = {}
+        for b in beds:
+            for vital, drift in b["drift"].items():
+                if abs(drift) > abs(max_drift.get(vital, 0.0)):
+                    max_drift[vital] = drift
+        return {
+            "t": self.elapsed,
+            "beds": beds,
+            "beds_affected": sum(
+                1 for b in beds if b["outage_active"]
+            ),
+            "beds_drifting": sum(1 for b in beds if b["drifting"]),
+            "meds": sorted(
+                {b["med"] for b in beds if b["outage_active"]}
+            ),
+            "max_drift": max_drift,
         }
 
     def bed_blocker_summary(self):

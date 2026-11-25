@@ -205,6 +205,24 @@ class Monitor:
         self.network_dropped = 0
         self.network_alarms_undelivered = 0
         self.network_alarms_synced = 0
+        # Medication stockout: the pharmacy is out of one
+        # medication until ``med_stockout_until`` (elapsed
+        # seconds), with ``med_stockout_cfg`` carrying the
+        # medication, the drift rates, and the recovery rate.
+        # While the stock is out and the patient has actually
+        # missed a dose of that medication, their true vitals
+        # drift by the configured rates — a real deterioration
+        # off their drug, not a sensor error — held in
+        # ``med_stockout_drift`` per vital, in that vital's own
+        # units. Once the stock returns the drift shrinks back
+        # toward zero at the recovery rate. Only vitals with a
+        # non-zero drift are listed. The drift is a property of
+        # the patient, not the sensor: it feeds the alarms and
+        # the NEWS2 score exactly like the oxygen deficit does,
+        # and it is cleared on a new admission, like the deficit.
+        self.med_stockout_until = None
+        self.med_stockout_cfg = None
+        self.med_stockout_drift = {}
         self.seq = 0
         # False until the ward admits this bed (scenario timeline); an
         # unadmitted bed emits no readings at all.
@@ -543,6 +561,38 @@ class Monitor:
             "alarms_synced": self.network_alarms_synced,
         }
 
+    def med_stockout_detail(self, now):
+        """Per-bed medication-stockout state as plain JSON data.
+
+        ``outage_active`` is True while a medication-stockout
+        event holds the pharmacy out of this medication, with
+        when the stock returns; ``med`` is the medication that
+        is out (None with no event recorded); ``drift`` is how
+        far each vital has moved from the patient's walked
+        vitals for want of the drug, and ``drifting`` is True
+        while any vital is off — including after the stock
+        returns, while the patient is still recovering.
+        """
+        active = (
+            self.med_stockout_until is not None
+            and now < self.med_stockout_until
+        )
+        return {
+            "bed": self.bed_id,
+            "admitted": self.admitted,
+            "med": (
+                self.med_stockout_cfg["med"]
+                if self.med_stockout_cfg is not None
+                else None
+            ),
+            "outage_active": active,
+            "outage_until": (
+                self.med_stockout_until if active else None
+            ),
+            "drift": dict(self.med_stockout_drift),
+            "drifting": bool(self.med_stockout_drift),
+        }
+
     def bed_blocker_detail(self, now):
         """Per-bed bed-blocker state as plain JSON data.
 
@@ -718,6 +768,10 @@ class Monitor:
         # deficit goes the same way: the new patient starts
         # fully saturated, and an outage still running starts
         # desaturating them again from zero on the next tick.
+        # The medication-stockout drift goes the same way: the
+        # new patient starts on their own drug levels, and a
+        # stockout still running starts drifting them again
+        # from zero on their first missed dose.
         # A power outage goes the same way for the dark flag:
         # the new patient starts with a live monitor, and an
         # outage still running starts draining the battery
@@ -727,6 +781,7 @@ class Monitor:
         self.sensor_drift = {}
         self.oxygen_deficit = 0.0
         self.oxygen_floor_hit = False
+        self.med_stockout_drift = {}
         self.power_went_dark = False
         self.power_dark_ticks = 0
         # A new admission starts with an empty network backlog:
@@ -827,6 +882,57 @@ class Monitor:
             if self.oxygen_deficit == 0:
                 self.oxygen_floor_hit = False
 
+    def _step_med_stockout(self, now, dt=1.0):
+        """Grow or recover the medication-stockout drift for this tick.
+
+        Only a patient who has actually missed a dose of the
+        stocked-out medication is affected: while the stockout is
+        active and the medication sits in the schedule's missed
+        set, each configured vital drifts by its rate per second
+        — a real deterioration, not a sensor error, so the alarms
+        and the NEWS2 score see it exactly like a patient coming
+        off their drug would. Once the stock returns the drift
+        shrinks by the event's ``recovery_rate`` per second until
+        the patient is back to their walked vitals. The drift is
+        pure arithmetic on dt — no RNG — so a seeded run
+        reproduces it exactly. A patient with no dose due inside
+        the window never misses one, so they never drift; a dose
+        given during the window (one that fell due before the
+        stock ran out) clears the miss and starts the recovery
+        even while the stock is still out.
+        """
+        if self.med_stockout_cfg is None:
+            return
+        cfg = self.med_stockout_cfg
+        missed = any(
+            m.lower() == cfg["med"] for m in self.meds.missed_active
+        )
+        active = (
+            self.med_stockout_until is not None
+            and now < self.med_stockout_until
+        )
+        if active and missed:
+            for vital, rate in cfg["drift"].items():
+                self.med_stockout_drift[vital] = round(
+                    self.med_stockout_drift.get(vital, 0.0) + rate * dt,
+                    3,
+                )
+        elif self.med_stockout_drift:
+            step = cfg["recovery_rate"] * dt
+            for vital in list(self.med_stockout_drift):
+                drift = self.med_stockout_drift[vital]
+                if abs(drift) <= step:
+                    self.med_stockout_drift.pop(vital, None)
+                elif drift > 0:
+                    self.med_stockout_drift[vital] = round(
+                        drift - step, 3
+                    )
+                else:
+                    self.med_stockout_drift[vital] = round(
+                        drift + step, 3
+                    )
+
+
     def reported_signs(self):
         """The vitals as the sensor reports them: true vitals
         plus the accumulated drift bias, clamped inside the
@@ -837,11 +943,16 @@ class Monitor:
         sensor error — and the deficit never pushes the reported
         SpO2 below the outage's floor, however far the walk
         wanders; the sensor-drift bias still shows in full
-        whenever the deficit leaves room above the floor."""
+        whenever the deficit leaves room above the floor. A
+        patient drifting off a stocked-out medication reports
+        the walked vitals plus the medication drift — also a
+        real change, so the alarms and the NEWS2 score see it
+        exactly like the oxygen deficit."""
         out = {}
         for key, value in self.signs.items():
             lo, hi = PLAUSIBLE[key]
             v = value + self.sensor_drift.get(key, 0.0)
+            v += self.med_stockout_drift.get(key, 0.0)
             if key == "spo2" and self.oxygen_deficit > 0:
                 floor = (
                     self.oxygen_outage_cfg["floor"]
@@ -970,6 +1081,14 @@ class Monitor:
         # as fast. A patient not on oxygen is untouched.
         self._step_oxygen(now, dt)
 
+        # A medication stockout drifts a patient who has missed a
+        # dose of the stocked-out drug before the reading is
+        # built, so this tick's reading, alarms, and NEWS2 score
+        # already carry the drift — and a patient recovering
+        # after the stock returns climbs back just as fast. A
+        # patient with no dose due inside the window never drifts.
+        self._step_med_stockout(now, dt)
+
         # Consciousness moves before the reading is built, so this
         # tick's reading, score, and snapshot already carry the new
         # level — a change is visible in the same tick it happens.
@@ -999,6 +1118,7 @@ class Monitor:
             "on_battery": on_battery,
             "sensor_drift": dict(self.sensor_drift),
             "oxygen_deficit": self.oxygen_deficit,
+            "med_stockout_drift": dict(self.med_stockout_drift),
             **reported,
         }
         reading["alarms"] = alarms_for(reported)

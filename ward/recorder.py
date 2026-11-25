@@ -120,7 +120,11 @@ def summarize(path):
     down, how many readings are buffered locally waiting to
     sync, how many were buffered, synced, and dropped, and how
     many alarms raised while down are still undelivered and how
-    many have since synced — and medication totals from the last tick:
+    many have since synced — and medication-stockout totals from
+    the last tick: how many beds have a medication stocked out,
+    how many are drifting off their drug, which medications are
+    out, the largest drift per vital, and each drifting bed's
+    drift — and medication totals from the last tick:
     doses given, late, missed, and skipped for a stockout, and
     whether the missed-dose hooks are configured and how many hook
     deliveries were invoked and failed — and staffing totals from
@@ -149,6 +153,7 @@ def summarize(path):
     last_oxygen_outage = None
     last_power_outage = None
     last_network_outage = None
+    last_medication_stockout = None
     with open(path) as f:
         for line in f:
             line = line.strip()
@@ -218,6 +223,8 @@ def summarize(path):
                 last_power_outage = obj["power_outage"]
             if isinstance(obj.get("network_outage"), dict):
                 last_network_outage = obj["network_outage"]
+            if isinstance(obj.get("medication_stockout"), dict):
+                last_medication_stockout = obj["medication_stockout"]
             for bed in obj["beds"]:
                 b = bed["bed"]
                 if not bed.get("online", True):
@@ -714,6 +721,31 @@ def summarize(path):
                 },
             }
             if last_network_outage is not None
+            else None
+        ),
+        # Medication-stockout totals from the last tick: how many
+        # beds have a medication stocked out, how many are
+        # drifting off their drug, which medications are out, the
+        # largest drift per vital, and each drifting bed's drift
+        # — so a run's missed doses and their clinical cost are
+        # visible without replaying every tick.
+        "medication_stockout": (
+            {
+                "beds_affected": last_medication_stockout[
+                    "beds_affected"
+                ],
+                "beds_drifting": last_medication_stockout[
+                    "beds_drifting"
+                ],
+                "meds": last_medication_stockout["meds"],
+                "max_drift": last_medication_stockout["max_drift"],
+                "beds": {
+                    str(b["bed"]): b["drift"]
+                    for b in last_medication_stockout["beds"]
+                    if b["drifting"]
+                },
+            }
+            if last_medication_stockout is not None
             else None
         ),
     }

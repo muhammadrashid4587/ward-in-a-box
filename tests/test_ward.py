@@ -11946,5 +11946,432 @@ class TestNetworkOutage(unittest.TestCase):
         self.assertEqual(snaps, snaps2)
 
 
+class TestMedicationStockout(unittest.TestCase):
+    # A medication stockout: the pharmacy runs out of metoprolol
+    # from t=5 for 55 s, so the two doses due inside the window
+    # are skipped — a missed_dose alarm raises until the next dose
+    # is given — and the patient drifts: their heart rate climbs
+    # 0.5 bpm a tick from the first missed dose, then recovers
+    # 1.0 bpm a tick once the stock returns. A bed with no dose
+    # due inside the window misses nothing and never drifts.
+    MEDICATION = {
+        "med": "metoprolol",
+        "drift": {"heart_rate": 0.5},
+        "recovery_rate": 1.0,
+    }
+
+    def _stockout_ward(self):
+        return Ward(
+            beds=2,
+            profiles=["stable", "stable"],
+            meds=[
+                [{"name": "metoprolol", "every_s": 30, "first_at": 10}],
+                [],
+            ],
+            chaos=[
+                ChaosEvent(
+                    "medication_stockout",
+                    at=5,
+                    duration=55,
+                    bed=0,
+                    medication=self.MEDICATION,
+                )
+            ],
+            seed=42,
+        )
+
+    def test_medication_config_validation(self):
+        # A medication-stockout event needs a medication config.
+        with self.assertRaises(ValueError):
+            ChaosEvent("medication_stockout", at=0, duration=10, bed=0)
+        with self.assertRaises(ValueError):
+            ChaosEvent(
+                "medication_stockout",
+                at=0,
+                duration=10,
+                bed=0,
+                medication="metoprolol",
+            )
+        # The medication name is required and non-empty.
+        for bad in ({}, {"drift": {"heart_rate": 0.5}}):
+            with self.assertRaises(ValueError):
+                ChaosEvent(
+                    "medication_stockout",
+                    at=0,
+                    duration=10,
+                    bed=0,
+                    medication=bad,
+                )
+        for bad_med in ("", "   ", 42):
+            with self.assertRaises(ValueError):
+                ChaosEvent(
+                    "medication_stockout",
+                    at=0,
+                    duration=10,
+                    bed=0,
+                    medication={
+                        "med": bad_med,
+                        "drift": {"heart_rate": 0.5},
+                    },
+                )
+        # The drift map is required: unknown vitals and all-zero
+        # rates are rejected, like a sensor drift.
+        for bad_drift in (None, {}, {"heart_rate": 0}, {"wbc": 0.5}):
+            with self.assertRaises(ValueError):
+                ChaosEvent(
+                    "medication_stockout",
+                    at=0,
+                    duration=10,
+                    bed=0,
+                    medication={"med": "metoprolol", "drift": bad_drift},
+                )
+        # The recovery rate must be positive too.
+        with self.assertRaises(ValueError):
+            ChaosEvent(
+                "medication_stockout",
+                at=0,
+                duration=10,
+                bed=0,
+                medication={
+                    "med": "metoprolol",
+                    "drift": {"heart_rate": 0.5},
+                    "recovery_rate": 0,
+                },
+            )
+        # Defaults: the recovery rate is the largest absolute
+        # drift rate unless told otherwise, and the medication
+        # name is lower-cased.
+        ev = ChaosEvent(
+            "medication_stockout",
+            at=0,
+            duration=10,
+            bed=0,
+            medication={
+                "med": "Metoprolol",
+                "drift": {"heart_rate": 0.5, "systolic": -1.0},
+            },
+        )
+        self.assertEqual(ev.med, "metoprolol")
+        self.assertEqual(
+            ev.medication,
+            {
+                "med": "metoprolol",
+                "drift": {"heart_rate": 0.5, "systolic": -1.0},
+                "recovery_rate": 1.0,
+            },
+        )
+        ev = ChaosEvent(
+            "medication_stockout",
+            at=0,
+            duration=10,
+            bed=0,
+            medication=self.MEDICATION,
+        )
+        self.assertEqual(ev.medication, self.MEDICATION)
+
+    def test_doses_skipped_during_medication_stockout(self):
+        ward = self._stockout_ward()
+        snaps = [ward.tick() for _ in range(40)]
+        # The dose due at 10 s is skipped at once: the alarm
+        # raises in the same tick, and the dose is recorded as a
+        # stockout, not a miss.
+        self.assertIn("missed_dose", snaps[9]["beds"][0]["alarms"])
+        self.assertEqual(
+            snaps[9]["meds"]["beds"][0]["stockouts"], ["metoprolol"]
+        )
+        self.assertEqual(snaps[9]["meds"]["total_stockout"], 1)
+        self.assertEqual(
+            snaps[9]["meds"]["beds"][0]["doses"]["stockout"], 1
+        )
+        # The dose due at 40 s is skipped too; the control bed,
+        # with no metoprolol prescribed, is untouched.
+        self.assertEqual(snaps[39]["meds"]["total_stockout"], 2)
+        self.assertEqual(
+            [
+                h["status"]
+                for h in snaps[39]["meds"]["beds"][0]["history"]
+            ],
+            ["stockout", "stockout"],
+        )
+        self.assertEqual(snaps[39]["meds"]["beds"][1]["doses"], {
+            "given": 0,
+            "late": 0,
+            "missed": 0,
+            "stockout": 0,
+            "pending": 0,
+        })
+        # The missed-dose alarm clears when the next dose is
+        # given — due at 70 s, given at 100 s.
+        for _ in range(60):
+            ward.tick()
+        self.assertEqual(
+            list(ward.monitors[0].alarm_history),
+            [{"alarm": "missed_dose", "raised_t": 10.0,
+              "cleared_t": 100.0}],
+        )
+
+    def test_vitals_drift_while_doses_missed(self):
+        ward = self._stockout_ward()
+        snaps = [ward.tick() for _ in range(60)]
+        # Nothing drifts before the first missed dose, even
+        # though the stock ran out at t=5.
+        self.assertEqual(
+            snaps[8]["beds"][0]["med_stockout_drift"], {}
+        )
+        # The drift ramps exactly: 0.5 bpm a tick from t=10,
+        # so 25.0 bpm by t=59 — and the reported heart rate
+        # carries it, while the control bed never drifts.
+        self.assertEqual(
+            snaps[9]["beds"][0]["med_stockout_drift"],
+            {"heart_rate": 0.5},
+        )
+        self.assertEqual(
+            snaps[58]["beds"][0]["med_stockout_drift"],
+            {"heart_rate": 25.0},
+        )
+        self.assertEqual(snaps[58]["beds"][0]["heart_rate"], 100.36)
+        self.assertTrue(
+            all(
+                s["beds"][1]["med_stockout_drift"] == {}
+                for s in snaps
+            )
+        )
+        # The drift is a real deterioration: the heart-rate
+        # component of the NEWS2 score climbs with it.
+        self.assertEqual(
+            snaps[58]["beds"][0]["news2"]["components"]["heart_rate"],
+            1,
+        )
+        self.assertEqual(snaps[58]["beds"][0]["news2"]["score"], 1)
+        # The per-bed detail: the outage window and the drift.
+        detail = snaps[29]["medication_stockout"]["beds"][0]
+        self.assertTrue(detail["outage_active"])
+        self.assertEqual(detail["outage_until"], 60.0)
+        self.assertEqual(detail["med"], "metoprolol")
+        self.assertEqual(detail["drift"], {"heart_rate": 10.5})
+        self.assertTrue(detail["drifting"])
+        summary = snaps[29]["medication_stockout"]
+        self.assertEqual(summary["beds_affected"], 1)
+        self.assertEqual(summary["beds_drifting"], 1)
+        self.assertEqual(summary["meds"], ["metoprolol"])
+        self.assertEqual(
+            summary["max_drift"], {"heart_rate": 10.5}
+        )
+
+    def test_drift_recovers_after_stock_returns(self):
+        ward = self._stockout_ward()
+        snaps = [ward.tick() for _ in range(90)]
+        # The stock returns at t=60: the drift shrinks 1.0 bpm
+        # a tick from 25.0, so 24.0 at t=60 and back to zero —
+        # and out of the map — at t=84.
+        self.assertEqual(
+            snaps[59]["beds"][0]["med_stockout_drift"],
+            {"heart_rate": 24.0},
+        )
+        self.assertEqual(
+            snaps[82]["beds"][0]["med_stockout_drift"],
+            {"heart_rate": 1.0},
+        )
+        self.assertEqual(
+            snaps[83]["beds"][0]["med_stockout_drift"], {}
+        )
+        self.assertFalse(
+            snaps[89]["medication_stockout"]["beds"][0]["drifting"]
+        )
+        self.assertEqual(
+            snaps[89]["medication_stockout"]["beds_drifting"], 0
+        )
+        self.assertEqual(
+            snaps[89]["medication_stockout"]["max_drift"], {}
+        )
+
+    def test_no_drift_without_missed_dose(self):
+        # The patient's next dose is not due until t=100, long
+        # after the 5-60 s stockout: nothing is missed, so
+        # nothing drifts, even though the drug was out.
+        ward = Ward(
+            beds=1,
+            profiles=["stable"],
+            meds=[[{"name": "metoprolol", "every_s": 60, "first_at": 100}]],
+            chaos=[
+                ChaosEvent(
+                    "medication_stockout",
+                    at=5,
+                    duration=55,
+                    bed=0,
+                    medication=self.MEDICATION,
+                )
+            ],
+            seed=42,
+        )
+        snaps = [ward.tick() for _ in range(70)]
+        self.assertTrue(
+            all(
+                s["beds"][0]["med_stockout_drift"] == {}
+                for s in snaps
+            )
+        )
+        self.assertEqual(snaps[69]["meds"]["total_stockout"], 0)
+        self.assertNotIn("missed_dose", snaps[69]["beds"][0]["alarms"])
+
+    def test_drift_clears_on_new_admission(self):
+        ward = Ward(
+            beds=2,
+            profiles=["stable", "stable"],
+            meds=[
+                [{"name": "metoprolol", "every_s": 30, "first_at": 10}],
+                [],
+            ],
+            chaos=[
+                ChaosEvent(
+                    "medication_stockout",
+                    at=5,
+                    duration=55,
+                    bed=0,
+                    medication=self.MEDICATION,
+                )
+            ],
+            seed=42,
+            cleaning_s=1.0,
+        )
+        for _ in range(30):
+            ward.tick()
+        m = ward.monitors[0]
+        self.assertEqual(m.med_stockout_drift, {"heart_rate": 10.5})
+        # Discharged, cleaned, and re-admitted — the new patient
+        # starts with no drift, even though the stockout is
+        # still running.
+        ward.discharge(0)
+        ward.tick()
+        ward.admit(0, profile="stable")
+        self.assertEqual(m.med_stockout_drift, {})
+
+    def test_medication_stockout_summary_and_endpoint(self):
+        ward = self._stockout_ward()
+        snaps = [ward.tick() for _ in range(40)]
+        summary = snaps[39]["medication_stockout"]
+        self.assertEqual(summary["beds_affected"], 1)
+        self.assertEqual(summary["beds_drifting"], 1)
+        self.assertEqual(summary["meds"], ["metoprolol"])
+        self.assertEqual(summary["max_drift"], {"heart_rate": 15.5})
+        server, port = serve_in_thread(ward)
+        try:
+            status, body = get(port, "/medication-stockout")
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                json.loads(body)["beds"][0]["drift"],
+                {"heart_rate": 15.5},
+            )
+            self.assertEqual(json.loads(body)["meds"], ["metoprolol"])
+        finally:
+            server.shutdown()
+            server.server_close()
+        # 503 while partitioned, like the other live endpoints.
+        partitioned = Ward(
+            beds=2,
+            chaos=[ChaosEvent("partition", at=1, duration=5)],
+            seed=4,
+        )
+        partitioned.tick()  # t=1: partitioned
+        server, port = serve_in_thread(partitioned)
+        try:
+            status, body = get(port, "/medication-stockout")
+            self.assertEqual(status, 503)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_summary_reports_medication_stockout(self):
+        ward = self._stockout_ward()
+        path = os.path.join(tempfile.mkdtemp(), "run.jsonl")
+        with Recorder(path, ward.beds, ward.rate_hz, seed=42) as rec:
+            ward.recorder = rec
+            for _ in range(40):
+                ward.tick()
+        summary = summarize(path)
+        self.assertEqual(
+            summary["medication_stockout"],
+            {
+                "beds_affected": 1,
+                "beds_drifting": 1,
+                "meds": ["metoprolol"],
+                "max_drift": {"heart_rate": 15.5},
+                "beds": {"0": {"heart_rate": 15.5}},
+            },
+        )
+
+    def test_websocket_carries_medication_stockout(self):
+        ward = self._stockout_ward()
+        for _ in range(10):
+            ward.tick()  # t=10: the first dose is missed
+        server, port = serve_in_thread(ward)
+        try:
+            ws = WsClient(port)
+            try:
+                msg = json.loads(ws.read_until_opcode(1))
+                # The frame is the next tick, t=11, so the drift
+                # has grown one more step past the t=10 tick.
+                self.assertEqual(
+                    msg["medication_stockout"]["beds_affected"], 1
+                )
+                self.assertTrue(
+                    msg["medication_stockout"]["beds"][0][
+                        "outage_active"
+                    ]
+                )
+                self.assertEqual(
+                    msg["medication_stockout"]["beds"][0]["drift"],
+                    {"heart_rate": 1.0},
+                )
+                self.assertEqual(
+                    msg["beds"][0]["med_stockout_drift"],
+                    {"heart_rate": 1.0},
+                )
+            finally:
+                ws.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_scenario_file_loads_and_runs(self):
+        cfg = load_scenario("scenarios/medication-stockout.json")
+        self.assertEqual(len(cfg["chaos"]), 1)
+        self.assertEqual(cfg["chaos"][0].type, "medication_stockout")
+        self.assertEqual(cfg["chaos"][0].medication, self.MEDICATION)
+        ward = build_ward(cfg, seed=42)
+        snaps = [ward.tick() for _ in range(130)]
+        # Ward-wide, so both beds' stock is out from t=5 to
+        # t=60 — but only the bed on metoprolol drifts, 0.5 bpm
+        # a tick from the first missed dose at t=10 to 25.0 at
+        # t=59, then back to zero by t=84 once the stock returns.
+        self.assertEqual(
+            snaps[58]["medication_stockout"]["beds_affected"], 2
+        )
+        self.assertEqual(
+            snaps[58]["medication_stockout"]["beds_drifting"], 1
+        )
+        self.assertEqual(
+            snaps[58]["beds"][0]["med_stockout_drift"],
+            {"heart_rate": 25.0},
+        )
+        self.assertEqual(
+            snaps[83]["beds"][0]["med_stockout_drift"], {}
+        )
+        # Two doses skipped, two given, and the missed-dose
+        # alarm raised at the first skip and cleared when the
+        # next dose was given at t=100.
+        self.assertEqual(snaps[129]["meds"]["total_stockout"], 2)
+        self.assertEqual(snaps[129]["meds"]["total_given"], 2)
+        self.assertEqual(
+            list(ward.monitors[0].alarm_history),
+            [{"alarm": "missed_dose", "raised_t": 10.0,
+              "cleared_t": 100.0}],
+        )
+        # Seeded, so a second run reproduces every tick.
+        ward2 = build_ward(cfg, seed=42)
+        snaps2 = [ward2.tick() for _ in range(130)]
+        self.assertEqual(snaps, snaps2)
+
+
 if __name__ == "__main__":
     unittest.main()

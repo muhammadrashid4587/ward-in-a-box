@@ -1,0 +1,1 @@
+{"beds":2,"chaos":[{"at":5,"duration":55,"medication":{"drift":{"heart_rate":0.5},"med":"metoprolol","recovery_rate":1.0},"type":"medication_stockout"}],"host":"127.0.0.1","patients":[{"bed":0,"meds":[{"every_s":30,"first_at":10,"name":"metoprolol"}],"profile":"stable"},{"bed":1,"profile":"stable"}],"port":8080,"rate_hz":1.0}

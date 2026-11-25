@@ -112,6 +112,7 @@ def load_scenario(path):
                     oxygen=ev.get("oxygen"),
                     power=ev.get("power"),
                     network=ev.get("network"),
+                    medication=ev.get("medication"),
                 )
             )
         except KeyError as e:

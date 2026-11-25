@@ -1,11 +1,12 @@
 """Chaos events: device dropout, alarm storms, stale readings, partitions,
 discharges, pharmacy stockouts, slow sensor drift, staff shortages, bed
-blockers, oxygen outages, power outages, network outages."""
+blockers, oxygen outages, power outages, network outages, medication
+stockouts."""
 
 from .staffing import ROLES
 from .vitals import NORMAL, PLAUSIBLE
 
-VALID_TYPES = ("dropout", "alarm_storm", "stale", "partition", "discharge", "stockout", "sensor_drift", "staff_shortage", "bed_blocker", "oxygen_outage", "power_outage", "network_outage")
+VALID_TYPES = ("dropout", "alarm_storm", "stale", "partition", "discharge", "stockout", "sensor_drift", "staff_shortage", "bed_blocker", "oxygen_outage", "power_outage", "network_outage", "medication_stockout")
 
 # Default readings a monitor buffers locally while the network is
 # down, per bed, before the oldest drops off — ten minutes at
@@ -16,6 +17,56 @@ DEFAULT_NETWORK_BACKLOG_CAP = 300
 # an isolation clean after an infectious patient, or an equipment
 # fault on the bed itself.
 BLOCK_REASONS = ("porter", "isolation_clean", "equipment_fault")
+
+
+def validate_medication_stockout(medication):
+    """A medication-stockout config: ``{"med": ..., "drift": ..., "recovery_rate": ...}``.
+
+    ``med`` is required: the medication that runs out of stock — a
+    non-empty string, matched case-insensitively against the
+    patients' schedules. ``drift`` is required: a map of vital to
+    drift rate per second (see :func:`validate_drift`) — how fast
+    the patient's true vitals move once a dose of that medication
+    has actually been missed, because the drug is no longer holding
+    them where it was: a missed beta-blocker lets the heart rate
+    climb, a missed antihypertensive lets the pressure rise.
+    ``recovery_rate`` is how fast each vital's drift shrinks back
+    toward zero per second once the stock is back (default the
+    largest absolute drift rate) — a positive finite number. A
+    config with no medication or no drift does nothing at all, so
+    it is rejected.
+    """
+    if not isinstance(medication, dict):
+        raise ValueError(
+            "medication_stockout needs a medication config, got %r"
+            % (medication,)
+        )
+    med = medication.get("med")
+    if not isinstance(med, str) or not med.strip():
+        raise ValueError(
+            "medication_stockout needs a medication name, got %r"
+            % (med,)
+        )
+    drift = validate_drift(medication.get("drift"))
+    recovery_rate = medication.get(
+        "recovery_rate", max(abs(r) for r in drift.values())
+    )
+    if (
+        not isinstance(recovery_rate, (int, float))
+        or isinstance(recovery_rate, bool)
+        or recovery_rate != recovery_rate
+        or recovery_rate in (float("inf"), float("-inf"))
+        or recovery_rate <= 0
+    ):
+        raise ValueError(
+            "medication_stockout: recovery_rate must be a positive "
+            "finite number, got %r" % (recovery_rate,)
+        )
+    return {
+        "med": med.strip().lower(),
+        "drift": drift,
+        "recovery_rate": float(recovery_rate),
+    }
 
 
 def validate_network(network):
@@ -311,15 +362,38 @@ class ChaosEvent:
     syncs at once: the buffered readings and the undelivered
     alarms are delivered, and the backlog empties. Without
     ``bed``/``beds`` it is ward-wide, like ``partition``: the
-    link serves the whole ward.
+    link serves the whole ward. ``medication_stockout`` needs
+    ``medication`` (see :func:`validate_medication_stockout`):
+    a named medication runs out of stock for the window, so
+    doses of it that fall due on the target beds are skipped —
+    recorded with status ``stockout`` in the dose history,
+    counted in the medication metrics, and flagged with a
+    ``missed_dose`` alarm, exactly like a plain ``stockout`` —
+    and the patients who actually miss a dose drift: their true
+    vitals move by the configured ``drift`` rates per second
+    while the stock is out, so the alarms, the NEWS2 score,
+    trend alerts, and escalations all respond exactly as they
+    would to a patient genuinely deteriorating off their drug.
+    A patient prescribed the medication but with no dose due
+    inside the window misses nothing and never drifts. Once
+    the stock returns the drift shrinks back toward zero at
+    ``recovery_rate`` per second — the replenishment is the
+    recovery, so a patient still waiting on their next dose
+    starts recovering when the stock comes back, not when the
+    dose is finally given. Without ``bed``/``beds`` it applies
+    to every bed that has the medication prescribed, like
+    ``stockout``.
     """
 
-    def __init__(self, type, at, duration=None, bed=None, beds=None, med=None, drift=None, shortage=None, reason=None, oxygen=None, power=None, network=None):
+    def __init__(self, type, at, duration=None, bed=None, beds=None, med=None, drift=None, shortage=None, reason=None, oxygen=None, power=None, network=None, medication=None):
         if type not in VALID_TYPES:
             raise ValueError("unknown chaos type: %r" % type)
         if type == "stockout":
             if not isinstance(med, str) or not med.strip():
                 raise ValueError("stockout needs a medication name, got %r" % (med,))
+        if type == "medication_stockout":
+            medication = validate_medication_stockout(medication)
+            med = medication["med"]
         if type == "sensor_drift":
             drift = validate_drift(drift)
         if type == "staff_shortage":
@@ -352,6 +426,7 @@ class ChaosEvent:
         self.oxygen = oxygen
         self.power = power
         self.network = network
+        self.medication = medication
 
     @property
     def end(self):
@@ -405,11 +480,16 @@ class ChaosEngine:
 
         Only beds that actually have the stocked-out medication in
         their schedule are listed, so a ward-wide stockout of insulin
-        does not flag beds with no insulin prescribed.
+        does not flag beds with no insulin prescribed. A
+        medication-stockout event stocks out its medication the same
+        way — the dose skipping is identical, the drift is what sets
+        it apart — so both types feed this map.
         """
         out = {}
         for ev in self.events:
-            if ev.type != "stockout" or not ev.active(now):
+            if ev.type not in ("stockout", "medication_stockout"):
+                continue
+            if not ev.active(now):
                 continue
             for b in ev.targets(ward):
                 meds = ward.monitors[b].meds.meds
@@ -595,6 +675,21 @@ class ChaosEngine:
                     m = ward.monitors[b]
                     m.network_outage_until = ev.end
                     m.network_outage_cfg = ev.network
+            elif ev.type == "medication_stockout":
+                # The pharmacy is out of this medication for the
+                # window. The monitor holds the outage end and
+                # the config; the drift itself grows and recovers
+                # in the monitor tick (see
+                # Monitor._step_med_stockout), gated on the
+                # patient actually having missed a dose of that
+                # medication, so a bed with no dose due inside
+                # the window never drifts. An overlapping event
+                # only extends the window and refreshes the
+                # config, like the network outage above.
+                for b in ev.targets(ward):
+                    m = ward.monitors[b]
+                    m.med_stockout_until = ev.end
+                    m.med_stockout_cfg = ev.medication
             elif ev.type == "dropout":
                 for b in ev.targets(ward):
                     ward.monitors[b].offline_until = ev.end
