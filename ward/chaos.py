@@ -1,12 +1,13 @@
 """Chaos events: device dropout, alarm storms, stale readings, partitions,
 discharges, pharmacy stockouts, slow sensor drift, staff shortages, bed
 blockers, oxygen outages, power outages, network outages, medication
-stockouts, infusion pump failures, lab-result delays, ventilator failures."""
+stockouts, infusion pump failures, lab-result delays, ventilator failures,
+dialysis failures."""
 
 from .staffing import ROLES
 from .vitals import NORMAL, PLAUSIBLE
 
-VALID_TYPES = ("dropout", "alarm_storm", "stale", "partition", "discharge", "stockout", "sensor_drift", "staff_shortage", "bed_blocker", "oxygen_outage", "power_outage", "network_outage", "medication_stockout", "pump_failure", "lab_delay", "ventilator_failure")
+VALID_TYPES = ("dropout", "alarm_storm", "stale", "partition", "discharge", "stockout", "sensor_drift", "staff_shortage", "bed_blocker", "oxygen_outage", "power_outage", "network_outage", "medication_stockout", "pump_failure", "lab_delay", "ventilator_failure", "dialysis_failure")
 
 # Default readings a monitor buffers locally while the network is
 # down, per bed, before the oldest drops off — ten minutes at
@@ -56,6 +57,51 @@ def validate_ventilator(ventilator):
     ):
         raise ValueError(
             "ventilator_failure: recovery_rate must be a positive "
+            "finite number, got %r" % (recovery_rate,)
+        )
+    return {
+        "drift": drift,
+        "recovery_rate": float(recovery_rate),
+    }
+
+
+def validate_dialysis(dialysis):
+    """A dialysis-failure config: ``{"drift": ..., "recovery_rate": ...}``.
+
+    ``drift`` is required: a map of vital to drift rate per
+    second (see :func:`validate_drift`) — how fast the
+    patient's true vitals move once their dialysis machine
+    has stopped, because they have lost renal replacement:
+    a dialysis machine that stops lets fluid build up, so
+    the blood pressure climbs and the heart rate climbs with
+    it. ``recovery_rate`` is how fast each vital's drift
+    shrinks back toward zero per second once the machine is
+    running again (default the largest absolute drift rate)
+    — a positive finite number. A config with no drift does
+    nothing at all, so it is rejected. Which patient is
+    affected is not part of the config: it is the patient's
+    own dialysis (see ``Monitor.on_dialysis``) — the machine
+    treats whoever is on it, and a bed with no dialysis has
+    no machine to fail.
+    """
+    if not isinstance(dialysis, dict):
+        raise ValueError(
+            "dialysis_failure needs a dialysis config, got %r"
+            % (dialysis,)
+        )
+    drift = validate_drift(dialysis.get("drift"))
+    recovery_rate = dialysis.get(
+        "recovery_rate", max(abs(r) for r in drift.values())
+    )
+    if (
+        not isinstance(recovery_rate, (int, float))
+        or isinstance(recovery_rate, bool)
+        or recovery_rate != recovery_rate
+        or recovery_rate in (float("inf"), float("-inf"))
+        or recovery_rate <= 0
+    ):
+        raise ValueError(
+            "dialysis_failure: recovery_rate must be a positive "
             "finite number, got %r" % (recovery_rate,)
         )
     return {
@@ -557,9 +603,24 @@ class ChaosEvent:
     patient is on one is the patient's own flag, not part of
     the event. Once the ventilator is running again the drift
     shrinks back toward zero at ``recovery_rate`` per second.
+    ``dialysis_failure`` needs ``dialysis`` (see
+    :func:`validate_dialysis`): a bedside dialysis machine
+    fails for the window — a blood leak, a failed pump, a
+    clotted dialyser — so the patient on that bed loses renal
+    replacement and drifts: their true vitals move by the
+    configured ``drift`` rates per second while the machine
+    is down, so the alarms, the NEWS2 score, trend alerts,
+    and escalations all respond exactly as they would to a
+    patient genuinely deteriorating off their dialysis, and
+    a ``dialysis_failure`` alarm raises while the machine
+    is down. Only a bed on dialysis is affected — a bed
+    with no dialysis has no machine to fail — and which
+    patient is on one is the patient's own flag, not part of
+    the event. Once the machine is running again the drift
+    shrinks back toward zero at ``recovery_rate`` per second.
     """
 
-    def __init__(self, type, at, duration=None, bed=None, beds=None, med=None, drift=None, shortage=None, reason=None, oxygen=None, power=None, network=None, medication=None, pump=None, lab=None, ventilator=None):
+    def __init__(self, type, at, duration=None, bed=None, beds=None, med=None, drift=None, shortage=None, reason=None, oxygen=None, power=None, network=None, medication=None, pump=None, lab=None, ventilator=None, dialysis=None):
         if type not in VALID_TYPES:
             raise ValueError("unknown chaos type: %r" % type)
         if type == "stockout":
@@ -574,6 +635,8 @@ class ChaosEvent:
             lab = validate_lab_delay(lab)
         if type == "ventilator_failure":
             ventilator = validate_ventilator(ventilator)
+        if type == "dialysis_failure":
+            dialysis = validate_dialysis(dialysis)
         if type == "sensor_drift":
             drift = validate_drift(drift)
         if type == "staff_shortage":
@@ -610,6 +673,7 @@ class ChaosEvent:
         self.pump = pump
         self.lab = lab
         self.ventilator = ventilator
+        self.dialysis = dialysis
 
     @property
     def end(self):
@@ -1041,6 +1105,20 @@ class ChaosEngine:
                     m = ward.monitors[b]
                     m.ventilator_failure_until = ev.end
                     m.ventilator_failure_cfg = ev.ventilator
+            elif ev.type == "dialysis_failure":
+                # The bedside dialysis machine has failed for
+                # the window. The monitor holds the failure end
+                # and the config; the drift itself grows and
+                # recovers in the monitor tick (see
+                # Monitor._step_dialysis_failure), gated on
+                # the bed actually being on dialysis, so a bed
+                # not on dialysis never drifts. An overlapping
+                # event only extends the window and refreshes
+                # the config, like the ventilator failure above.
+                for b in ev.targets(ward):
+                    m = ward.monitors[b]
+                    m.dialysis_failure_until = ev.end
+                    m.dialysis_failure_cfg = ev.dialysis
             elif ev.type == "dropout":
                 for b in ev.targets(ward):
                     ward.monitors[b].offline_until = ev.end

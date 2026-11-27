@@ -13,7 +13,9 @@ between the ward and the server, network outages that cut the
 link to the central station while the monitors keep recording
 locally, pharmacy stockouts, infusion pump failures that stop
 a patient's drug mid-infusion, ventilator failures that leave a
-ventilated patient losing saturation and breathing faster, and
+ventilated patient losing saturation and breathing faster,
+dialysis failures that leave a patient off renal replacement
+with a climbing heart rate and blood pressure, and
 lab results that come back late and hold up a discharge. An HTTP endpoint streams the vitals as
 JSON lines so real health software can be tested against it, and a small
 CLI runs a scenario file.
@@ -321,6 +323,16 @@ python3 -m ward.cli scenarios/ventilator-failure.json --seed 42
 # endpoint is logged, never fatal)
 python3 -m ward.cli scenarios/ventilator-failure-hooks.json --seed 42
 
+# Dialysis failure: bed 0's dialysis machine stops from 5 s to
+# 60 s — a dialysis_failure alarm raises at 5 s and clears at
+# 60 s, the patient's heart rate climbs 0.5 bpm a tick to +27.5
+# by 59 s — reading 102.86 with the NEWS2 heart-rate component
+# at 1 — and the systolic pressure climbs 0.4 a tick to +22.0 —
+# reading 132.3 — then both recover 0.5 a tick once the machine
+# restarts, the systolic drift gone at 104 s and the heart rate
+# back to zero at 115 s, while bed 1, not on dialysis, is untouched
+python3 -m ward.cli scenarios/dialysis-failure.json --seed 42
+
 # Reproducible run
 python3 -m ward.cli scenarios/example.json --seed 42
 ```
@@ -428,6 +440,14 @@ python3 -m ward.cli scenarios/example.json --seed 42
   how many ventilators are down, how many beds are drifting,
   and the largest drift per vital — as JSON
   (503 while partitioned)
+- `GET /dialysis-failure` — per-bed dialysis-failure state:
+  whether the patient is on dialysis, whether the machine
+  is down, when it is running again, and how far each vital
+  has drifted for want of renal replacement, plus ward
+  totals — how many beds have a patient on dialysis, how
+  many machines are down, how many beds are drifting, and
+  the largest drift per vital — as JSON
+  (503 while partitioned)
 
 A reading looks like:
 
@@ -469,6 +489,7 @@ summary from `/news2`, and the sensor-drift summary from
 `/medication-stockout`, and the pump-failure summary from
 `/pump-failure`, and the lab-delay summary from `/lab-delay`,
 and the ventilator-failure summary from `/ventilator-failure`,
+and the dialysis-failure summary from `/dialysis-failure`,
 so a client gets bed occupancy, vitals, alarms, staffing,
 medication, and the intake queue in one message. Ping frames are answered with pong, close frames
 are echoed and the connection is then closed; text frames from the
@@ -668,6 +689,21 @@ Chaos types:
   restarts. A bed with no ventilator has no ventilator to fail
   and is untouched. Once the ventilator is running again the
   drift recovers at `recovery_rate` per second. See Ventilator
+  failure below.
+- `dialysis_failure` — a bedside dialysis machine fails for
+  `duration` seconds; needs `"dialysis"`, a map with
+  `"drift"` (a map of vital to drift rate per second,
+  required — for example `{"heart_rate": 0.5, "systolic": 0.4}`),
+  and `"recovery_rate"` (how fast each vital's drift shrinks
+  back per second once the machine is running again, default
+  the largest absolute drift rate). While it is down the patient
+  on that bed loses renal replacement and drifts: their true
+  vitals move by the configured rates per second, the alarms,
+  the NEWS2 score, trend alerts, and escalations all respond,
+  and a `dialysis_failure` alarm raises until the machine
+  restarts. A bed not on dialysis has no machine to fail
+  and is untouched. Once the machine is running again the
+  drift recovers at `recovery_rate` per second. See Dialysis
   failure below.
 
 `bed` targets one bed, `beds` targets several, neither targets all beds
@@ -1485,6 +1521,67 @@ example: over a seeded 70-tick run the same ward as
 `ventilator-failure.json` stops bed 0's ventilator at 5 s and
 restarts it at 60 s — POSTed to the configured webhook, with
 2 hook deliveries invoked and 0 failed against a stub server.
+
+## Dialysis failure
+
+A `dialysis_failure` chaos event stops a bedside dialysis
+machine for a window — a blood leak, a failed pump, a clotted
+dialyser — so the patient on that bed loses renal replacement
+and drifts off it:
+
+```json
+{"type": "dialysis_failure", "at": 5, "duration": 55,
+ "dialysis": {"drift": {"heart_rate": 0.5, "systolic": 0.4},
+              "recovery_rate": 0.5}}
+```
+
+A patient is on dialysis when their scenario entry says so
+(`"dialysis": true`), the way a patient is on a ventilator
+(`"ventilator"`) — dialysis is treatment the patient either
+has or has not, not a drug with a name. While the machine is
+down, a patient on dialysis has their true vitals move by the
+configured `drift` rates per second — fluid builds up, so the
+systolic pressure climbs and the heart rate climbs with it —
+so the alarms, the NEWS2 score, trend alerts, and escalations
+all respond exactly as they would to a patient genuinely
+deteriorating off renal replacement, and a `dialysis_failure`
+alarm raises the tick the machine fails and clears the tick it
+restarts. It is a real change, not a sensor error: the drift
+is added to the patient's walked vitals, like the
+ventilator-failure drift, and the reported reading is still
+clamped inside the plausible envelope. A bed not on dialysis
+has no machine to fail: its machine is down in the summary
+but its vitals never move and it never alarms. Once the
+machine is running again the drift shrinks back toward zero
+at `recovery_rate` per second. The drift is cleared on a new
+admission, like the oxygen deficit — and the new patient
+starts off dialysis unless one is named for them. Every
+reading carries its drift (`"dialysis_failure_drift"`) and
+whether the patient is on dialysis (`"dialysis"`), every
+snapshot carries a `"dialysis_failure"` object with the
+per-bed dialysis state — whether the patient is on dialysis,
+whether the machine is down, when it is running again, and
+how far each vital has drifted — and ward totals (how many
+beds have a patient on dialysis, how many machines are down,
+how many beds are drifting, and the largest drift per vital),
+served on its own by `GET /dialysis-failure` and carried in
+every WebSocket frame, and the run summary (`--summary`)
+reports the same totals from the last tick. One honest
+limitation, shared with the ventilator failure: the drift has
+no cap of its own — a very long failure keeps drifting the
+patient until the machine restarts, and only the
+plausible-envelope clamp on the reported reading bounds it,
+so a scenario with a long window should use a modest rate.
+See `scenarios/dialysis-failure.json` for a runnable example:
+over a seeded 130-tick run the machine is down from 5 s to
+60 s, the `dialysis_failure` alarm raises at 5 s and clears
+at 60 s, the patient's heart rate climbs 0.5 bpm a tick to
++27.5 at 59 s — reading 102.86 with the NEWS2 heart-rate
+component at 1 — and the systolic pressure climbs 0.4 a tick
+to +22.0 — reading 132.3 — then both recover 0.5 a tick once
+the machine restarts, the systolic drift gone at 104 s and
+the heart rate back to zero at 115 s, while the control bed,
+not on dialysis, never drifts.
 
 ## Lab-result delay
 
@@ -3953,3 +4050,17 @@ the hook totals.
   endpoint, and the run summary; off by default, configured per
   ward with `ventilator_failure_hooks` in the scenario) — done in
   v0.64.0
+- Dialysis failure (a `dialysis_failure` chaos event stops
+  a bedside dialysis machine for a window — a blood leak, a
+  failed pump, a clotted dialyser — so a patient on dialysis
+  drifts off renal replacement: their true vitals move by the
+  configured `drift` rates per second while the machine is
+  down, so the alarms, the NEWS2 score, trend alerts, and
+  escalations all respond, and a `dialysis_failure` alarm
+  raises until the machine restarts; a bed not on dialysis
+  has no machine to fail and is untouched; once the machine
+  is running again the drift recovers at `recovery_rate` per
+  second; the drift rides in every reading, a
+  `"dialysis_failure"` object in every snapshot, WebSocket
+  frame, a `GET /dialysis-failure` endpoint, and the run
+  summary) — done in v0.65.0

@@ -56,7 +56,7 @@ class Ward:
     snapshot to a JSONL file.
     """
 
-    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None, cleaning_s=30.0, meds=None, triage=None, discharge_planning=None, cleaning_capacity=None, discharge_readiness=None, oxygen=None, infusions=None, ventilators=None, consciousness=None, consciousness_dynamics=None, news2_trend=None, trend_alert_hooks=None, escalation_hooks=None, boarding_full_hooks=None, wait_time_hooks=None, missed_dose_hooks=None, discharge_readiness_hooks=None, discharge_priority_hooks=None, oxygen_outage_hooks=None, power_outage_hooks=None, sensor_drift_hooks=None, bed_blocker_hooks=None, network_outage_hooks=None, medication_stockout_hooks=None, pump_failure_hooks=None, lab_delay_hooks=None, lab_overdue_hooks=None, ventilator_failure_hooks=None, news2_staffing_escalation=None, labs=None):
+    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None, cleaning_s=30.0, meds=None, triage=None, discharge_planning=None, cleaning_capacity=None, discharge_readiness=None, oxygen=None, infusions=None, ventilators=None, dialysis=None, consciousness=None, consciousness_dynamics=None, news2_trend=None, trend_alert_hooks=None, escalation_hooks=None, boarding_full_hooks=None, wait_time_hooks=None, missed_dose_hooks=None, discharge_readiness_hooks=None, discharge_priority_hooks=None, oxygen_outage_hooks=None, power_outage_hooks=None, sensor_drift_hooks=None, bed_blocker_hooks=None, network_outage_hooks=None, medication_stockout_hooks=None, pump_failure_hooks=None, lab_delay_hooks=None, lab_overdue_hooks=None, ventilator_failure_hooks=None, news2_staffing_escalation=None, labs=None):
         if not 1 <= beds <= 64:
             raise ValueError("beds must be 1..64")
         if rate_hz <= 0:
@@ -381,6 +381,11 @@ class Ward:
                 if ventilators is not None and i < len(ventilators)
                 else False
             )
+            bed_dialysis = (
+                dialysis[i]
+                if dialysis is not None and i < len(dialysis)
+                else False
+            )
             bed_consciousness = (
                 consciousness[i]
                 if consciousness is not None and i < len(consciousness)
@@ -397,7 +402,7 @@ class Ward:
                 if labs is not None and i < len(labs)
                 else None
             )
-            monitor = Monitor(i, profile, rng=self.rng, acuity=acuity, meds=bed_meds, on_oxygen=on_oxygen, infusion=bed_infusion, on_ventilator=bed_ventilator, consciousness=bed_consciousness, consciousness_dynamics=bed_dynamics, news2_trend=self.news2_trend, trend_alert_hooks=self.trend_alert_hooks, escalation_hooks=self.escalation_hooks, missed_dose_hooks=self.missed_dose_hooks, discharge_readiness_hooks=self.discharge_readiness_hooks, labs=bed_labs)
+            monitor = Monitor(i, profile, rng=self.rng, acuity=acuity, meds=bed_meds, on_oxygen=on_oxygen, infusion=bed_infusion, on_ventilator=bed_ventilator, on_dialysis=bed_dialysis, consciousness=bed_consciousness, consciousness_dynamics=bed_dynamics, news2_trend=self.news2_trend, trend_alert_hooks=self.trend_alert_hooks, escalation_hooks=self.escalation_hooks, missed_dose_hooks=self.missed_dose_hooks, discharge_readiness_hooks=self.discharge_readiness_hooks, labs=bed_labs)
             # With a timeline, beds start unadmitted and come online as
             # the timeline admits them; without one, all beds start open.
             if timeline is not None:
@@ -608,7 +613,7 @@ class Ward:
         # in, and before the snapshot, so the event is in it.
         # A tick where the order is unchanged fires nothing.
         self._check_priority_order()
-        snap = {"t": self.elapsed, "beds": readings, "staffing": self.staffing_summary(), "turnover": self.turnover_summary(), "meds": self.meds_summary(), "triage": self.triage_summary(), "arrivals": self.arrivals_summary(), "discharge": self.discharge_summary(), "discharge_readiness": self.readiness_summary(), "discharge_priority": self.discharge_priority_summary(), "early_warning": self.early_warning_summary(), "sensor_drift": self.sensor_drift_summary(), "bed_blocker": self.bed_blocker_summary(), "oxygen_outage": self.oxygen_outage_summary(), "power_outage": self.power_outage_summary(), "network_outage": self.network_outage_summary(), "medication_stockout": self.medication_stockout_summary(), "pump_failure": self.pump_failure_summary(), "lab_delay": self.lab_delay_summary(), "ventilator_failure": self.ventilator_failure_summary()}
+        snap = {"t": self.elapsed, "beds": readings, "staffing": self.staffing_summary(), "turnover": self.turnover_summary(), "meds": self.meds_summary(), "triage": self.triage_summary(), "arrivals": self.arrivals_summary(), "discharge": self.discharge_summary(), "discharge_readiness": self.readiness_summary(), "discharge_priority": self.discharge_priority_summary(), "early_warning": self.early_warning_summary(), "sensor_drift": self.sensor_drift_summary(), "bed_blocker": self.bed_blocker_summary(), "oxygen_outage": self.oxygen_outage_summary(), "power_outage": self.power_outage_summary(), "network_outage": self.network_outage_summary(), "medication_stockout": self.medication_stockout_summary(), "pump_failure": self.pump_failure_summary(), "lab_delay": self.lab_delay_summary(), "ventilator_failure": self.ventilator_failure_summary(), "dialysis_failure": self.dialysis_failure_summary()}
         with self._lock:
             self.latest = snap
         if self.recorder is not None:
@@ -1503,6 +1508,45 @@ class Ward:
             ),
         }
 
+    def dialysis_failure_summary(self):
+        """Per-bed dialysis-failure state and ward totals.
+
+        ``beds`` carries each bed's dialysis state — whether
+        the patient is on dialysis, whether the machine is
+        down, when it is running again, and how far each
+        vital has drifted for want of renal replacement —
+        ``beds_on_dialysis`` counts the patients on dialysis,
+        ``beds_affected`` counts the beds whose machine is
+        down, ``beds_drifting`` counts the ones whose vitals
+        are currently off (including a patient still
+        recovering after the machine restarted), and
+        ``max_drift`` is the largest absolute drift on any bed
+        per vital, so a client can see at a glance how far the
+        ward's dialysis patients have drifted off treatment
+        and how far they still have to recover.
+        """
+        beds = [
+            m.dialysis_failure_detail(self.elapsed)
+            for m in self.monitors
+        ]
+        max_drift = {}
+        for b in beds:
+            for vital, drift in b["drift"].items():
+                if abs(drift) > abs(max_drift.get(vital, 0.0)):
+                    max_drift[vital] = drift
+        return {
+            "t": self.elapsed,
+            "beds": beds,
+            "beds_on_dialysis": sum(
+                1 for b in beds if b["on_dialysis"]
+            ),
+            "beds_affected": sum(
+                1 for b in beds if b["failure_active"]
+            ),
+            "beds_drifting": sum(1 for b in beds if b["drifting"]),
+            "max_drift": max_drift,
+        }
+
     def lab_delay_summary(self):
         """Per-bed lab-delay state and ward totals.
 
@@ -2135,12 +2179,12 @@ class Ward:
         summary["cleaning_queue"] = self.cleaning_queue()
         return summary
 
-    def admit(self, bed_id, profile=None, acuity=None, on_oxygen=None, infusion=None, consciousness=None, labs=None, on_ventilator=None):
+    def admit(self, bed_id, profile=None, acuity=None, on_oxygen=None, infusion=None, consciousness=None, labs=None, on_ventilator=None, on_dialysis=None):
         """Admit a new patient to an available bed.
 
         Raises ValueError if the bed is occupied or still cleaning.
         """
-        self._monitor(bed_id).admit(self.elapsed, profile=profile, acuity=acuity, on_oxygen=on_oxygen, infusion=infusion, consciousness=consciousness, labs=labs, on_ventilator=on_ventilator)
+        self._monitor(bed_id).admit(self.elapsed, profile=profile, acuity=acuity, on_oxygen=on_oxygen, infusion=infusion, consciousness=consciousness, labs=labs, on_ventilator=on_ventilator, on_dialysis=on_dialysis)
 
     def _monitor(self, bed_id):
         if not 0 <= bed_id < self.beds:

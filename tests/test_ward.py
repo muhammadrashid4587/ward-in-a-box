@@ -13513,6 +13513,416 @@ class TestVentilatorFailure(unittest.TestCase):
         self.assertEqual(snaps, snaps2)
 
 
+class TestDialysisFailure(unittest.TestCase):
+    # A dialysis failure: bed 0's dialysis machine stops from
+    # t=5 for 55 s, so the patient loses renal replacement —
+    # their heart rate climbs 0.5 bpm a tick and their systolic
+    # pressure 0.4 mmHg a tick while the machine is down, then
+    # both recover 0.5 a tick once it restarts — and a
+    # dialysis_failure alarm raises until the machine is
+    # running again. Bed 1, not on dialysis, has no machine
+    # to fail and never drifts.
+    DIAL = {
+        "drift": {"heart_rate": 0.5, "systolic": 0.4},
+        "recovery_rate": 0.5,
+    }
+
+    def _dial_ward(self):
+        return Ward(
+            beds=2,
+            profiles=["stable", "stable"],
+            dialysis=[True, False],
+            chaos=[
+                ChaosEvent(
+                    "dialysis_failure",
+                    at=5,
+                    duration=55,
+                    bed=0,
+                    dialysis=self.DIAL,
+                )
+            ],
+            seed=42,
+        )
+
+    def test_dialysis_config_validation(self):
+        # A dialysis-failure event needs a dialysis config.
+        with self.assertRaises(ValueError):
+            ChaosEvent("dialysis_failure", at=0, duration=10, bed=0)
+        with self.assertRaises(ValueError):
+            ChaosEvent(
+                "dialysis_failure",
+                at=0,
+                duration=10,
+                bed=0,
+                dialysis="heart_rate",
+            )
+        # The drift map is required: unknown vitals and all-zero
+        # rates are rejected, like a sensor drift.
+        for bad_drift in (None, {}, {"heart_rate": 0}, {"wbc": 0.5}):
+            with self.assertRaises(ValueError):
+                ChaosEvent(
+                    "dialysis_failure",
+                    at=0,
+                    duration=10,
+                    bed=0,
+                    dialysis={"drift": bad_drift},
+                )
+        # The recovery rate must be positive too.
+        with self.assertRaises(ValueError):
+            ChaosEvent(
+                "dialysis_failure",
+                at=0,
+                duration=10,
+                bed=0,
+                dialysis={
+                    "drift": {"heart_rate": 0.5},
+                    "recovery_rate": 0,
+                },
+            )
+        # Defaults: the recovery rate is the largest absolute
+        # drift rate unless told otherwise.
+        ev = ChaosEvent(
+            "dialysis_failure",
+            at=0,
+            duration=10,
+            bed=0,
+            dialysis={"drift": {"heart_rate": 0.5, "systolic": 0.4}},
+        )
+        self.assertEqual(
+            ev.dialysis,
+            {
+                "drift": {"heart_rate": 0.5, "systolic": 0.4},
+                "recovery_rate": 0.5,
+            },
+        )
+        ev = ChaosEvent(
+            "dialysis_failure",
+            at=0,
+            duration=10,
+            bed=0,
+            dialysis=self.DIAL,
+        )
+        self.assertEqual(ev.dialysis, self.DIAL)
+
+    def test_dialysis_validation(self):
+        # A dialysis flag is a bool, off by default.
+        with self.assertRaises(ValueError):
+            Monitor(0, on_dialysis="yes")
+        self.assertTrue(Monitor(0, on_dialysis=True).on_dialysis)
+        self.assertFalse(Monitor(0).on_dialysis)
+
+    def test_vitals_drift_while_machine_down(self):
+        ward = self._dial_ward()
+        snaps = [ward.tick() for _ in range(60)]
+        # Nothing drifts before the machine fails at t=5.
+        self.assertEqual(
+            snaps[3]["beds"][0]["dialysis_failure_drift"], {}
+        )
+        # The drift ramps exactly: heart rate 0.5 bpm a tick up
+        # and systolic 0.4 mmHg a tick up from t=5, so +27.5 and
+        # +22.0 by t=59 — and the reported vitals carry it,
+        # while the control bed never drifts.
+        self.assertEqual(
+            snaps[4]["beds"][0]["dialysis_failure_drift"],
+            {"heart_rate": 0.5, "systolic": 0.4},
+        )
+        self.assertEqual(
+            snaps[58]["beds"][0]["dialysis_failure_drift"],
+            {"heart_rate": 27.5, "systolic": 22.0},
+        )
+        self.assertEqual(snaps[58]["beds"][0]["heart_rate"], 102.86)
+        self.assertEqual(snaps[58]["beds"][0]["systolic"], 132.3)
+        self.assertTrue(
+            all(
+                s["beds"][1]["dialysis_failure_drift"] == {}
+                for s in snaps
+            )
+        )
+        # The drift is a real deterioration: the heart-rate
+        # component of the NEWS2 score climbs with it, to 1
+        # at t=59.
+        self.assertEqual(
+            snaps[58]["beds"][0]["news2"]["components"]["heart_rate"],
+            1,
+        )
+        # The per-bed detail: the failure window and the drift.
+        detail = snaps[29]["dialysis_failure"]["beds"][0]
+        self.assertTrue(detail["failure_active"])
+        self.assertEqual(detail["failure_until"], 60.0)
+        self.assertTrue(detail["on_dialysis"])
+        self.assertEqual(
+            detail["drift"], {"heart_rate": 13.0, "systolic": 10.4}
+        )
+        self.assertTrue(detail["drifting"])
+        summary = snaps[29]["dialysis_failure"]
+        self.assertEqual(summary["beds_on_dialysis"], 1)
+        self.assertEqual(summary["beds_affected"], 1)
+        self.assertEqual(summary["beds_drifting"], 1)
+        self.assertEqual(
+            summary["max_drift"],
+            {"heart_rate": 13.0, "systolic": 10.4},
+        )
+
+    def test_dialysis_failure_alarm(self):
+        ward = self._dial_ward()
+        snaps = [ward.tick() for _ in range(100)]
+        # The alarm raises the tick the machine fails and
+        # clears the tick it restarts — the control bed never
+        # alarms.
+        self.assertNotIn(
+            "dialysis_failure", snaps[3]["beds"][0]["alarms"]
+        )
+        self.assertIn(
+            "dialysis_failure", snaps[4]["beds"][0]["alarms"]
+        )
+        self.assertIn(
+            "dialysis_failure", snaps[58]["beds"][0]["alarms"]
+        )
+        self.assertNotIn(
+            "dialysis_failure", snaps[59]["beds"][0]["alarms"]
+        )
+        self.assertTrue(
+            all(
+                "dialysis_failure" not in s["beds"][1]["alarms"]
+                for s in snaps
+            )
+        )
+        history = list(ward.monitors[0].alarm_history)
+        self.assertEqual(
+            [a for a in history if a["alarm"] == "dialysis_failure"],
+            [{"alarm": "dialysis_failure", "raised_t": 5.0,
+              "cleared_t": 60.0}],
+        )
+
+    def test_drift_recovers_after_machine_restarts(self):
+        ward = self._dial_ward()
+        snaps = [ward.tick() for _ in range(120)]
+        # The machine restarts at t=60: both drifts shrink
+        # 0.5 a tick from +27.5 and +22.0, so +27.0 and +21.5
+        # at t=60, the systolic drift is gone at t=104, and
+        # the heart-rate drift — the larger one — is gone at
+        # t=115.
+        self.assertEqual(
+            snaps[59]["beds"][0]["dialysis_failure_drift"],
+            {"heart_rate": 27.0, "systolic": 21.5},
+        )
+        self.assertEqual(
+            snaps[86]["beds"][0]["dialysis_failure_drift"],
+            {"heart_rate": 13.5, "systolic": 8.0},
+        )
+        self.assertEqual(
+            snaps[103]["beds"][0]["dialysis_failure_drift"],
+            {"heart_rate": 5.0},
+        )
+        self.assertEqual(
+            snaps[114]["beds"][0]["dialysis_failure_drift"], {}
+        )
+        self.assertFalse(
+            snaps[115]["dialysis_failure"]["beds"][0]["drifting"]
+        )
+        self.assertEqual(
+            snaps[115]["dialysis_failure"]["beds_drifting"], 0
+        )
+        self.assertEqual(
+            snaps[115]["dialysis_failure"]["max_drift"], {}
+        )
+
+    def test_no_drift_without_dialysis(self):
+        # A ward-wide dialysis failure with no dialysis
+        # anywhere: the machines are down, but nothing drifts
+        # and no alarm raises, because there is no machine
+        # to fail.
+        ward = Ward(
+            beds=2,
+            profiles=["stable", "stable"],
+            chaos=[
+                ChaosEvent(
+                    "dialysis_failure",
+                    at=5,
+                    duration=55,
+                    dialysis=self.DIAL,
+                )
+            ],
+            seed=42,
+        )
+        snaps = [ward.tick() for _ in range(70)]
+        self.assertTrue(
+            all(
+                s["beds"][0]["dialysis_failure_drift"] == {}
+                for s in snaps
+            )
+        )
+        # Both machines are down inside the window, but
+        # neither bed is drifting and no patient is on one.
+        self.assertEqual(
+            snaps[29]["dialysis_failure"]["beds_on_dialysis"], 0
+        )
+        self.assertEqual(snaps[29]["dialysis_failure"]["beds_affected"], 2)
+        self.assertEqual(snaps[29]["dialysis_failure"]["beds_drifting"], 0)
+        self.assertNotIn(
+            "dialysis_failure", snaps[29]["beds"][0]["alarms"]
+        )
+
+    def test_drift_clears_on_new_admission(self):
+        ward = Ward(
+            beds=2,
+            profiles=["stable", "stable"],
+            dialysis=[True, False],
+            chaos=[
+                ChaosEvent(
+                    "dialysis_failure",
+                    at=5,
+                    duration=55,
+                    bed=0,
+                    dialysis=self.DIAL,
+                )
+            ],
+            seed=42,
+            cleaning_s=1.0,
+        )
+        for _ in range(30):
+            ward.tick()
+        m = ward.monitors[0]
+        self.assertEqual(
+            m.dialysis_failure_drift,
+            {"heart_rate": 13.0, "systolic": 10.4},
+        )
+        # Discharged, cleaned, and re-admitted — the new patient
+        # starts with no drift and no dialysis, even though the
+        # machine is still down.
+        ward.discharge(0)
+        ward.tick()
+        ward.admit(0, profile="stable")
+        self.assertEqual(m.dialysis_failure_drift, {})
+        self.assertFalse(m.on_dialysis)
+
+    def test_dialysis_failure_summary_and_endpoint(self):
+        ward = self._dial_ward()
+        snaps = [ward.tick() for _ in range(40)]
+        summary = snaps[39]["dialysis_failure"]
+        self.assertEqual(summary["beds_on_dialysis"], 1)
+        self.assertEqual(summary["beds_affected"], 1)
+        self.assertEqual(summary["beds_drifting"], 1)
+        self.assertEqual(
+            summary["max_drift"],
+            {"heart_rate": 18.0, "systolic": 14.4},
+        )
+        server, port = serve_in_thread(ward)
+        try:
+            status, body = get(port, "/dialysis-failure")
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                json.loads(body)["beds"][0]["drift"],
+                {"heart_rate": 18.0, "systolic": 14.4},
+            )
+            self.assertEqual(
+                json.loads(body)["beds_on_dialysis"], 1
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+        # 503 while partitioned, like the other live endpoints.
+        partitioned = Ward(
+            beds=2,
+            chaos=[ChaosEvent("partition", at=1, duration=5)],
+            seed=4,
+        )
+        partitioned.tick()  # t=1: partitioned
+        server, port = serve_in_thread(partitioned)
+        try:
+            status, body = get(port, "/dialysis-failure")
+            self.assertEqual(status, 503)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_summary_reports_dialysis_failure(self):
+        ward = self._dial_ward()
+        path = os.path.join(tempfile.mkdtemp(), "run.jsonl")
+        with Recorder(path, ward.beds, ward.rate_hz, seed=42) as rec:
+            ward.recorder = rec
+            for _ in range(40):
+                ward.tick()
+        summary = summarize(path)
+        self.assertEqual(
+            summary["dialysis_failure"],
+            {
+                "beds_on_dialysis": 1,
+                "beds_affected": 1,
+                "beds_drifting": 1,
+                "max_drift": {"heart_rate": 18.0, "systolic": 14.4},
+                "beds": {"0": {"heart_rate": 18.0, "systolic": 14.4}},
+            },
+        )
+
+    def test_websocket_carries_dialysis_failure(self):
+        ward = self._dial_ward()
+        for _ in range(10):
+            ward.tick()  # t=10: the drift is +3.0 HR, +2.4 systolic
+        server, port = serve_in_thread(ward)
+        try:
+            ws = WsClient(port)
+            try:
+                msg = json.loads(ws.read_until_opcode(1))
+                # The frame is the next tick, t=11, so the drift
+                # has grown one more step past the t=10 tick.
+                self.assertEqual(
+                    msg["dialysis_failure"]["beds_affected"], 1
+                )
+                self.assertEqual(
+                    msg["dialysis_failure"]["beds"][0]["drift"],
+                    {"heart_rate": 3.5, "systolic": 2.8},
+                )
+                self.assertEqual(
+                    msg["beds"][0]["dialysis_failure_drift"],
+                    {"heart_rate": 3.5, "systolic": 2.8},
+                )
+            finally:
+                ws.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_scenario_file_loads_and_runs(self):
+        cfg = load_scenario("scenarios/dialysis-failure.json")
+        self.assertEqual(len(cfg["chaos"]), 1)
+        self.assertEqual(cfg["chaos"][0].type, "dialysis_failure")
+        self.assertEqual(cfg["chaos"][0].dialysis, self.DIAL)
+        self.assertEqual(cfg["dialysis"], [True, False])
+        ward = build_ward(cfg, seed=42)
+        snaps = [ward.tick() for _ in range(130)]
+        # Ward-wide, so both beds' machines are down from t=5
+        # to t=60 — but only the bed on dialysis drifts,
+        # heart rate 0.5 a tick up and systolic 0.4 a tick up
+        # from t=5 to +27.5 and +22.0 at t=59, then back to
+        # zero by t=115 once the machine restarts.
+        self.assertEqual(
+            snaps[58]["dialysis_failure"]["beds_affected"], 2
+        )
+        self.assertEqual(
+            snaps[58]["dialysis_failure"]["beds_drifting"], 1
+        )
+        self.assertEqual(
+            snaps[58]["beds"][0]["dialysis_failure_drift"],
+            {"heart_rate": 27.5, "systolic": 22.0},
+        )
+        self.assertEqual(
+            snaps[114]["beds"][0]["dialysis_failure_drift"], {}
+        )
+        # The dialysis_failure alarm raises at 5 s and clears
+        # at 60 s, when the machine restarts.
+        self.assertEqual(
+            [a for a in ward.monitors[0].alarm_history
+             if a["alarm"] == "dialysis_failure"],
+            [{"alarm": "dialysis_failure", "raised_t": 5.0,
+              "cleared_t": 60.0}],
+        )
+        # Seeded, so a second run reproduces every tick.
+        ward2 = build_ward(cfg, seed=42)
+        snaps2 = [ward2.tick() for _ in range(130)]
+        self.assertEqual(snaps, snaps2)
+
+
 class TestLabDelay(unittest.TestCase):
     # A lab-result delay: bed 0's bloods are due at t=30, but the
     # lab is slow from t=5 for 60 s, so they land 120 s late, at

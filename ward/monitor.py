@@ -52,12 +52,13 @@ class Monitor:
     seconds); the monitor clears each one when its time passes.
     """
 
-    def __init__(self, bed_id, profile="stable", rng=None, acuity=3, meds=None, on_oxygen=False, infusion=None, consciousness="alert", consciousness_dynamics=None, news2_trend=None, trend_alert_hooks=None, escalation_hooks=None, missed_dose_hooks=None, discharge_readiness_hooks=None, labs=None, on_ventilator=False):
+    def __init__(self, bed_id, profile="stable", rng=None, acuity=3, meds=None, on_oxygen=False, infusion=None, consciousness="alert", consciousness_dynamics=None, news2_trend=None, trend_alert_hooks=None, escalation_hooks=None, missed_dose_hooks=None, discharge_readiness_hooks=None, labs=None, on_ventilator=False, on_dialysis=False):
         self.bed_id = bed_id
         self.profile = profile
         self.acuity = validate_acuity(acuity)
         self.on_oxygen = self._validate_on_oxygen(on_oxygen)
         self.on_ventilator = self._validate_on_ventilator(on_ventilator)
+        self.on_dialysis = self._validate_on_dialysis(on_dialysis)
         self.infusion = self._validate_infusion(infusion)
         self.consciousness = validate_consciousness(consciousness)
         self.consciousness_dynamics = validate_consciousness_dynamics(
@@ -279,6 +280,26 @@ class Monitor:
         self.ventilator_failure_until = None
         self.ventilator_failure_cfg = None
         self.ventilator_failure_drift = {}
+        # Dialysis failure: the bedside dialysis machine has
+        # failed until ``dialysis_failure_until`` (elapsed
+        # seconds), with ``dialysis_failure_cfg`` carrying the
+        # drift rates and the recovery rate. While the machine
+        # is down and this bed's patient is on dialysis
+        # (``self.on_dialysis``), the patient's true vitals
+        # drift by the configured rates — a real deterioration
+        # off renal replacement, not a sensor error — held in
+        # ``dialysis_failure_drift`` per vital, in that vital's
+        # own units. Once the machine is running again the
+        # drift shrinks back toward zero at the recovery rate.
+        # Only vitals with a non-zero drift are listed. The drift
+        # is a property of the patient, not the sensor: it feeds
+        # the alarms and the NEWS2 score exactly like the
+        # ventilator-failure drift does, and it is cleared on a
+        # new admission, like the deficit. A bed not on dialysis
+        # never drifts — it has no machine to fail.
+        self.dialysis_failure_until = None
+        self.dialysis_failure_cfg = None
+        self.dialysis_failure_drift = {}
         self.seq = 0
         # False until the ward admits this bed (scenario timeline); an
         # unadmitted bed emits no readings at all.
@@ -373,6 +394,18 @@ class Monitor:
                 % (on_ventilator,)
             )
         return on_ventilator
+
+    @staticmethod
+    def _validate_on_dialysis(on_dialysis):
+        """Whether the patient is on dialysis: a bool, False
+        for a patient with working kidneys. A non-bool is a
+        scenario error, not a patient off dialysis."""
+        if not isinstance(on_dialysis, bool):
+            raise ValueError(
+                "on_dialysis must be a bool, got %r"
+                % (on_dialysis,)
+            )
+        return on_dialysis
 
     @staticmethod
     def _validate_infusion(infusion):
@@ -735,6 +768,36 @@ class Monitor:
             "drifting": bool(self.ventilator_failure_drift),
         }
 
+    def dialysis_failure_detail(self, now):
+        """Per-bed dialysis-failure state as plain JSON data.
+
+        ``failure_active`` is True while a dialysis-failure
+        event holds this bed's dialysis machine down, with when
+        it is running again; ``on_dialysis`` says whether the
+        patient is on dialysis at all (False for a bed not on
+        dialysis, which has no machine to fail); ``drift``
+        is how far each vital has moved from the patient's
+        walked vitals for want of renal replacement, and
+        ``drifting`` is True while any vital is off — including
+        after the machine restarts, while the patient is
+        still recovering.
+        """
+        active = (
+            self.dialysis_failure_until is not None
+            and now < self.dialysis_failure_until
+        )
+        return {
+            "bed": self.bed_id,
+            "admitted": self.admitted,
+            "on_dialysis": self.on_dialysis,
+            "failure_active": active,
+            "failure_until": (
+                self.dialysis_failure_until if active else None
+            ),
+            "drift": dict(self.dialysis_failure_drift),
+            "drifting": bool(self.dialysis_failure_drift),
+        }
+
     def apply_lab_delay(self, event):
         """Push out the lab results a lab-delay event covers.
 
@@ -902,7 +965,7 @@ class Monitor:
         self.turnovers += 1
         self.total_cleaning_s = round(self.total_cleaning_s + cleaning_s, 3)
 
-    def admit(self, now, profile=None, acuity=None, on_oxygen=None, infusion=None, consciousness=None, labs=None, on_ventilator=None):
+    def admit(self, now, profile=None, acuity=None, on_oxygen=None, infusion=None, consciousness=None, labs=None, on_ventilator=None, on_dialysis=None):
         """Admit a new patient to an available bed.
 
         Raises ValueError if the bed is occupied, still cleaning,
@@ -917,7 +980,9 @@ class Monitor:
         previous patient's consciousness never carries over either.
         The new patient is not on a ventilator unless
         ``on_ventilator`` says so — the previous patient's
-        ventilator never carries over.
+        ventilator never carries over. The new patient is not
+        on dialysis unless ``on_dialysis`` says so — the
+        previous patient's dialysis never carries over.
         The new patient waits on no lab results unless ``labs``
         orders some: the previous patient's results — landed or
         still pending — never carry over.
@@ -943,6 +1008,9 @@ class Monitor:
         )
         self.on_ventilator = self._validate_on_ventilator(
             False if on_ventilator is None else on_ventilator
+        )
+        self.on_dialysis = self._validate_on_dialysis(
+            False if on_dialysis is None else on_dialysis
         )
         self.infusion = self._validate_infusion(infusion)
         self.consciousness = validate_consciousness(
@@ -974,7 +1042,11 @@ class Monitor:
         # goes the same way: the new patient starts on their own
         # ventilator, and a ventilator failure still running
         # starts drifting them again from zero — if they are on
-        # a ventilator at all.
+        # a ventilator at all. The dialysis-failure drift goes
+        # the same way: the new patient starts on their own
+        # dialysis, and a dialysis failure still running starts
+        # drifting them again from zero — if they are on
+        # dialysis at all.
         # A power outage goes the same way for the dark flag:
         # the new patient starts with a live monitor, and an
         # outage still running starts draining the battery
@@ -987,6 +1059,7 @@ class Monitor:
         self.med_stockout_drift = {}
         self.pump_failure_drift = {}
         self.ventilator_failure_drift = {}
+        self.dialysis_failure_drift = {}
         self.power_went_dark = False
         self.power_dark_ticks = 0
         # A new admission starts with an empty network backlog:
@@ -1230,6 +1303,52 @@ class Monitor:
                         drift + step, 3
                     )
 
+    def _step_dialysis_failure(self, now, dt=1.0):
+        """Grow or recover the dialysis-failure drift for
+        this tick.
+
+        Only a bed on dialysis is affected: while the machine
+        is down, each configured vital drifts by its rate per
+        second — a real deterioration, not a sensor error, so
+        the alarms and the NEWS2 score see it exactly like a
+        patient losing renal replacement would. Once the
+        machine is running again the drift shrinks by the
+        event's ``recovery_rate`` per second until the patient
+        is back to their walked vitals. The drift is pure
+        arithmetic on dt — no RNG — so a seeded run reproduces
+        it exactly. A bed not on dialysis never drifts; a
+        dialysis failure on it is recorded in the summary but
+        changes no vitals.
+        """
+        if self.dialysis_failure_cfg is None or not self.on_dialysis:
+            return
+        cfg = self.dialysis_failure_cfg
+        active = (
+            self.dialysis_failure_until is not None
+            and now < self.dialysis_failure_until
+        )
+        if active:
+            for vital, rate in cfg["drift"].items():
+                self.dialysis_failure_drift[vital] = round(
+                    self.dialysis_failure_drift.get(vital, 0.0)
+                    + rate * dt,
+                    3,
+                )
+        elif self.dialysis_failure_drift:
+            step = cfg["recovery_rate"] * dt
+            for vital in list(self.dialysis_failure_drift):
+                drift = self.dialysis_failure_drift[vital]
+                if abs(drift) <= step:
+                    self.dialysis_failure_drift.pop(vital, None)
+                elif drift > 0:
+                    self.dialysis_failure_drift[vital] = round(
+                        drift - step, 3
+                    )
+                else:
+                    self.dialysis_failure_drift[vital] = round(
+                        drift + step, 3
+                    )
+
     def reported_signs(self):
         """The vitals as the sensor reports them: true vitals
         plus the accumulated drift bias, clamped inside the
@@ -1248,7 +1367,9 @@ class Monitor:
         a failed infusion pump reports the walked vitals plus
         the pump drift the same way. A patient drifting off a
         failed ventilator reports the walked vitals plus the
-        ventilator drift the same way."""
+        ventilator drift the same way. A patient drifting off
+        a failed dialysis machine reports the walked vitals
+        plus the dialysis drift the same way."""
         out = {}
         for key, value in self.signs.items():
             lo, hi = PLAUSIBLE[key]
@@ -1256,6 +1377,7 @@ class Monitor:
             v += self.med_stockout_drift.get(key, 0.0)
             v += self.pump_failure_drift.get(key, 0.0)
             v += self.ventilator_failure_drift.get(key, 0.0)
+            v += self.dialysis_failure_drift.get(key, 0.0)
             if key == "spo2" and self.oxygen_deficit > 0:
                 floor = (
                     self.oxygen_outage_cfg["floor"]
@@ -1417,6 +1539,14 @@ class Monitor:
         # with no ventilator never drifts.
         self._step_ventilator_failure(now, dt)
 
+        # A dialysis failure drifts a patient whose dialysis
+        # machine has stopped before the reading is built, so
+        # this tick's reading, alarms, and NEWS2 score already
+        # carry the drift — and a patient recovering after the
+        # machine restarts climbs back just as fast. A bed
+        # not on dialysis never drifts.
+        self._step_dialysis_failure(now, dt)
+
         # Consciousness moves before the reading is built, so this
         # tick's reading, score, and snapshot already carry the new
         # level — a change is visible in the same tick it happens.
@@ -1443,6 +1573,7 @@ class Monitor:
             "on_oxygen": self.on_oxygen,
             "infusion": self.infusion,
             "ventilator": self.on_ventilator,
+            "dialysis": self.on_dialysis,
             "consciousness": self.consciousness,
             "stale": False,
             "on_battery": on_battery,
@@ -1452,6 +1583,9 @@ class Monitor:
             "pump_failure_drift": dict(self.pump_failure_drift),
             "ventilator_failure_drift": dict(
                 self.ventilator_failure_drift
+            ),
+            "dialysis_failure_drift": dict(
+                self.dialysis_failure_drift
             ),
             "labs_pending": self.labs.pending,
             **reported,
@@ -1485,6 +1619,17 @@ class Monitor:
             # itself, not the drift it causes.
             reading["alarms"] = reading["alarms"] + [
                 "ventilator_failure"
+            ]
+        if (
+            self.on_dialysis
+            and self.dialysis_failure_until is not None
+            and now < self.dialysis_failure_until
+        ):
+            # A failed dialysis machine raises an alarm until
+            # the machine is running again — the device fault
+            # itself, not the drift it causes.
+            reading["alarms"] = reading["alarms"] + [
+                "dialysis_failure"
             ]
         # NEWS2 early-warning score for this tick's vitals. The
         # score is a parallel track to the alarm list: it never

@@ -1,0 +1,1 @@
+{"beds":2,"chaos":[{"at":5,"dialysis":{"drift":{"heart_rate":0.5,"systolic":0.4},"recovery_rate":0.5},"duration":55,"type":"dialysis_failure"}],"host":"127.0.0.1","patients":[{"bed":0,"dialysis":true,"profile":"stable"},{"bed":1,"profile":"stable"}],"port":8080,"rate_hz":1.0}

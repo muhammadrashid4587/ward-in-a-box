@@ -157,6 +157,7 @@ def summarize(path):
     last_pump_failure = None
     last_lab_delay = None
     last_ventilator_failure = None
+    last_dialysis_failure = None
     with open(path) as f:
         for line in f:
             line = line.strip()
@@ -234,6 +235,8 @@ def summarize(path):
                 last_lab_delay = obj["lab_delay"]
             if isinstance(obj.get("ventilator_failure"), dict):
                 last_ventilator_failure = obj["ventilator_failure"]
+            if isinstance(obj.get("dialysis_failure"), dict):
+                last_dialysis_failure = obj["dialysis_failure"]
             for bed in obj["beds"]:
                 b = bed["bed"]
                 if not bed.get("online", True):
@@ -944,6 +947,34 @@ def summarize(path):
                 ),
             }
             if last_ventilator_failure is not None
+            else None
+        ),
+        # Dialysis-failure totals from the last tick: how many
+        # beds have a patient on dialysis, how many have
+        # their machine down, how many are drifting off
+        # treatment, the largest drift per vital, and each
+        # drifting bed's drift — so a run's failed machines
+        # and their clinical cost are visible without replaying
+        # every tick.
+        "dialysis_failure": (
+            {
+                "beds_on_dialysis": (
+                    last_dialysis_failure["beds_on_dialysis"]
+                ),
+                "beds_affected": (
+                    last_dialysis_failure["beds_affected"]
+                ),
+                "beds_drifting": (
+                    last_dialysis_failure["beds_drifting"]
+                ),
+                "max_drift": last_dialysis_failure["max_drift"],
+                "beds": {
+                    str(b["bed"]): b["drift"]
+                    for b in last_dialysis_failure["beds"]
+                    if b["drifting"]
+                },
+            }
+            if last_dialysis_failure is not None
             else None
         ),
     }
