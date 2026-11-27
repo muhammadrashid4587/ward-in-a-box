@@ -382,6 +382,11 @@ python3 -m ward.cli scenarios/alarm-storm-ack-per-bed.json --seed 42
 # averages 26.0 s and beds 1 and 2 average 30.5 s
 python3 -m ward.cli scenarios/alarm-storm-ack-totals.json --seed 42
 
+# Slowest-bed alert: the same burst twice, with a 30.0 s
+# mean-ack threshold — bed 0 averages 26.0 s and stays
+# quiet, beds 1 and 2 average 30.5 s and alert
+python3 -m ward.cli scenarios/alarm-storm-ack-slowest-bed.json --seed 42
+
 # Reproducible run
 python3 -m ward.cli scenarios/example.json --seed 42
 ```
@@ -518,8 +523,10 @@ python3 -m ward.cli scenarios/example.json --seed 42
   across storms (how many storms each bed raised in, how
   many of its storm alarms were raised, acked, and are
   still pending, and the mean and longest time it took to
-  clear a storm's alarms), the storm event history, and the
-  alarm-storm-hook totals, as JSON
+  clear a storm's alarms), the slowest-bed alert threshold
+  and the beds whose mean time to ack across the storms
+  they fully cleared is above it, the storm event history,
+  and the alarm-storm-hook totals, as JSON
   (503 while partitioned)
 
 A reading looks like:
@@ -1278,7 +1285,37 @@ from the storm's start — null while any of its alarms is
 still pending, so a dashboard can see which bed's alarms
 the nurses cleared last. A bed whose alarms were all acked
 before the storm started times at zero, like the storm
-itself. The `alarm_storm_acknowledged` hook event carries
+itself. The summary also totals the per-bed times across
+storms (`"bed_ack_totals"`): how many storms each bed
+raised in, how many of its storm alarms were raised,
+acked, and are still pending, and the mean and longest
+time it took to clear a storm's alarms — counting only
+the storms it fully cleared, null while none of its
+storms has fully cleared — so a dashboard can see which
+bed is slowest to clear over a whole run, not just
+inside one storm. And a ward that wants to hear about
+the bed falling behind without polling those totals sets
+a slowest-bed threshold on the storm detection config:
+
+```json
+{"alarm_storm": {"slowest_bed_alert_threshold_s": 30.0}}
+```
+
+While the threshold is set, any bed whose mean time to
+ack across the storms it fully cleared is above it is
+listed in `"slowest_bed_alerts"` — the bed, its mean and
+longest time, the threshold, and how many storms it
+raised in and cleared — in `GET /alarm-storm`, every
+snapshot and WebSocket frame, and the run summary
+(`--summary`). The threshold is off (null) by default,
+and a bed with no fully-cleared storm never alerts,
+however slow its still-open storms look, because its
+mean is null. See
+`scenarios/alarm-storm-ack-slowest-bed.json` for a
+runnable example: over a seeded 220-tick run the same
+burst twice leaves bed 0 averaging 26.0 s and quiet,
+while beds 1 and 2 average 30.5 s and alert against a
+30.0 s threshold. The `alarm_storm_acknowledged` hook event carries
 the same per-bed times. The summary totals it up:
 how many storms there have been, how many are
 acknowledged and how many are not, and the mean and
@@ -4584,7 +4621,17 @@ the hook totals.
   `GET /alarm-storm` endpoint, and the run summary, so a
   dashboard can see which bed is slowest to clear over a
   whole run, not just inside one storm) — done in v0.74.0
-- Next: a slowest-bed alert when one bed's mean time to
-  ack across storms crosses a configurable threshold, so
-  a dashboard hears about the bed falling behind instead
-  of having to poll the totals
+- Slowest-bed alert (a configurable mean-ack threshold on
+  the alarm-storm detection config — when a bed's mean
+  time to ack across the storms it fully cleared crosses
+  it, the bed is listed with its mean and longest time,
+  the threshold, and how many storms it raised in and
+  cleared, in the alarm-storm summary, every snapshot,
+  WebSocket frame, a `GET /alarm-storm` endpoint, and the
+  run summary, so a dashboard hears about the bed falling
+  behind instead of having to poll the totals; off by
+  default, and a bed with no fully-cleared storm never
+  alerts) — done in v0.75.0
+- Next: a slowest-bed alert hook event, so a ward hears
+  about the bed falling behind the moment it crosses the
+  threshold instead of having to poll the summary

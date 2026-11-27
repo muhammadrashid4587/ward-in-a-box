@@ -15350,15 +15350,27 @@ class TestAlarmStormHooks(unittest.TestCase):
     def test_validate_alarm_storm(self):
         self.assertEqual(
             validate_alarm_storm(None),
-            {"threshold": 10, "window_s": 60.0},
+            {
+                "threshold": 10,
+                "window_s": 60.0,
+                "slowest_bed_alert_threshold_s": None,
+            },
         )
         self.assertEqual(
             validate_alarm_storm({"threshold": 5}),
-            {"threshold": 5, "window_s": 60.0},
+            {
+                "threshold": 5,
+                "window_s": 60.0,
+                "slowest_bed_alert_threshold_s": None,
+            },
         )
         self.assertEqual(
             validate_alarm_storm({"window_s": 30}),
-            {"threshold": 10, "window_s": 30.0},
+            {
+                "threshold": 10,
+                "window_s": 30.0,
+                "slowest_bed_alert_threshold_s": None,
+            },
         )
         with self.assertRaises(ValueError):
             validate_alarm_storm({"threshold": 0})
@@ -16194,6 +16206,125 @@ class TestAlarmStormHooks(unittest.TestCase):
         self.assertEqual(
             ward.alarm_storm_summary()["bed_ack_totals"], []
         )
+
+    def test_scenario_alarm_storm_slowest_bed_alert(self):
+        # The same burst twice, with a 30.0 s mean-ack
+        # threshold: bed 0 averages 26.0 s and stays quiet,
+        # beds 1 and 2 average 30.5 s and alert, each with
+        # both storms cleared. The run summary carries the
+        # same threshold and alerts from the last tick.
+        cfg = load_scenario(
+            os.path.join(
+                HERE,
+                "..",
+                "scenarios",
+                "alarm-storm-ack-slowest-bed.json",
+            )
+        )
+        path = os.path.join(tempfile.mkdtemp(), "run.jsonl")
+        ward = build_ward(cfg, seed=42)
+        with Recorder(path, ward.beds, ward.rate_hz, seed=42) as rec:
+            ward.recorder = rec
+            for _ in range(220):
+                ward.tick()
+        summary = ward.alarm_storm_summary()
+        self.assertEqual(
+            summary["slowest_bed_alert_threshold_s"], 30.0
+        )
+        self.assertEqual(
+            summary["slowest_bed_alerts"],
+            [
+                {
+                    "bed": 1,
+                    "mean_time_to_ack_s": 30.5,
+                    "max_time_to_ack_s": 31.0,
+                    "threshold_s": 30.0,
+                    "storms": 2,
+                    "cleared_storms": 2,
+                },
+                {
+                    "bed": 2,
+                    "mean_time_to_ack_s": 30.5,
+                    "max_time_to_ack_s": 31.0,
+                    "threshold_s": 30.0,
+                    "storms": 2,
+                    "cleared_storms": 2,
+                },
+            ],
+        )
+        run = summarize(path)
+        self.assertEqual(
+            run["alarm_storm"]["slowest_bed_alert_threshold_s"],
+            30.0,
+        )
+        self.assertEqual(
+            run["alarm_storm"]["slowest_bed_alerts"],
+            summary["slowest_bed_alerts"],
+        )
+
+    def test_alarm_storm_slowest_bed_alert_off_by_default(self):
+        # No threshold configured: the same two storms
+        # clear at the same means, but nothing alerts.
+        cfg = load_scenario(
+            os.path.join(
+                HERE, "..", "scenarios", "alarm-storm-ack-totals.json"
+            )
+        )
+        ward = build_ward(cfg, seed=42)
+        for _ in range(220):
+            ward.tick()
+        summary = ward.alarm_storm_summary()
+        self.assertIsNone(
+            summary["slowest_bed_alert_threshold_s"]
+        )
+        self.assertEqual(summary["slowest_bed_alerts"], [])
+
+    def test_alarm_storm_slowest_bed_alert_ignores_uncleared_storms(self):
+        # Twenty ticks in, the first storm is open and no
+        # bed has cleared anything yet — a threshold of
+        # 0.1 s still alerts on nobody, because a bed with
+        # no fully-cleared storm has a null mean.
+        cfg = load_scenario(
+            os.path.join(
+                HERE,
+                "..",
+                "scenarios",
+                "alarm-storm-ack-slowest-bed.json",
+            )
+        )
+        ward = build_ward(cfg, seed=42)
+        for _ in range(20):
+            ward.tick()
+        summary = ward.alarm_storm_summary()
+        self.assertEqual(summary["slowest_bed_alerts"], [])
+        self.assertTrue(
+            all(
+                b["mean_time_to_ack_s"] is None
+                for b in summary["bed_ack_totals"]
+            )
+        )
+
+    def test_validate_alarm_storm_slowest_bed_threshold(self):
+        self.assertEqual(
+            validate_alarm_storm(
+                {"slowest_bed_alert_threshold_s": 30}
+            ),
+            {
+                "threshold": 10,
+                "window_s": 60.0,
+                "slowest_bed_alert_threshold_s": 30.0,
+            },
+        )
+        self.assertIsNone(
+            validate_alarm_storm(
+                {"slowest_bed_alert_threshold_s": None}
+            )["slowest_bed_alert_threshold_s"]
+        )
+        for bad in (True, 0, -5, "30"):
+            with self.assertRaises(ValueError):
+                validate_alarm_storm(
+                    {"slowest_bed_alert_threshold_s": bad}
+                )
 
     def test_alarm_storm_endpoint_serves_json_and_is_503_while_partitioned(self):
         ward = self._storm_ward()

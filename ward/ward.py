@@ -57,9 +57,15 @@ DEFAULT_PROFILES = ["stable", "stable", "stable", "tachycardic", "hypoxic", "feb
 # and ends the tick the count inside that window falls back below
 # the threshold. Defaults: 10 alarms within 60 seconds — a burst
 # a real ward would page about, while a quiet ward stays quiet.
+# ``slowest_bed_alert_threshold_s`` is the mean time to ack, in
+# seconds, past which a bed counts as falling behind: when a
+# bed's mean time to clear a storm's alarms across the storms it
+# fully cleared crosses it, the bed is listed in
+# ``slowest_bed_alerts``. Null (the default) turns the alert off.
 DEFAULT_ALARM_STORM = {
     "threshold": 10,
     "window_s": 60.0,
+    "slowest_bed_alert_threshold_s": None,
 }
 
 
@@ -68,9 +74,11 @@ def validate_alarm_storm(value):
 
     None means the defaults; a dict may set ``threshold`` (alarms
     raised inside the window that start a storm, an int of at
-    least 1) and ``window_s`` (seconds of trailing alarm history
-    the count looks at, a number above 0). Returns the normalized
-    dict.
+    least 1), ``window_s`` (seconds of trailing alarm history
+    the count looks at, a number above 0), and
+    ``slowest_bed_alert_threshold_s`` (mean seconds to ack past
+    which a bed counts as falling behind, a number above 0, or
+    null to turn the alert off). Returns the normalized dict.
     """
     if value is None:
         return dict(DEFAULT_ALARM_STORM)
@@ -107,6 +115,19 @@ def validate_alarm_storm(value):
                     % (threshold,)
                 )
             out[key] = float(threshold)
+        elif key == "slowest_bed_alert_threshold_s":
+            if threshold is not None and (
+                isinstance(threshold, bool)
+                or not isinstance(threshold, (int, float))
+                or threshold <= 0
+            ):
+                raise ValueError(
+                    "alarm_storm slowest_bed_alert_threshold_s must"
+                    " be a number > 0 or null, got %r" % (threshold,)
+                )
+            out[key] = (
+                None if threshold is None else float(threshold)
+            )
     return out
 
 
@@ -1798,6 +1819,51 @@ class Ward:
             )
         return view
 
+    def _slowest_bed_alerts(self, totals, storms):
+        """Beds whose mean time to ack across storms crosses the threshold.
+
+        One entry per bed whose mean time to clear a storm's
+        alarms — over the storms it fully cleared, null while
+        none has — is above
+        ``slowest_bed_alert_threshold_s``: the bed, its mean
+        and longest time, the threshold, and how many storms
+        it raised in and how many of those it fully cleared.
+        Empty while the threshold is off (null) or no bed's
+        mean crosses it, so a dashboard can watch one field
+        instead of polling the totals — and a bed with no
+        fully-cleared storm never alerts, however slow its
+        still-open storms look, because its mean is null.
+        """
+        threshold = self.alarm_storm["slowest_bed_alert_threshold_s"]
+        if threshold is None:
+            return []
+        cleared = {}
+        for storm in storms:
+            for entry in storm["bed_acks"]:
+                if entry["time_to_ack_s"] is not None:
+                    cleared[entry["bed"]] = (
+                        cleared.get(entry["bed"], 0) + 1
+                    )
+        alerts = []
+        for total in totals:
+            mean = total["mean_time_to_ack_s"]
+            if mean is not None and mean > threshold:
+                alerts.append(
+                    {
+                        "bed": total["bed"],
+                        "mean_time_to_ack_s": mean,
+                        "max_time_to_ack_s": total[
+                            "max_time_to_ack_s"
+                        ],
+                        "threshold_s": threshold,
+                        "storms": total["storms"],
+                        "cleared_storms": cleared.get(
+                            total["bed"], 0
+                        ),
+                    }
+                )
+        return alerts
+
     def _alarm_storm_view(self, storm):
         """One storm as plain JSON data, for the summary."""
         return {
@@ -1878,7 +1944,15 @@ class Ward:
         pending, and the mean and longest time it took to
         clear a storm's alarms, null while none of its storms
         has fully cleared — so a dashboard can see which bed
-        is slowest to clear over a whole run. ``event_count``
+        is slowest to clear over a whole run.
+        ``slowest_bed_alerts`` lists the beds whose mean time
+        to ack across the storms they fully cleared is above
+        ``slowest_bed_alert_threshold_s`` — each with the bed,
+        its mean and longest time, the threshold, and how many
+        storms it raised in and cleared — empty while the
+        threshold is off (null) or no bed's mean crosses it, so
+        a dashboard hears about the bed falling behind instead
+        of having to poll the totals. ``event_count``
         counts every alarm-storm hook event this run — storms
         starting, ending, and being acknowledged — and
         ``events`` lists them, each with the tick, the storm's
@@ -1904,6 +1978,7 @@ class Ward:
             for s in acknowledged
             if s["time_to_ack_s"] is not None
         ]
+        bed_ack_totals = self._bed_ack_totals(storms)
         return {
             "t": self.elapsed,
             "storm_active": open_storm is not None,
@@ -1924,7 +1999,13 @@ class Ward:
                 "max_time_to_ack_s": max(times) if times else None,
             },
             "storms": storms,
-            "bed_ack_totals": self._bed_ack_totals(storms),
+            "bed_ack_totals": bed_ack_totals,
+            "slowest_bed_alert_threshold_s": self.alarm_storm[
+                "slowest_bed_alert_threshold_s"
+            ],
+            "slowest_bed_alerts": self._slowest_bed_alerts(
+                bed_ack_totals, storms
+            ),
             "event_count": len(self.alarm_storm_events),
             "events": [dict(e) for e in self.alarm_storm_events],
             "alarm_storm_hooks": (
