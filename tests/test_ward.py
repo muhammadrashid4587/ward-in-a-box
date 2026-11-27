@@ -24,6 +24,7 @@ from ward.alert_hooks import (
     validate_boarding_full_hooks,
     validate_discharge_priority_hooks,
     validate_discharge_readiness_hooks,
+    validate_dropout_hooks,
     validate_escalation_hooks,
     validate_lab_delay_hooks,
     validate_lab_overdue_hooks,
@@ -14883,6 +14884,364 @@ class TestPartitionHooks(unittest.TestCase):
             )
             self.assertEqual(
                 run["partition"]["partition_hooks"][
+                    "invoked"
+                ],
+                2,
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+class TestDropoutHooks(unittest.TestCase):
+    # Dropout hooks: a bed's monitor going dark — offline — or
+    # coming back fires the ward's dropout_hooks — the same
+    # webhook/callback machinery as the NEWS2 hooks — so
+    # something outside the ward hears the monitor fail and
+    # return. A dropout is per-bed, so the payload names the
+    # beds the event covers, not the whole ward.
+
+    def _dropout_ward(self, hooks=None):
+        return Ward(
+            beds=12,
+            profiles=["stable"] * 12,
+            chaos=[
+                ChaosEvent(
+                    "dropout",
+                    at=10,
+                    duration=30,
+                    bed=0,
+                ),
+            ],
+            seed=42,
+            dropout_hooks=hooks,
+        )
+
+    def test_validate_dropout_hooks(self):
+        hooks = validate_dropout_hooks(None)
+        self.assertIsInstance(hooks, TrendAlertHooks)
+        self.assertFalse(hooks.configured)
+        self.assertEqual(hooks.kind, "dropout")
+        custom = validate_dropout_hooks(
+            {"webhook_url": "https://example.invalid/hooks", "timeout_s": 2}
+        )
+        self.assertTrue(custom.configured)
+        self.assertEqual(custom.kind, "dropout")
+        self.assertEqual(custom.timeout_s, 2.0)
+        seen = []
+        append = seen.append
+        cb = validate_dropout_hooks({"callback": append})
+        self.assertTrue(cb.configured)
+        self.assertIs(cb.callback, append)
+        with self.assertRaises(ValueError):
+            validate_dropout_hooks(
+                {"webhook_url": "ftp://x/hooks"}
+            )
+        with self.assertRaises(ValueError):
+            validate_dropout_hooks({"callback": "not callable"})
+        with self.assertRaises(ValueError):
+            validate_dropout_hooks({"timeout_s": 0})
+        with self.assertRaises(ValueError):
+            validate_dropout_hooks({"url": "http://x/hooks"})
+        with self.assertRaises(ValueError):
+            validate_dropout_hooks("http://x/hooks")
+
+    def test_hooks_off_by_default(self):
+        # No hooks configured: the monitor still goes dark and
+        # comes back, and each event is recorded with no hook
+        # invoked.
+        ward = self._dropout_ward()
+        self.assertFalse(ward.dropout_hooks.configured)
+        for _ in range(70):
+            ward.tick()
+        summary = ward.dropout_summary()
+        self.assertEqual(summary["offline_beds"], [])
+        self.assertEqual(summary["event_count"], 2)
+        self.assertEqual(
+            [
+                (e["event"], e["t"])
+                for e in summary["events"]
+            ],
+            [
+                ("dropout_started", 10.0),
+                ("dropout_ended", 40.0),
+            ],
+        )
+        for event in summary["events"]:
+            self.assertFalse(event["hook_invoked"])
+            self.assertEqual(event["hook_errors"], [])
+            self.assertEqual(event["hook_retries"], 0)
+            self.assertEqual(
+                event["hook_final_status"], "not_invoked"
+            )
+        self.assertEqual(
+            summary["dropout_hooks"],
+            {"configured": False, "invoked": 0, "failed": 0, "retries": 0, "delivered": 0},
+        )
+        self.assertEqual(
+            ward.snapshot()["dropout"]["event_count"], 2
+        )
+
+    def test_callback_hook_fires_for_start_and_end(self):
+        seen = []
+        ward = self._dropout_ward({"callback": seen.append})
+        self.assertTrue(ward.dropout_hooks.configured)
+        for _ in range(70):
+            ward.tick()
+        # Two events over the run: bed 0's monitor goes dark
+        # at 10 s and comes back at 40 s. The monitor stays
+        # offline in between, but the dropout itself fires
+        # once on start and once on end, not once a tick.
+        self.assertEqual(
+            [(p["event"], p["t"]) for p in seen],
+            [
+                ("dropout_started", 10.0),
+                ("dropout_ended", 40.0),
+            ],
+        )
+        start, end = seen
+        self.assertEqual(
+            {k: v for k, v in start.items() if k != "hook_retries"
+             and k != "hook_final_status"},
+            {
+                "event": "dropout_started",
+                "t": 10.0,
+                "at": 10.0,
+                "ends": 40.0,
+                "duration": 30,
+                "beds": [0],
+            },
+        )
+        self.assertEqual(end["event"], "dropout_ended")
+        self.assertEqual(end["t"], 40.0)
+        self.assertEqual(end["beds"], [0])
+        # Every event records the invocation.
+        summary = ward.dropout_summary()
+        self.assertEqual(summary["event_count"], 2)
+        for event in summary["events"]:
+            self.assertTrue(event["hook_invoked"])
+            self.assertEqual(event["hook_errors"], [])
+            self.assertEqual(event["hook_final_status"], "delivered")
+        self.assertEqual(
+            summary["dropout_hooks"],
+            {"configured": True, "invoked": 2, "failed": 0, "retries": 0, "delivered": 2},
+        )
+
+    def test_start_and_end_fire_again_for_a_second_dropout(self):
+        # Two dropouts on the same bed: the start and the end
+        # fire once per dropout — the engine tracks each event
+        # separately, so the second dropout fires again.
+        seen = []
+        ward = Ward(
+            beds=12,
+            profiles=["stable"] * 12,
+            chaos=[
+                ChaosEvent(
+                    "dropout",
+                    at=5,
+                    duration=10,
+                    bed=0,
+                ),
+                ChaosEvent(
+                    "dropout",
+                    at=30,
+                    duration=10,
+                    bed=0,
+                ),
+            ],
+            seed=42,
+            dropout_hooks={"callback": seen.append},
+        )
+        for _ in range(45):
+            ward.tick()
+        self.assertEqual(
+            [(p["event"], p["t"]) for p in seen],
+            [
+                ("dropout_started", 5.0),
+                ("dropout_ended", 15.0),
+                ("dropout_started", 30.0),
+                ("dropout_ended", 40.0),
+            ],
+        )
+        self.assertEqual(
+            ward.dropout_summary()[
+                "dropout_hooks"
+            ],
+            {"configured": True, "invoked": 4, "failed": 0, "retries": 0, "delivered": 4},
+        )
+
+    def test_offline_beds_tracks_the_window(self):
+        ward = self._dropout_ward()
+        for _ in range(9):
+            ward.tick()
+        self.assertEqual(
+            ward.dropout_summary()["offline_beds"], []
+        )
+        ward.tick()  # t=10: bed 0's monitor goes dark
+        self.assertEqual(
+            ward.dropout_summary()["offline_beds"], [0]
+        )
+        for _ in range(29):
+            ward.tick()
+        self.assertEqual(
+            ward.dropout_summary()["offline_beds"], [0]
+        )
+        ward.tick()  # t=40: bed 0's monitor is back
+        self.assertEqual(
+            ward.dropout_summary()["offline_beds"], []
+        )
+
+    def test_callback_failure_is_not_fatal(self):
+        def boom(payload):
+            raise ValueError("pager is down")
+
+        ward = self._dropout_ward({"callback": boom})
+        for _ in range(9):
+            ward.tick()  # t=9: the monitor is still online
+        snap = ward.tick()  # t=10: dark, hook raises
+        self.assertEqual(snap["dropout"]["offline_beds"], [0])
+        snap = ward.tick()  # t=11: the tick still completes
+        self.assertEqual(snap["dropout"]["offline_beds"], [0])
+        event = ward.dropout_summary()["events"][0]
+        self.assertEqual(event["event"], "dropout_started")
+        self.assertTrue(event["hook_invoked"])
+        self.assertEqual(event["hook_errors"], ["pager is down"])
+        self.assertEqual(event["hook_final_status"], "failed")
+        summary = ward.dropout_summary()[
+            "dropout_hooks"
+        ]
+        self.assertEqual(summary["invoked"], 1)
+        self.assertEqual(summary["failed"], 1)
+
+    def test_webhook_posts_to_stub_server(self):
+        server, port, received = capture_server()
+        try:
+            ward = self._dropout_ward(
+                {"webhook_url": "http://127.0.0.1:%d/hooks" % port}
+            )
+            for _ in range(70):
+                ward.tick()
+            self.assertTrue(ward.dropout_hooks.wait(timeout=5))
+            self.assertEqual(len(received), 2)
+            payloads = sorted(
+                (json.loads(r[2]) for r in received),
+                key=lambda p: p["t"],
+            )
+            self.assertEqual(
+                [(p["event"], p["t"]) for p in payloads],
+                [
+                    ("dropout_started", 10.0),
+                    ("dropout_ended", 40.0),
+                ],
+            )
+            path, content_type, body = received[0]
+            self.assertEqual(path, "/hooks")
+            self.assertEqual(content_type, "application/json")
+            start = [p for p in payloads if p["event"] == "dropout_started"][0]
+            self.assertEqual(start["beds"], [0])
+            summary = ward.dropout_summary()
+            self.assertEqual(
+                summary["dropout_hooks"],
+                {"configured": True, "invoked": 2, "failed": 0, "retries": 0, "delivered": 2},
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_dropout_endpoint_serves_json_and_is_503_while_partitioned(self):
+        ward = self._dropout_ward()
+        server, port = serve_in_thread(ward)
+        try:
+            status, body = get(port, "/dropout")
+            self.assertEqual(status, 200)
+            summary = json.loads(body)
+            self.assertEqual(summary["offline_beds"], [])
+            self.assertEqual(summary["event_count"], 0)
+            for _ in range(10):
+                ward.tick()  # t=10: bed 0's monitor goes dark
+            status, body = get(port, "/dropout")
+            self.assertEqual(status, 200)
+            summary = json.loads(body)
+            self.assertEqual(summary["offline_beds"], [0])
+            self.assertEqual(summary["event_count"], 1)
+            # 503 while partitioned, like the other live endpoints.
+            ward.partitioned = True
+            status, body = get(port, "/dropout")
+            self.assertEqual(status, 503)
+            ward.partitioned = False
+            status, body = get(port, "/dropout")
+            self.assertEqual(status, 200)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_scenario_dropout_hooks(self):
+        cfg = load_scenario(
+            os.path.join(
+                HERE, "..", "scenarios", "dropout-hooks.json"
+            )
+        )
+        self.assertTrue(cfg["dropout_hooks"].configured)
+        server, port, received = capture_server()
+        path = os.path.join(tempfile.mkdtemp(), "run.jsonl")
+        try:
+            # The scenario's URL is a placeholder; point it at
+            # the stub server for this run.
+            cfg["dropout_hooks"] = (
+                validate_dropout_hooks(
+                    {"webhook_url": "http://127.0.0.1:%d/hooks" % port}
+                )
+            )
+            ward = build_ward(cfg, seed=42)
+            with Recorder(path, ward.beds, ward.rate_hz, seed=42) as rec:
+                ward.recorder = rec
+                for _ in range(70):
+                    snap = ward.tick()
+            self.assertTrue(ward.dropout_hooks.wait(timeout=5))
+            # Two events over the run: bed 0's monitor goes
+            # dark at 10 s and comes back at 40 s. The
+            # deliveries run in separate daemon threads, so
+            # their arrival order at the stub is not
+            # guaranteed — sort by event time before asserting.
+            self.assertEqual(len(received), 2)
+            payloads = sorted(
+                (json.loads(r[2]) for r in received),
+                key=lambda p: p["t"],
+            )
+            self.assertEqual(
+                [
+                    (p["event"], p["t"], p.get("beds"))
+                    for p in payloads
+                ],
+                [
+                    ("dropout_started", 10.0, [0]),
+                    ("dropout_ended", 40.0, [0]),
+                ],
+            )
+            # Every event records that its hook was invoked.
+            for event in snap["dropout"]["events"]:
+                self.assertTrue(event["hook_invoked"])
+            summary = ward.dropout_summary()
+            self.assertEqual(summary["event_count"], 2)
+            self.assertEqual(
+                summary["dropout_hooks"],
+                {"configured": True, "invoked": 2, "failed": 0, "retries": 0, "delivered": 2},
+            )
+            # The run summary carries the event count and the
+            # hook totals from the last tick — but only as of
+            # that tick: the snapshot in the file was recorded
+            # before the last delivery settled, so delivered is
+            # read from the live summary above, not from here.
+            run = summarize(path)
+            self.assertEqual(run["dropout"]["event_count"], 2)
+            self.assertEqual(run["dropout"]["offline_beds"], [])
+            self.assertTrue(
+                run["dropout"]["dropout_hooks"][
+                    "configured"
+                ]
+            )
+            self.assertEqual(
+                run["dropout"]["dropout_hooks"][
                     "invoked"
                 ],
                 2,

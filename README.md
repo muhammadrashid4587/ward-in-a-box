@@ -473,6 +473,10 @@ python3 -m ward.cli scenarios/example.json --seed 42
   server right now, the partition event history, and the
   partition-hook totals, as JSON
   (503 while partitioned)
+- `GET /dropout` — which beds' monitors are offline right
+  now, the dropout event history, and the dropout-hook
+  totals, as JSON
+  (503 while partitioned)
 
 A reading looks like:
 
@@ -1072,6 +1076,53 @@ ward with none configured behaves exactly as before. See
 a seeded 70-tick run the ward is cut off at 10 s and back at
 40 s — POSTed to the configured webhook, with 2 hook
 deliveries invoked and 0 failed against a stub server.
+
+## Dropout hooks
+
+A monitor going dark is the moment a bed stops reporting —
+and the moment the outside world most needs to hear about
+it, because the bed's readings simply stop arriving with no
+alarm to explain why. A ward that wants the outside world
+to hear about that moment — a dashboard, a pager, an
+on-call manager — configures dropout hooks, the same
+channels as the NEWS2 hooks (webhook and/or in-process
+callback), on the same best-effort, never-fatal terms:
+
+```json
+{"dropout_hooks": {"webhook_url": "http://127.0.0.1:18099/hooks"}}
+```
+
+Two events fire. `dropout_started` fires once, in the tick
+a monitor goes offline, with the dropout window (`"at"`,
+`"ends"`, `"duration"`) and the beds it covers — a dropout
+is per-bed, so only the beds the event targets. `dropout_ended`
+fires once, in the tick the monitor comes back, with the
+same window. A monitor that stays dark for thirty ticks
+fires once, not thirty times, and a second dropout fires
+again — the start and end are per event, not per run. An
+in-process callback gets the same payloads in the tick the
+event fires (Python API only — a scenario file cannot hold a
+callable), so scenario code can log or escalate on the
+monitor going dark directly. Each event records whether the
+hook was invoked (`"hook_invoked"`, False with no hooks) and
+any synchronous error (`"hook_errors"`), and the dropout
+summary carries the current state (`"offline_beds"`), the
+event totals (`"event_count"`, the full `"events"` history)
+and the ward dropout-hook totals (`"dropout_hooks"`: whether
+any hook is configured, how many deliveries were invoked,
+how many failed, how many retries were spent, and how many
+deliveries eventually landed) — in `GET /dropout`, every
+snapshot and WebSocket frame, and the run summary
+(`--summary`). The same retry rules as the NEWS2 hooks
+apply — a failed webhook POST is retried with backoff up to
+`"max_retries"` times, and the event records
+`"hook_retries"` and `"hook_final_status"` alongside
+`"hook_invoked"`. Hooks are off by default, so a ward with
+none configured behaves exactly as before. See
+`scenarios/dropout-hooks.json` for a runnable example: over
+a seeded 70-tick run bed 0's monitor goes dark at 10 s and
+comes back at 40 s — POSTed to the configured webhook, with
+2 hook deliveries invoked and 0 failed against a stub server.
 
 ## Bed blocker
 
@@ -4284,3 +4335,22 @@ the hook totals.
   WebSocket frame, a `GET /partition` endpoint, and the run
   summary; off by default, configured per ward with
   `partition_hooks` in the scenario) — done in v0.68.0
+- Dropout hooks (when a monitor drops out or comes back —
+  a configured webhook URL gets a `dropout_started` /
+  `dropout_ended` event payload POSTed to it, or an
+  in-process callback is called with the same payload in the
+  firing tick, so a hook can page the on-call manager on a
+  bed going dark; a dropout is per-bed, so the payload names
+  the beds the event covers; one start and one end per
+  dropout, re-armed for a second dropout; reusing the NEWS2
+  hook machinery, best effort and never fatal; each event
+  records whether the hook was invoked, and the dropout
+  summary carries the current state, the event history and
+  the dropout-hook totals, in every snapshot, WebSocket
+  frame, a `GET /dropout` endpoint, and the run summary; off
+  by default, configured per ward with `dropout_hooks` in
+  the scenario) — done in v0.69.0
+- Next: alarm-storm hooks (`alarm_storm_started` /
+  `alarm_storm_ended`, one start and one end per storm,
+  re-armed for a second storm, same machinery and same
+  surfaces as the dropout hooks)

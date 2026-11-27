@@ -9,6 +9,7 @@ from .alert_hooks import (
     validate_boarding_full_hooks,
     validate_discharge_priority_hooks,
     validate_discharge_readiness_hooks,
+    validate_dropout_hooks,
     validate_escalation_hooks,
     validate_lab_delay_hooks,
     validate_lab_overdue_hooks,
@@ -480,6 +481,16 @@ def load_scenario(path):
             )
         except ValueError as e:
             raise ValueError("partition_hooks: %s" % e)
+    dropout_hooks = None
+    if "dropout_hooks" in data:
+        if not isinstance(data["dropout_hooks"], dict):
+            raise ValueError("dropout_hooks must be an object")
+        try:
+            dropout_hooks = validate_dropout_hooks(
+                data["dropout_hooks"]
+            )
+        except ValueError as e:
+            raise ValueError("dropout_hooks: %s" % e)
     return {
         "beds": beds,
         "rate_hz": rate,
@@ -522,6 +533,7 @@ def load_scenario(path):
         "dialysis_failure_hooks": dialysis_failure_hooks,
         "staff_shortage_hooks": staff_shortage_hooks,
         "partition_hooks": partition_hooks,
+        "dropout_hooks": dropout_hooks,
         "triage": triage,
         "host": data.get("host", "127.0.0.1"),
         "port": data.get("port", 8080),
@@ -578,6 +590,7 @@ def build_ward(cfg, seed=None, recorder=None):
             "staff_shortage_hooks"
         ),
         partition_hooks=cfg.get("partition_hooks"),
+        dropout_hooks=cfg.get("dropout_hooks"),
         triage=cfg.get("triage"),
         recorder=recorder,
     )

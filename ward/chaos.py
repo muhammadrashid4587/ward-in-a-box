@@ -771,6 +771,12 @@ class ChaosEngine:
         # is a new event, so it fires again.
         self._partition_started = set()
         self._partition_ended = set()
+        # Dropout events fire their start hook once, on the
+        # first tick inside the window, and their end hook
+        # once, on the first tick after it — a second dropout
+        # on the same beds is a new event, so it fires again.
+        self._dropout_started = set()
+        self._dropout_ended = set()
 
     def stockouts(self, ward, now):
         """Active pharmacy stockouts: ``{bed_id: {med, ...}}``.
@@ -1054,6 +1060,26 @@ class ChaosEngine:
                 ):
                     self._partition_ended.add(id(ev))
                     ward._partition_ended(ev, now)
+            # Dropout: the start hook fires once, on the first
+            # tick inside the window, and the end hook once, on
+            # the first tick after it — so scenario code hears
+            # a monitor go dark and come back exactly once per
+            # event, even across a run that ticks past the end.
+            # The check runs before the active gate below, so an
+            # end is caught on the tick the window closes. A
+            # dropout is per-bed, so the payload names the beds
+            # the event covers, not the whole ward.
+            if ev.type == "dropout":
+                if ev.active(now):
+                    if id(ev) not in self._dropout_started:
+                        self._dropout_started.add(id(ev))
+                        ward._dropout_started(ev, now)
+                elif (
+                    id(ev) in self._dropout_started
+                    and id(ev) not in self._dropout_ended
+                ):
+                    self._dropout_ended.add(id(ev))
+                    ward._dropout_ended(ev, now)
             if not ev.active(now):
                 continue
             if ev.type == "sensor_drift":

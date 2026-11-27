@@ -54,8 +54,10 @@ staff shortage starting or ending — a nurse calling in sick
 and the roster coming whole again — fires the ward's
 ``staff_shortage_hooks``; a partition starting or ending —
 the ward cut off from the server and reconnected — fires
-the ward's ``partition_hooks``.
-All twenty share
+the ward's ``partition_hooks``; a monitor dropping out or
+coming back — a bed's monitor going offline and returning —
+fires the ward's ``dropout_hooks``.
+All twenty-one share
 the same ``AlertHooks`` machinery — the same webhook and
 callback channels, the same best-effort delivery — just a
 different event payload.
@@ -394,6 +396,19 @@ def validate_partition_hooks(value):
     )
 
 
+def validate_dropout_hooks(value):
+    """Normalize a dropout hook config (see
+    :func:`_validate_hooks`).
+
+    Fires when a monitor drops out or comes back — when a
+    bed's monitor goes offline and when it returns — rather
+    than when a NEWS2 event fires.
+    """
+    return _validate_hooks(
+        value, "dropout", "dropout_hooks"
+    )
+
+
 class AlertHooks:
     """The configured hooks for one ward event, shared by its monitors.
 
@@ -405,7 +420,7 @@ class AlertHooks:
     ``"network-outage"``, ``"medication-stockout"``,
     ``"pump-failure"``, ``"lab-delay"``, ``"lab-overdue"``,
     ``"ventilator-failure"``, ``"dialysis-failure"``,
-    ``"staff-shortage"``, or ``"partition"``); it changes
+    ``"staff-shortage"``, ``"partition"``, or ``"dropout"``); it changes
     nothing about delivery.
     """
 

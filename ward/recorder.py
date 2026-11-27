@@ -162,6 +162,7 @@ def summarize(path):
     last_ventilator_failure = None
     last_dialysis_failure = None
     last_partition = None
+    last_dropout = None
     with open(path) as f:
         for line in f:
             line = line.strip()
@@ -243,6 +244,8 @@ def summarize(path):
                 last_dialysis_failure = obj["dialysis_failure"]
             if isinstance(obj.get("partition"), dict):
                 last_partition = obj["partition"]
+            if isinstance(obj.get("dropout"), dict):
+                last_dropout = obj["dropout"]
             for bed in obj["beds"]:
                 b = bed["bed"]
                 if not bed.get("online", True):
@@ -709,6 +712,34 @@ def summarize(path):
                 ),
             }
             if last_partition is not None
+            else None
+        ),
+        # Dropout totals from the last tick: which beds'
+        # monitors are offline right now — plus how many
+        # dropout hook events fired this run, and whether the
+        # dropout hooks are configured and how many hook
+        # deliveries were invoked, failed, retried, and
+        # delivered.
+        "dropout": (
+            {
+                "offline_beds": last_dropout.get(
+                    "offline_beds", []
+                ),
+                "event_count": last_dropout.get(
+                    "event_count", 0
+                ),
+                "dropout_hooks": last_dropout.get(
+                    "dropout_hooks",
+                    {
+                        "configured": False,
+                        "invoked": 0,
+                        "failed": 0,
+                        "retries": 0,
+                        "delivered": 0,
+                    },
+                ),
+            }
+            if last_dropout is not None
             else None
         ),
         # Staffing totals from the last tick: the load factor, how

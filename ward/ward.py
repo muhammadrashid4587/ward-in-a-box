@@ -9,6 +9,7 @@ from .alert_hooks import (
     validate_boarding_full_hooks,
     validate_discharge_priority_hooks,
     validate_discharge_readiness_hooks,
+    validate_dropout_hooks,
     validate_escalation_hooks,
     validate_medication_stockout_hooks,
     validate_missed_dose_hooks,
@@ -59,7 +60,7 @@ class Ward:
     snapshot to a JSONL file.
     """
 
-    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None, cleaning_s=30.0, meds=None, triage=None, discharge_planning=None, cleaning_capacity=None, discharge_readiness=None, oxygen=None, infusions=None, ventilators=None, dialysis=None, consciousness=None, consciousness_dynamics=None, news2_trend=None, trend_alert_hooks=None, escalation_hooks=None, boarding_full_hooks=None, wait_time_hooks=None, missed_dose_hooks=None, discharge_readiness_hooks=None, discharge_priority_hooks=None, oxygen_outage_hooks=None, power_outage_hooks=None, sensor_drift_hooks=None, bed_blocker_hooks=None, network_outage_hooks=None, medication_stockout_hooks=None, pump_failure_hooks=None, lab_delay_hooks=None, lab_overdue_hooks=None, ventilator_failure_hooks=None, dialysis_failure_hooks=None, staff_shortage_hooks=None, partition_hooks=None, news2_staffing_escalation=None, labs=None):
+    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None, cleaning_s=30.0, meds=None, triage=None, discharge_planning=None, cleaning_capacity=None, discharge_readiness=None, oxygen=None, infusions=None, ventilators=None, dialysis=None, consciousness=None, consciousness_dynamics=None, news2_trend=None, trend_alert_hooks=None, escalation_hooks=None, boarding_full_hooks=None, wait_time_hooks=None, missed_dose_hooks=None, discharge_readiness_hooks=None, discharge_priority_hooks=None, oxygen_outage_hooks=None, power_outage_hooks=None, sensor_drift_hooks=None, bed_blocker_hooks=None, network_outage_hooks=None, medication_stockout_hooks=None, pump_failure_hooks=None, lab_delay_hooks=None, lab_overdue_hooks=None, ventilator_failure_hooks=None, dialysis_failure_hooks=None, staff_shortage_hooks=None, partition_hooks=None, dropout_hooks=None, news2_staffing_escalation=None, labs=None):
         if not 1 <= beds <= 64:
             raise ValueError("beds must be 1..64")
         if rate_hz <= 0:
@@ -316,6 +317,21 @@ class Ward:
         # Every partition hook event this run — the audit trail
         # for the partition hooks.
         self.partition_events = []
+        # Dropout hooks: one shared object for the whole ward
+        # (a webhook URL and/or an in-process callback), invoked
+        # when a monitor drops out or comes back. Off by
+        # default. The ward owns the object: a dropout is a
+        # per-bed event, but one hook config covers every bed
+        # — like the other per-bed chaos hooks — and the
+        # payload names the beds the event covers.
+        self.dropout_hooks = (
+            validate_dropout_hooks(
+                dropout_hooks
+            )
+        )
+        # Every dropout hook event this run — the audit trail
+        # for the dropout hooks.
+        self.dropout_events = []
         # The priority order last sent to the hooks (empty
         # before the first ready bed), and every order change
         # this run — the audit trail for the priority hooks.
@@ -659,7 +675,7 @@ class Ward:
         # in, and before the snapshot, so the event is in it.
         # A tick where the order is unchanged fires nothing.
         self._check_priority_order()
-        snap = {"t": self.elapsed, "beds": readings, "staffing": self.staffing_summary(), "turnover": self.turnover_summary(), "meds": self.meds_summary(), "triage": self.triage_summary(), "arrivals": self.arrivals_summary(), "discharge": self.discharge_summary(), "discharge_readiness": self.readiness_summary(), "discharge_priority": self.discharge_priority_summary(), "early_warning": self.early_warning_summary(), "sensor_drift": self.sensor_drift_summary(), "bed_blocker": self.bed_blocker_summary(), "oxygen_outage": self.oxygen_outage_summary(), "power_outage": self.power_outage_summary(), "network_outage": self.network_outage_summary(), "medication_stockout": self.medication_stockout_summary(), "pump_failure": self.pump_failure_summary(), "lab_delay": self.lab_delay_summary(), "ventilator_failure": self.ventilator_failure_summary(), "dialysis_failure": self.dialysis_failure_summary(), "partition": self.partition_summary()}
+        snap = {"t": self.elapsed, "beds": readings, "staffing": self.staffing_summary(), "turnover": self.turnover_summary(), "meds": self.meds_summary(), "triage": self.triage_summary(), "arrivals": self.arrivals_summary(), "discharge": self.discharge_summary(), "discharge_readiness": self.readiness_summary(), "discharge_priority": self.discharge_priority_summary(), "early_warning": self.early_warning_summary(), "sensor_drift": self.sensor_drift_summary(), "bed_blocker": self.bed_blocker_summary(), "oxygen_outage": self.oxygen_outage_summary(), "power_outage": self.power_outage_summary(), "network_outage": self.network_outage_summary(), "medication_stockout": self.medication_stockout_summary(), "pump_failure": self.pump_failure_summary(), "lab_delay": self.lab_delay_summary(), "ventilator_failure": self.ventilator_failure_summary(), "dialysis_failure": self.dialysis_failure_summary(), "partition": self.partition_summary(), "dropout": self.dropout_summary()}
         with self._lock:
             self.latest = snap
         if self.recorder is not None:
@@ -1233,6 +1249,87 @@ class Ward:
             "events": [dict(e) for e in self.partition_events],
             "partition_hooks": (
                 self.partition_hooks.summary()
+            ),
+        }
+
+    def _dropout_started(self, event, now):
+        """Fire the start hook for one dropout event.
+
+        Called by the chaos engine on the first tick inside the
+        event's window (see :meth:`chaos.ChaosEngine.apply`).
+        """
+        self._fire_dropout_event(
+            "dropout_started", event, now
+        )
+
+    def _dropout_ended(self, event, now):
+        """Fire the end hook for one dropout event.
+
+        Called by the chaos engine on the first tick after the
+        event's window closes.
+        """
+        self._fire_dropout_event(
+            "dropout_ended", event, now
+        )
+
+    def _fire_dropout_event(self, kind, event, now):
+        """Fire one per-bed dropout hook event.
+
+        The payload carries the event kind, the tick, the
+        dropout window (``at``, ``ends``, ``duration``), and
+        the beds it covers — a dropout is per-bed, so only
+        the beds the event targets — so a hook can tell the
+        outside world a monitor has gone dark and, on the
+        end event, that it is back. The event is recorded on
+        the audit trail with whether the hook was invoked
+        for it, any synchronous error, and the retries and
+        final delivery outcome.
+        """
+        payload = {
+            "event": kind,
+            "t": now,
+            "at": event.at,
+            "ends": event.end,
+            "duration": event.duration,
+            "beds": event.targets(self),
+        }
+        self.dropout_events.append(payload)
+        result = self.dropout_hooks.fire(
+            dict(payload),
+            record=payload,
+        )
+        payload["hook_invoked"] = result["invoked"]
+        payload["hook_errors"] = result["errors"]
+
+    def dropout_summary(self):
+        """Current dropout state and hook event history.
+
+        ``offline_beds`` lists the beds whose monitors are
+        offline right now; ``event_count`` counts every
+        dropout hook event this run — dropouts starting and
+        ending — and ``events`` lists them, each with the
+        tick, the dropout window, the beds it covers, and
+        whether the ward's hooks were invoked for it
+        (``hook_invoked``) and the retries and final
+        delivery outcome (``hook_retries``,
+        ``hook_final_status``); ``dropout_hooks`` carries
+        the hook totals: whether any hook is configured, how
+        many hook deliveries were invoked, how many failed,
+        how many retries were spent, and how many
+        deliveries eventually landed.
+        """
+        return {
+            "t": self.elapsed,
+            "offline_beds": [
+                i
+                for i, m in enumerate(self.monitors)
+                if m.offline_until is not None
+                and self.elapsed < m.offline_until
+            ],
+            "event_count": len(self.dropout_events),
+            "events": [dict(e) for e in self.dropout_events],
+            "dropout_hooks": (
+                self.dropout_hooks.summary()
             ),
         }
 
