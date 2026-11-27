@@ -19,6 +19,7 @@ from .alert_hooks import (
     validate_power_outage_hooks,
     validate_pump_failure_hooks,
     validate_sensor_drift_hooks,
+    validate_staff_shortage_hooks,
     validate_trend_alert_hooks,
     validate_ventilator_failure_hooks,
     validate_dialysis_failure_hooks,
@@ -452,6 +453,22 @@ def load_scenario(path):
             raise ValueError(
                 "dialysis_failure_hooks: %s" % e
             )
+    staff_shortage_hooks = None
+    if "staff_shortage_hooks" in data:
+        if not isinstance(data["staff_shortage_hooks"], dict):
+            raise ValueError(
+                "staff_shortage_hooks must be an object"
+            )
+        try:
+            staff_shortage_hooks = (
+                validate_staff_shortage_hooks(
+                    data["staff_shortage_hooks"]
+                )
+            )
+        except ValueError as e:
+            raise ValueError(
+                "staff_shortage_hooks: %s" % e
+            )
     return {
         "beds": beds,
         "rate_hz": rate,
@@ -492,6 +509,7 @@ def load_scenario(path):
         "lab_overdue_hooks": lab_overdue_hooks,
         "ventilator_failure_hooks": ventilator_failure_hooks,
         "dialysis_failure_hooks": dialysis_failure_hooks,
+        "staff_shortage_hooks": staff_shortage_hooks,
         "triage": triage,
         "host": data.get("host", "127.0.0.1"),
         "port": data.get("port", 8080),
@@ -543,6 +561,9 @@ def build_ward(cfg, seed=None, recorder=None):
         ),
         dialysis_failure_hooks=cfg.get(
             "dialysis_failure_hooks"
+        ),
+        staff_shortage_hooks=cfg.get(
+            "staff_shortage_hooks"
         ),
         triage=cfg.get("triage"),
         recorder=recorder,

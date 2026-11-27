@@ -190,6 +190,12 @@ python3 -m ward.cli scenarios/sensor-drift-hooks.json --seed 42
 # instead of 30.0 s
 python3 -m ward.cli scenarios/staff-shortage.json --seed 42
 
+# Staff-shortage hooks: the same ward, with the nurse calling in
+# sick at 10 s and the roster coming whole again at 40 s also
+# POSTed to a webhook (here a placeholder URL — point it at your
+# own endpoint; a dead endpoint is logged, never fatal)
+python3 -m ward.cli scenarios/staff-shortage-hooks.json --seed 42
+
 # Bed blocker: bed 1 waits for a porter from 5 s to 25 s, so its
 # discharge at 10 s is held until 25 s (15 s late), and bed 3
 # finishes cleaning at 15 s but is blocked for an isolation clean
@@ -354,7 +360,8 @@ python3 -m ward.cli scenarios/example.json --seed 42
 - `GET /alarms` — per-bed alarm history and rate metrics as JSON
   (503 while partitioned)
 - `GET /staffing` — the current shift, roster on duty, nurse-to-patient
-  ratio, alarm acknowledgement and vitals-check metrics as JSON
+  ratio, alarm acknowledgement and vitals-check metrics, and the
+  staff-shortage event history and hook totals, as JSON
   (503 while partitioned)
 - `GET /turnover` — per-bed turnover state (`occupied`, `cleaning`,
   `available`), turnovers and total cleaning time per bed, plus ward
@@ -953,6 +960,57 @@ is out from 10 s to 40 s during an alarm storm on beds 0-2,
 the load factor sits at 1.5 for the window and 1.0 either
 side of it, and all 15 storm alarms are acknowledged in
 45.0 s on average instead of 30.0 s.
+
+## Staff-shortage hooks
+
+A nurse calling in sick is the moment a ward most needs the
+outside world to hear about it — the roster is about to go
+thin, alarms are about to take longer to acknowledge and
+vitals checks are about to slip, and the ward will stay thin
+until the roster is whole again — so the hook makes sure
+something outside the ward hears about it. A ward that wants
+the outside world to hear about that moment — a dashboard, a
+pager, an on-call manager — configures staff-shortage hooks,
+the same channels as the NEWS2 hooks (webhook and/or
+in-process callback), on the same best-effort, never-fatal
+terms:
+
+```json
+{"staff_shortage_hooks": {"webhook_url": "http://127.0.0.1:18099/hooks"}}
+```
+
+Two events fire. `staff_shortage_started` fires once, in the
+tick the staff call in sick, with the shortage window (`"at"`,
+`"ends"`, `"duration"`), the beds it covers — a shortage is
+ward-wide, so every bed — and the shortage itself, the staff
+lost by role. `staff_shortage_ended` fires once, in the tick
+the roster comes whole again, with the same window. A ward
+that stays thin for thirty ticks fires once, not thirty times,
+and a second sick call fires again — the start and end are
+per event, not per run. An in-process callback gets the same
+payloads in the tick the event fires (Python API only — a
+scenario file cannot hold a callable), so scenario code can
+log or escalate on the sick call directly. Each event records
+whether the hook was invoked (`"hook_invoked"`, False with
+no hooks) and any synchronous error (`"hook_errors"`), and
+the staffing summary carries the event totals
+(`"event_count"`, the full `"events"` history) and the ward
+staff-shortage-hook totals (`"staff_shortage_hooks"`: whether
+any hook is configured, how many deliveries were invoked, how
+many failed, how many retries were spent, and how many
+deliveries eventually landed) — in `GET /staffing`, every
+snapshot and WebSocket frame, and the run summary
+(`--summary`). The same retry rules as the NEWS2 hooks apply
+— a failed webhook POST is retried with backoff up to
+`"max_retries"` times, and the event records `"hook_retries"`
+and `"hook_final_status"` alongside `"hook_invoked"`. Hooks
+are off by default, so a ward with none configured behaves
+exactly as before. See `scenarios/staff-shortage-hooks.json`
+for a runnable example: over a seeded 70-tick run the same
+ward as `staff-shortage.json` loses one nurse at 10 s and
+gets them back at 40 s — POSTed to the configured webhook,
+with 2 hook deliveries invoked and 0 failed against a stub
+server.
 
 ## Bed blocker
 
@@ -4136,3 +4194,16 @@ the hook totals.
   frame, a `GET /dialysis-failure` endpoint, and the run
   summary; off by default, configured per ward with
   `dialysis_failure_hooks` in the scenario) — done in v0.66.0
+- Staff-shortage hooks (when staff call in sick or the roster
+  comes whole again — a configured webhook URL gets a
+  `staff_shortage_started` / `staff_shortage_ended` event payload
+  POSTed to it, or an in-process callback is called with the same
+  payload in the firing tick, so a hook can page the on-call
+  manager on the ward going thin; one start and one end per
+  shortage, re-armed for a second sick call; reusing the NEWS2
+  hook machinery, best effort and never fatal; each event records
+  whether the hook was invoked, and the staffing summary carries
+  the event history and the staff-shortage-hook totals, in every
+  snapshot, WebSocket frame, a `GET /staffing` endpoint, and the
+  run summary; off by default, configured per ward with
+  `staff_shortage_hooks` in the scenario) — done in v0.67.0

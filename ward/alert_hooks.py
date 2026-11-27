@@ -46,8 +46,11 @@ due time and still not back — or landing after being
 overdue fires the ward's ``lab_overdue_hooks``; a ventilator
 failing or restarting fires the ward's
 ``ventilator_failure_hooks``; a dialysis machine failing or
-restarting fires the ward's ``dialysis_failure_hooks``.
-All eighteen share
+restarting fires the ward's ``dialysis_failure_hooks``; a
+staff shortage starting or ending — a nurse calling in sick
+and the roster coming whole again — fires the ward's
+``staff_shortage_hooks``.
+All nineteen share
 the same ``AlertHooks`` machinery — the same webhook and
 callback channels, the same best-effort delivery — just a
 different event payload.
@@ -360,6 +363,19 @@ def validate_dialysis_failure_hooks(value):
     )
 
 
+def validate_staff_shortage_hooks(value):
+    """Normalize a staff-shortage hook config (see
+    :func:`_validate_hooks`).
+
+    Fires when a staff shortage starts or ends — when staff
+    call in sick and the roster comes whole again — rather
+    than when a NEWS2 event fires.
+    """
+    return _validate_hooks(
+        value, "staff-shortage", "staff_shortage_hooks"
+    )
+
+
 class AlertHooks:
     """The configured hooks for one ward event, shared by its monitors.
 
@@ -370,7 +386,8 @@ class AlertHooks:
     ``"power-outage"``, ``"sensor-drift"``, ``"bed-blocker"``, or
     ``"network-outage"``, ``"medication-stockout"``,
     ``"pump-failure"``, ``"lab-delay"``, ``"lab-overdue"``,
-    ``"ventilator-failure"``, or ``"dialysis-failure"``); it changes
+    ``"ventilator-failure"``, ``"dialysis-failure"``, or
+    ``"staff-shortage"``); it changes
     nothing about delivery.
     """
 

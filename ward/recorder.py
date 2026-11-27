@@ -129,7 +129,10 @@ def summarize(path):
     whether the missed-dose hooks are configured and how many hook
     deliveries were invoked and failed — and staffing totals from
     the last tick: the load factor, how many extra nurses a NEWS2
-    staffing escalation has called in, and the escalation state.
+    staffing escalation has called in, and the escalation state —
+    and how many staff-shortage hook events fired this run, and
+    whether the staff-shortage hooks are configured and how many
+    hook deliveries were invoked and failed.
     Returns ``None`` fields for a recording with no ticks.
     """
     header = None
@@ -684,7 +687,11 @@ def summarize(path):
         # in, the staff an active staff-shortage event has taken
         # off the roster, and the escalation state — whether one
         # is configured and active, how many high-risk episodes
-        # are open, and every escalation raised so far.
+        # are open, and every escalation raised so far — plus
+        # how many staff-shortage hook events fired this run,
+        # and whether the staff-shortage hooks are configured
+        # and how many hook deliveries were invoked, failed,
+        # retried, and delivered.
         "staffing": (
             {
                 "load_factor": last_staffing["load_factor"],
@@ -702,6 +709,17 @@ def summarize(path):
                         "open_high_episodes": 0,
                         "escalations_raised": 0,
                         "escalations": [],
+                    },
+                ),
+                "event_count": last_staffing.get("event_count", 0),
+                "staff_shortage_hooks": last_staffing.get(
+                    "staff_shortage_hooks",
+                    {
+                        "configured": False,
+                        "invoked": 0,
+                        "failed": 0,
+                        "retries": 0,
+                        "delivered": 0,
                     },
                 ),
             }

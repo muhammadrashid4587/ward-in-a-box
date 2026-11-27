@@ -759,6 +759,12 @@ class ChaosEngine:
         # again.
         self._dialysis_failure_started = set()
         self._dialysis_failure_ended = set()
+        # Staff-shortage events fire their start hook once, on
+        # the first tick inside the window, and their end hook
+        # once, on the first tick after it — a second sick call
+        # is a new event, so it fires again.
+        self._staff_shortage_started = set()
+        self._staff_shortage_ended = set()
 
     def stockouts(self, ward, now):
         """Active pharmacy stockouts: ``{bed_id: {med, ...}}``.
@@ -1000,6 +1006,25 @@ class ChaosEngine:
                 ):
                     self._dialysis_failure_ended.add(id(ev))
                     ward._dialysis_failure_ended(ev, now)
+            # Staff shortage: the start hook fires once, on the
+            # first tick inside the window, and the end hook
+            # once, on the first tick after it — so scenario
+            # code hears the sick call and the roster coming
+            # whole again exactly once per event, even across
+            # a run that ticks past the end. The check runs
+            # before the active gate below, so an end is
+            # caught on the tick the window closes.
+            if ev.type == "staff_shortage":
+                if ev.active(now):
+                    if id(ev) not in self._staff_shortage_started:
+                        self._staff_shortage_started.add(id(ev))
+                        ward._staff_shortage_started(ev, now)
+                elif (
+                    id(ev) in self._staff_shortage_started
+                    and id(ev) not in self._staff_shortage_ended
+                ):
+                    self._staff_shortage_ended.add(id(ev))
+                    ward._staff_shortage_ended(ev, now)
             if not ev.active(now):
                 continue
             if ev.type == "sensor_drift":
