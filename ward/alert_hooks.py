@@ -45,8 +45,9 @@ running slow starting or returning to normal fires the ward's
 due time and still not back — or landing after being
 overdue fires the ward's ``lab_overdue_hooks``; a ventilator
 failing or restarting fires the ward's
-``ventilator_failure_hooks``.
-All seventeen share
+``ventilator_failure_hooks``; a dialysis machine failing or
+restarting fires the ward's ``dialysis_failure_hooks``.
+All eighteen share
 the same ``AlertHooks`` machinery — the same webhook and
 callback channels, the same best-effort delivery — just a
 different event payload.
@@ -345,6 +346,20 @@ def validate_ventilator_failure_hooks(value):
     )
 
 
+def validate_dialysis_failure_hooks(value):
+    """Normalize a dialysis-failure hook config (see
+    :func:`_validate_hooks`).
+
+    Fires when a dialysis machine fails or restarts — when
+    a bedside dialysis machine stops giving its patient
+    renal replacement and when it is running again — rather
+    than when a NEWS2 event fires.
+    """
+    return _validate_hooks(
+        value, "dialysis-failure", "dialysis_failure_hooks"
+    )
+
+
 class AlertHooks:
     """The configured hooks for one ward event, shared by its monitors.
 
@@ -354,8 +369,8 @@ class AlertHooks:
     ``"discharge-priority"``, ``"oxygen-outage"``,
     ``"power-outage"``, ``"sensor-drift"``, ``"bed-blocker"``, or
     ``"network-outage"``, ``"medication-stockout"``,
-    ``"pump-failure"``, ``"lab-delay"``, ``"lab-overdue"``, or
-    ``"ventilator-failure"``); it changes
+    ``"pump-failure"``, ``"lab-delay"``, ``"lab-overdue"``,
+    ``"ventilator-failure"``, or ``"dialysis-failure"``); it changes
     nothing about delivery.
     """
 

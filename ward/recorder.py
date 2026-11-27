@@ -955,7 +955,11 @@ def summarize(path):
         # treatment, the largest drift per vital, and each
         # drifting bed's drift — so a run's failed machines
         # and their clinical cost are visible without replaying
-        # every tick.
+        # every tick — plus how many dialysis-failure hook
+        # events fired this run, and whether the
+        # dialysis-failure hooks are configured and how many
+        # hook deliveries were invoked, failed, retried, and
+        # delivered.
         "dialysis_failure": (
             {
                 "beds_on_dialysis": (
@@ -973,6 +977,21 @@ def summarize(path):
                     for b in last_dialysis_failure["beds"]
                     if b["drifting"]
                 },
+                "event_count": last_dialysis_failure.get(
+                    "event_count", 0
+                ),
+                "dialysis_failure_hooks": (
+                    last_dialysis_failure.get(
+                        "dialysis_failure_hooks",
+                        {
+                            "configured": False,
+                            "invoked": 0,
+                            "failed": 0,
+                            "retries": 0,
+                            "delivered": 0,
+                        },
+                    )
+                ),
             }
             if last_dialysis_failure is not None
             else None

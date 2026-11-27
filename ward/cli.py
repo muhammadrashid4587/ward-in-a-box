@@ -21,6 +21,7 @@ from .alert_hooks import (
     validate_sensor_drift_hooks,
     validate_trend_alert_hooks,
     validate_ventilator_failure_hooks,
+    validate_dialysis_failure_hooks,
     validate_wait_time_hooks,
 )
 from .chaos import ChaosEvent
@@ -435,6 +436,22 @@ def load_scenario(path):
             raise ValueError(
                 "ventilator_failure_hooks: %s" % e
             )
+    dialysis_failure_hooks = None
+    if "dialysis_failure_hooks" in data:
+        if not isinstance(data["dialysis_failure_hooks"], dict):
+            raise ValueError(
+                "dialysis_failure_hooks must be an object"
+            )
+        try:
+            dialysis_failure_hooks = (
+                validate_dialysis_failure_hooks(
+                    data["dialysis_failure_hooks"]
+                )
+            )
+        except ValueError as e:
+            raise ValueError(
+                "dialysis_failure_hooks: %s" % e
+            )
     return {
         "beds": beds,
         "rate_hz": rate,
@@ -474,6 +491,7 @@ def load_scenario(path):
         "lab_delay_hooks": lab_delay_hooks,
         "lab_overdue_hooks": lab_overdue_hooks,
         "ventilator_failure_hooks": ventilator_failure_hooks,
+        "dialysis_failure_hooks": dialysis_failure_hooks,
         "triage": triage,
         "host": data.get("host", "127.0.0.1"),
         "port": data.get("port", 8080),
@@ -522,6 +540,9 @@ def build_ward(cfg, seed=None, recorder=None):
         lab_overdue_hooks=cfg.get("lab_overdue_hooks"),
         ventilator_failure_hooks=cfg.get(
             "ventilator_failure_hooks"
+        ),
+        dialysis_failure_hooks=cfg.get(
+            "dialysis_failure_hooks"
         ),
         triage=cfg.get("triage"),
         recorder=recorder,
