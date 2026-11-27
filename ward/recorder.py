@@ -163,6 +163,7 @@ def summarize(path):
     last_dialysis_failure = None
     last_partition = None
     last_dropout = None
+    last_alarm_storm = None
     with open(path) as f:
         for line in f:
             line = line.strip()
@@ -246,6 +247,8 @@ def summarize(path):
                 last_partition = obj["partition"]
             if isinstance(obj.get("dropout"), dict):
                 last_dropout = obj["dropout"]
+            if isinstance(obj.get("alarm_storm"), dict):
+                last_alarm_storm = obj["alarm_storm"]
             for bed in obj["beds"]:
                 b = bed["bed"]
                 if not bed.get("online", True):
@@ -740,6 +743,37 @@ def summarize(path):
                 ),
             }
             if last_dropout is not None
+            else None
+        ),
+        # Alarm-storm totals from the last tick: whether a storm
+        # is open right now, how many alarms are inside the
+        # trailing window, how many storm hook events fired this
+        # run, and whether the alarm-storm hooks are configured
+        # and how many hook deliveries were invoked, failed,
+        # retried, and delivered.
+        "alarm_storm": (
+            {
+                "storm_active": last_alarm_storm.get(
+                    "storm_active", False
+                ),
+                "alarms_in_window": last_alarm_storm.get(
+                    "alarms_in_window", 0
+                ),
+                "event_count": last_alarm_storm.get(
+                    "event_count", 0
+                ),
+                "alarm_storm_hooks": last_alarm_storm.get(
+                    "alarm_storm_hooks",
+                    {
+                        "configured": False,
+                        "invoked": 0,
+                        "failed": 0,
+                        "retries": 0,
+                        "delivered": 0,
+                    },
+                ),
+            }
+            if last_alarm_storm is not None
             else None
         ),
         # Staffing totals from the last tick: the load factor, how

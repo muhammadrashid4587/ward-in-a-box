@@ -3,8 +3,10 @@
 import random
 import threading
 import time
+from collections import deque
 
 from .alert_hooks import (
+    validate_alarm_storm_hooks,
     validate_bed_blocker_hooks,
     validate_boarding_full_hooks,
     validate_discharge_priority_hooks,
@@ -49,6 +51,65 @@ from .vitals import PROFILES, validate_acuity
 DEFAULT_PROFILES = ["stable", "stable", "stable", "tachycardic", "hypoxic", "febrile"]
 
 
+# Alarm-storm detection: how a burst of alarms is recognised as
+# a storm. A storm starts the tick the ward has raised at least
+# ``threshold`` alarms inside the trailing ``window_s`` seconds,
+# and ends the tick the count inside that window falls back below
+# the threshold. Defaults: 10 alarms within 60 seconds — a burst
+# a real ward would page about, while a quiet ward stays quiet.
+DEFAULT_ALARM_STORM = {
+    "threshold": 10,
+    "window_s": 60.0,
+}
+
+
+def validate_alarm_storm(value):
+    """Normalize an alarm-storm detection config.
+
+    None means the defaults; a dict may set ``threshold`` (alarms
+    raised inside the window that start a storm, an int of at
+    least 1) and ``window_s`` (seconds of trailing alarm history
+    the count looks at, a number above 0). Returns the normalized
+    dict.
+    """
+    if value is None:
+        return dict(DEFAULT_ALARM_STORM)
+    if not isinstance(value, dict):
+        raise ValueError(
+            "alarm_storm must be a dict, got %r" % (value,)
+        )
+    unknown = sorted(set(value) - set(DEFAULT_ALARM_STORM))
+    if unknown:
+        raise ValueError(
+            "alarm_storm has unknown keys: %s" % ", ".join(unknown)
+        )
+    out = dict(DEFAULT_ALARM_STORM)
+    for key, threshold in value.items():
+        if key == "threshold":
+            if (
+                isinstance(threshold, bool)
+                or not isinstance(threshold, int)
+                or threshold < 1
+            ):
+                raise ValueError(
+                    "alarm_storm threshold must be an int >= 1, got %r"
+                    % (threshold,)
+                )
+            out[key] = threshold
+        elif key == "window_s":
+            if (
+                isinstance(threshold, bool)
+                or not isinstance(threshold, (int, float))
+                or threshold <= 0
+            ):
+                raise ValueError(
+                    "alarm_storm window_s must be a number > 0, got %r"
+                    % (threshold,)
+                )
+            out[key] = float(threshold)
+    return out
+
+
 class Ward:
     """A simulated ward.
 
@@ -60,7 +121,7 @@ class Ward:
     snapshot to a JSONL file.
     """
 
-    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None, cleaning_s=30.0, meds=None, triage=None, discharge_planning=None, cleaning_capacity=None, discharge_readiness=None, oxygen=None, infusions=None, ventilators=None, dialysis=None, consciousness=None, consciousness_dynamics=None, news2_trend=None, trend_alert_hooks=None, escalation_hooks=None, boarding_full_hooks=None, wait_time_hooks=None, missed_dose_hooks=None, discharge_readiness_hooks=None, discharge_priority_hooks=None, oxygen_outage_hooks=None, power_outage_hooks=None, sensor_drift_hooks=None, bed_blocker_hooks=None, network_outage_hooks=None, medication_stockout_hooks=None, pump_failure_hooks=None, lab_delay_hooks=None, lab_overdue_hooks=None, ventilator_failure_hooks=None, dialysis_failure_hooks=None, staff_shortage_hooks=None, partition_hooks=None, dropout_hooks=None, news2_staffing_escalation=None, labs=None):
+    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None, cleaning_s=30.0, meds=None, triage=None, discharge_planning=None, cleaning_capacity=None, discharge_readiness=None, oxygen=None, infusions=None, ventilators=None, dialysis=None, consciousness=None, consciousness_dynamics=None, news2_trend=None, trend_alert_hooks=None, escalation_hooks=None, boarding_full_hooks=None, wait_time_hooks=None, missed_dose_hooks=None, discharge_readiness_hooks=None, discharge_priority_hooks=None, oxygen_outage_hooks=None, power_outage_hooks=None, sensor_drift_hooks=None, bed_blocker_hooks=None, network_outage_hooks=None, medication_stockout_hooks=None, pump_failure_hooks=None, lab_delay_hooks=None, lab_overdue_hooks=None, ventilator_failure_hooks=None, dialysis_failure_hooks=None, staff_shortage_hooks=None, partition_hooks=None, dropout_hooks=None, alarm_storm=None, alarm_storm_hooks=None, news2_staffing_escalation=None, labs=None):
         if not 1 <= beds <= 64:
             raise ValueError("beds must be 1..64")
         if rate_hz <= 0:
@@ -332,6 +393,35 @@ class Ward:
         # Every dropout hook event this run — the audit trail
         # for the dropout hooks.
         self.dropout_events = []
+        # Alarm-storm detection: how many alarms in how long
+        # counts as a storm (defaults: 10 alarms in 60 s).
+        # The detector watches the alarms the monitors raise
+        # each tick, so it needs no chaos event — a storm is
+        # recognised from the alarm traffic itself, whatever
+        # caused it.
+        self.alarm_storm = validate_alarm_storm(alarm_storm)
+        # Alarm-storm hooks: one shared object for the whole
+        # ward (a webhook URL and/or an in-process callback),
+        # invoked when a storm starts or ends. Off by default.
+        # The ward owns the object: a storm is a ward-level
+        # event, and the payload names the beds that raised
+        # the alarms.
+        self.alarm_storm_hooks = (
+            validate_alarm_storm_hooks(
+                alarm_storm_hooks
+            )
+        )
+        # Every alarm-storm hook event this run — the audit
+        # trail for the alarm-storm hooks.
+        self.alarm_storm_events = []
+        # The alarms raised inside the detector's trailing
+        # window — (t, bed, alarm) per raise, oldest first —
+        # and the storm open right now, if any: when it
+        # started, the most alarms ever inside the window
+        # during it, how many alarms have been raised since
+        # it started, and which beds raised them.
+        self._alarm_storm_raised = deque()
+        self._alarm_storm_open = None
         # The priority order last sent to the hooks (empty
         # before the first ready bed), and every order change
         # this run — the audit trail for the priority hooks.
@@ -603,6 +693,13 @@ class Ward:
         for m in self.monitors:
             for alarm in m.raised_this_tick:
                 self.staffing.alarm_raised(m.bed_id, alarm, self.elapsed, occupied)
+        # Alarm-storm detection: with this tick's raises in, count
+        # the alarms inside the trailing window — a burst crossing
+        # the threshold starts a storm, and the count falling back
+        # below it ends one. Runs after the staffing loop, so the
+        # same raises feed both, and before the snapshot, so the
+        # event is in it.
+        self._check_alarm_storm()
         # Discharge paperwork timing: a bed flagged ready starts
         # its paperwork clock, and one that stops being ready (or
         # leaves) drops it until it flags ready again — so the
@@ -675,7 +772,7 @@ class Ward:
         # in, and before the snapshot, so the event is in it.
         # A tick where the order is unchanged fires nothing.
         self._check_priority_order()
-        snap = {"t": self.elapsed, "beds": readings, "staffing": self.staffing_summary(), "turnover": self.turnover_summary(), "meds": self.meds_summary(), "triage": self.triage_summary(), "arrivals": self.arrivals_summary(), "discharge": self.discharge_summary(), "discharge_readiness": self.readiness_summary(), "discharge_priority": self.discharge_priority_summary(), "early_warning": self.early_warning_summary(), "sensor_drift": self.sensor_drift_summary(), "bed_blocker": self.bed_blocker_summary(), "oxygen_outage": self.oxygen_outage_summary(), "power_outage": self.power_outage_summary(), "network_outage": self.network_outage_summary(), "medication_stockout": self.medication_stockout_summary(), "pump_failure": self.pump_failure_summary(), "lab_delay": self.lab_delay_summary(), "ventilator_failure": self.ventilator_failure_summary(), "dialysis_failure": self.dialysis_failure_summary(), "partition": self.partition_summary(), "dropout": self.dropout_summary()}
+        snap = {"t": self.elapsed, "beds": readings, "staffing": self.staffing_summary(), "turnover": self.turnover_summary(), "meds": self.meds_summary(), "triage": self.triage_summary(), "arrivals": self.arrivals_summary(), "discharge": self.discharge_summary(), "discharge_readiness": self.readiness_summary(), "discharge_priority": self.discharge_priority_summary(), "early_warning": self.early_warning_summary(), "sensor_drift": self.sensor_drift_summary(), "bed_blocker": self.bed_blocker_summary(), "oxygen_outage": self.oxygen_outage_summary(), "power_outage": self.power_outage_summary(), "network_outage": self.network_outage_summary(), "medication_stockout": self.medication_stockout_summary(), "pump_failure": self.pump_failure_summary(), "lab_delay": self.lab_delay_summary(), "ventilator_failure": self.ventilator_failure_summary(), "dialysis_failure": self.dialysis_failure_summary(), "partition": self.partition_summary(), "dropout": self.dropout_summary(), "alarm_storm": self.alarm_storm_summary()}
         with self._lock:
             self.latest = snap
         if self.recorder is not None:
@@ -1330,6 +1427,141 @@ class Ward:
             "events": [dict(e) for e in self.dropout_events],
             "dropout_hooks": (
                 self.dropout_hooks.summary()
+            ),
+        }
+
+    def _check_alarm_storm(self):
+        """Detect an alarm storm from this tick's alarm traffic.
+
+        Every alarm the monitors raised this tick joins the
+        trailing window; raises older than ``window_s`` fall
+        out of it. The count crossing ``threshold`` starts a
+        storm — once, not once a tick — and falling back below
+        it ends the storm, so a second burst re-arms and fires
+        again. While a storm is open its peak window count, its
+        total raises, and its beds keep growing.
+        """
+        now = self.elapsed
+        window_s = self.alarm_storm["window_s"]
+        threshold = self.alarm_storm["threshold"]
+        raised_now = 0
+        for m in self.monitors:
+            for alarm in m.raised_this_tick:
+                self._alarm_storm_raised.append(
+                    (now, m.bed_id, alarm)
+                )
+                raised_now += 1
+        cutoff = now - window_s
+        while (
+            self._alarm_storm_raised
+            and self._alarm_storm_raised[0][0] < cutoff
+        ):
+            self._alarm_storm_raised.popleft()
+        count = len(self._alarm_storm_raised)
+        open_storm = self._alarm_storm_open
+        if open_storm is None:
+            if count >= threshold:
+                beds = sorted(
+                    {b for _, b, _ in self._alarm_storm_raised}
+                )
+                self._alarm_storm_open = {
+                    "started_t": now,
+                    "peak": count,
+                    "total": count,
+                    "beds": set(beds),
+                }
+                self._fire_alarm_storm_event(
+                    "alarm_storm_started",
+                    now,
+                    {
+                        "threshold": threshold,
+                        "window_s": window_s,
+                        "alarms_in_window": count,
+                        "beds": beds,
+                    },
+                )
+        else:
+            open_storm["peak"] = max(open_storm["peak"], count)
+            open_storm["total"] += raised_now
+            open_storm["beds"].update(
+                b for _, b, _ in self._alarm_storm_raised
+            )
+            if count < threshold:
+                self._fire_alarm_storm_event(
+                    "alarm_storm_ended",
+                    now,
+                    {
+                        "started_t": open_storm["started_t"],
+                        "duration_s": round(
+                            now - open_storm["started_t"], 3
+                        ),
+                        "threshold": threshold,
+                        "window_s": window_s,
+                        "peak_alarms_in_window": open_storm["peak"],
+                        "alarms_raised": open_storm["total"],
+                        "beds": sorted(open_storm["beds"]),
+                    },
+                )
+                self._alarm_storm_open = None
+
+    def _fire_alarm_storm_event(self, kind, now, extra):
+        """Fire one alarm-storm hook event.
+
+        The payload carries the event kind, the tick, and the
+        storm's shape — the detection threshold and window,
+        how many alarms are inside the window (on start) or
+        the storm's peak and total raises (on end), and the
+        beds that raised them — so a hook can tell the outside
+        world the ward is paging faster than anyone can keep
+        up with, and when it has settled again. The event is
+        recorded on the audit trail with whether the hook was
+        invoked for it, any synchronous error, and the retries
+        and final delivery outcome.
+        """
+        payload = {"event": kind, "t": now}
+        payload.update(extra)
+        self.alarm_storm_events.append(payload)
+        result = self.alarm_storm_hooks.fire(
+            dict(payload),
+            record=payload,
+        )
+        payload["hook_invoked"] = result["invoked"]
+        payload["hook_errors"] = result["errors"]
+
+    def alarm_storm_summary(self):
+        """Current alarm-storm state and hook event history.
+
+        ``storm_active`` says whether the ward is inside a
+        storm right now, ``started_t`` when it started (null
+        when none is open), ``alarms_in_window`` how many
+        alarms have been raised inside the trailing window,
+        and ``threshold`` / ``window_s`` the detection
+        settings; ``event_count`` counts every alarm-storm
+        hook event this run — storms starting and ending —
+        and ``events`` lists them, each with the tick, the
+        storm's shape, and whether the ward's hooks were
+        invoked for it (``hook_invoked``) and the retries and
+        final delivery outcome (``hook_retries``,
+        ``hook_final_status``); ``alarm_storm_hooks`` carries
+        the hook totals: whether any hook is configured, how
+        many hook deliveries were invoked, how many failed,
+        how many retries were spent, and how many
+        deliveries eventually landed.
+        """
+        open_storm = self._alarm_storm_open
+        return {
+            "t": self.elapsed,
+            "storm_active": open_storm is not None,
+            "started_t": (
+                open_storm["started_t"] if open_storm else None
+            ),
+            "alarms_in_window": len(self._alarm_storm_raised),
+            "threshold": self.alarm_storm["threshold"],
+            "window_s": self.alarm_storm["window_s"],
+            "event_count": len(self.alarm_storm_events),
+            "events": [dict(e) for e in self.alarm_storm_events],
+            "alarm_storm_hooks": (
+                self.alarm_storm_hooks.summary()
             ),
         }
 

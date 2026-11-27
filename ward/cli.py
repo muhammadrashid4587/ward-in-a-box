@@ -5,6 +5,7 @@ import json
 import sys
 
 from .alert_hooks import (
+    validate_alarm_storm_hooks,
     validate_bed_blocker_hooks,
     validate_boarding_full_hooks,
     validate_discharge_priority_hooks,
@@ -44,7 +45,7 @@ from .timeline import Timeline, TimelinePhase
 from .triage import TriageQueue
 from .meds import validate_med
 from .vitals import PROFILES, validate_acuity
-from .ward import Ward
+from .ward import Ward, validate_alarm_storm
 
 
 def load_scenario(path):
@@ -491,6 +492,24 @@ def load_scenario(path):
             )
         except ValueError as e:
             raise ValueError("dropout_hooks: %s" % e)
+    alarm_storm = None
+    if "alarm_storm" in data:
+        if not isinstance(data["alarm_storm"], dict):
+            raise ValueError("alarm_storm must be an object")
+        try:
+            alarm_storm = validate_alarm_storm(data["alarm_storm"])
+        except ValueError as e:
+            raise ValueError("alarm_storm: %s" % e)
+    alarm_storm_hooks = None
+    if "alarm_storm_hooks" in data:
+        if not isinstance(data["alarm_storm_hooks"], dict):
+            raise ValueError("alarm_storm_hooks must be an object")
+        try:
+            alarm_storm_hooks = validate_alarm_storm_hooks(
+                data["alarm_storm_hooks"]
+            )
+        except ValueError as e:
+            raise ValueError("alarm_storm_hooks: %s" % e)
     return {
         "beds": beds,
         "rate_hz": rate,
@@ -534,6 +553,8 @@ def load_scenario(path):
         "staff_shortage_hooks": staff_shortage_hooks,
         "partition_hooks": partition_hooks,
         "dropout_hooks": dropout_hooks,
+        "alarm_storm": alarm_storm,
+        "alarm_storm_hooks": alarm_storm_hooks,
         "triage": triage,
         "host": data.get("host", "127.0.0.1"),
         "port": data.get("port", 8080),
@@ -591,6 +612,8 @@ def build_ward(cfg, seed=None, recorder=None):
         ),
         partition_hooks=cfg.get("partition_hooks"),
         dropout_hooks=cfg.get("dropout_hooks"),
+        alarm_storm=cfg.get("alarm_storm"),
+        alarm_storm_hooks=cfg.get("alarm_storm_hooks"),
         triage=cfg.get("triage"),
         recorder=recorder,
     )

@@ -56,8 +56,11 @@ and the roster coming whole again — fires the ward's
 the ward cut off from the server and reconnected — fires
 the ward's ``partition_hooks``; a monitor dropping out or
 coming back — a bed's monitor going offline and returning —
-fires the ward's ``dropout_hooks``.
-All twenty-one share
+fires the ward's ``dropout_hooks``; an alarm storm starting or
+ending — the ward raising at least ``threshold`` alarms within
+``window_s`` seconds, and the rate falling back below it — fires
+the ward's ``alarm_storm_hooks``.
+All twenty-two share
 the same ``AlertHooks`` machinery — the same webhook and
 callback channels, the same best-effort delivery — just a
 different event payload.
@@ -409,6 +412,20 @@ def validate_dropout_hooks(value):
     )
 
 
+def validate_alarm_storm_hooks(value):
+    """Normalize an alarm-storm hook config (see
+    :func:`_validate_hooks`).
+
+    Fires when an alarm storm starts or ends — when the ward
+    raises at least ``threshold`` alarms within ``window_s``
+    seconds, and when the rate falls back below it — rather
+    than when a NEWS2 event fires.
+    """
+    return _validate_hooks(
+        value, "alarm-storm", "alarm_storm_hooks"
+    )
+
+
 class AlertHooks:
     """The configured hooks for one ward event, shared by its monitors.
 
@@ -420,7 +437,8 @@ class AlertHooks:
     ``"network-outage"``, ``"medication-stockout"``,
     ``"pump-failure"``, ``"lab-delay"``, ``"lab-overdue"``,
     ``"ventilator-failure"``, ``"dialysis-failure"``,
-    ``"staff-shortage"``, ``"partition"``, or ``"dropout"``); it changes
+    ``"staff-shortage"``, ``"partition"``, ``"dropout"``, or
+    ``"alarm-storm"``); it changes
     nothing about delivery.
     """
 

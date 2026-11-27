@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from ward.alert_hooks import (
     TrendAlertHooks,
+    validate_alarm_storm_hooks,
     validate_bed_blocker_hooks,
     validate_boarding_full_hooks,
     validate_discharge_priority_hooks,
@@ -67,7 +68,7 @@ from ward.news2 import (
     validate_news2_trend,
 )
 from ward.vitals import PROFILES, effective_ranges, validate_acuity
-from ward.ward import Ward
+from ward.ward import Ward, validate_alarm_storm
 from ward.websocket import accept_key, encode_frame, read_frame
 
 HERE = os.path.dirname(__file__)
@@ -15242,6 +15243,438 @@ class TestDropoutHooks(unittest.TestCase):
             )
             self.assertEqual(
                 run["dropout"]["dropout_hooks"][
+                    "invoked"
+                ],
+                2,
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+class TestAlarmStormHooks(unittest.TestCase):
+    # Alarm-storm hooks: when the ward raises at least
+    # ``threshold`` alarms inside ``window_s`` seconds — 10 in
+    # 60 s by default — a storm starts, and when the trailing
+    # count falls back below the threshold it ends. The storm
+    # is recognised from the alarm traffic itself, whatever
+    # caused it, so no chaos event is needed — the ward's
+    # alarm_storm_hooks fire on the burst and on the calm
+    # after it, with the same webhook/callback machinery as
+    # the other hooks.
+
+    def _storm_ward(self, hooks=None, alarm_storm=None):
+        return Ward(
+            beds=12,
+            profiles=["stable"] * 12,
+            chaos=[
+                ChaosEvent(
+                    "alarm_storm",
+                    at=10,
+                    duration=20,
+                    beds=[0, 1, 2],
+                ),
+            ],
+            seed=42,
+            alarm_storm=alarm_storm,
+            alarm_storm_hooks=hooks,
+        )
+
+    def test_validate_alarm_storm_hooks(self):
+        hooks = validate_alarm_storm_hooks(None)
+        self.assertIsInstance(hooks, TrendAlertHooks)
+        self.assertFalse(hooks.configured)
+        self.assertEqual(hooks.kind, "alarm-storm")
+        custom = validate_alarm_storm_hooks(
+            {"webhook_url": "https://example.invalid/hooks", "timeout_s": 2}
+        )
+        self.assertTrue(custom.configured)
+        self.assertEqual(custom.kind, "alarm-storm")
+        self.assertEqual(custom.timeout_s, 2.0)
+        seen = []
+        append = seen.append
+        cb = validate_alarm_storm_hooks({"callback": append})
+        self.assertTrue(cb.configured)
+        self.assertIs(cb.callback, append)
+        with self.assertRaises(ValueError):
+            validate_alarm_storm_hooks(
+                {"webhook_url": "ftp://x/hooks"}
+            )
+        with self.assertRaises(ValueError):
+            validate_alarm_storm_hooks({"callback": "not callable"})
+        with self.assertRaises(ValueError):
+            validate_alarm_storm_hooks({"timeout_s": 0})
+        with self.assertRaises(ValueError):
+            validate_alarm_storm_hooks({"url": "http://x/hooks"})
+        with self.assertRaises(ValueError):
+            validate_alarm_storm_hooks("http://x/hooks")
+
+    def test_validate_alarm_storm(self):
+        self.assertEqual(
+            validate_alarm_storm(None),
+            {"threshold": 10, "window_s": 60.0},
+        )
+        self.assertEqual(
+            validate_alarm_storm({"threshold": 5}),
+            {"threshold": 5, "window_s": 60.0},
+        )
+        self.assertEqual(
+            validate_alarm_storm({"window_s": 30}),
+            {"threshold": 10, "window_s": 30.0},
+        )
+        with self.assertRaises(ValueError):
+            validate_alarm_storm({"threshold": 0})
+        with self.assertRaises(ValueError):
+            validate_alarm_storm({"threshold": 1.5})
+        with self.assertRaises(ValueError):
+            validate_alarm_storm({"window_s": 0})
+        with self.assertRaises(ValueError):
+            validate_alarm_storm({"rate": 5})
+        with self.assertRaises(ValueError):
+            validate_alarm_storm("10 in 60")
+
+    def test_hooks_off_by_default(self):
+        # No hooks configured: the storm still starts and
+        # ends, and each event is recorded with no hook
+        # invoked.
+        ward = self._storm_ward()
+        self.assertFalse(ward.alarm_storm_hooks.configured)
+        for _ in range(100):
+            ward.tick()
+        summary = ward.alarm_storm_summary()
+        self.assertFalse(summary["storm_active"])
+        self.assertIsNone(summary["started_t"])
+        self.assertEqual(summary["alarms_in_window"], 0)
+        self.assertEqual(summary["threshold"], 10)
+        self.assertEqual(summary["window_s"], 60.0)
+        self.assertEqual(summary["event_count"], 2)
+        self.assertEqual(
+            [
+                (e["event"], e["t"])
+                for e in summary["events"]
+            ],
+            [
+                ("alarm_storm_started", 12.0),
+                ("alarm_storm_ended", 73.0),
+            ],
+        )
+        for event in summary["events"]:
+            self.assertFalse(event["hook_invoked"])
+            self.assertEqual(event["hook_errors"], [])
+            self.assertEqual(event["hook_retries"], 0)
+            self.assertEqual(
+                event["hook_final_status"], "not_invoked"
+            )
+        self.assertEqual(
+            summary["alarm_storm_hooks"],
+            {"configured": False, "invoked": 0, "failed": 0, "retries": 0, "delivered": 0},
+        )
+        self.assertEqual(
+            ward.snapshot()["alarm_storm"]["event_count"], 2
+        )
+
+    def test_callback_hook_fires_for_start_and_end(self):
+        seen = []
+        ward = self._storm_ward({"callback": seen.append})
+        self.assertTrue(ward.alarm_storm_hooks.configured)
+        for _ in range(100):
+            ward.tick()
+        # Two events over the run: the burst on beds 0-2
+        # crosses 10 alarms in 60 s at 12 s, and the trailing
+        # count falls back below 10 at 73 s, once the burst
+        # has aged out of the window. The storm stays open
+        # in between, but the hooks fire once on start and
+        # once on end, not once a tick.
+        self.assertEqual(
+            [(p["event"], p["t"]) for p in seen],
+            [
+                ("alarm_storm_started", 12.0),
+                ("alarm_storm_ended", 73.0),
+            ],
+        )
+        start, end = seen
+        self.assertEqual(start["threshold"], 10)
+        self.assertEqual(start["window_s"], 60.0)
+        self.assertEqual(start["alarms_in_window"], 13)
+        self.assertEqual(start["beds"], [0, 1, 2])
+        self.assertEqual(end["event"], "alarm_storm_ended")
+        self.assertEqual(end["t"], 73.0)
+        self.assertEqual(end["started_t"], 12.0)
+        self.assertEqual(end["duration_s"], 61.0)
+        self.assertEqual(end["peak_alarms_in_window"], 15)
+        self.assertEqual(end["alarms_raised"], 15)
+        self.assertEqual(end["beds"], [0, 1, 2])
+        # Every event records the invocation.
+        summary = ward.alarm_storm_summary()
+        self.assertEqual(summary["event_count"], 2)
+        for event in summary["events"]:
+            self.assertTrue(event["hook_invoked"])
+            self.assertEqual(event["hook_errors"], [])
+            self.assertEqual(event["hook_final_status"], "delivered")
+        self.assertEqual(
+            summary["alarm_storm_hooks"],
+            {"configured": True, "invoked": 2, "failed": 0, "retries": 0, "delivered": 2},
+        )
+
+    def test_storm_active_tracks_the_window(self):
+        ward = self._storm_ward()
+        for _ in range(11):
+            ward.tick()
+        self.assertFalse(
+            ward.alarm_storm_summary()["storm_active"]
+        )
+        ward.tick()  # t=12: the 10th alarm in 60 s lands
+        summary = ward.alarm_storm_summary()
+        self.assertTrue(summary["storm_active"])
+        self.assertEqual(summary["started_t"], 12.0)
+        self.assertEqual(summary["alarms_in_window"], 13)
+        for _ in range(60):
+            ward.tick()
+        self.assertTrue(
+            ward.alarm_storm_summary()["storm_active"]
+        )
+        ward.tick()  # t=73: the burst ages out of the window
+        summary = ward.alarm_storm_summary()
+        self.assertFalse(summary["storm_active"])
+        self.assertIsNone(summary["started_t"])
+
+    def test_start_and_end_fire_again_for_a_second_storm(self):
+        # Two alarm storms on the same beds: the start and
+        # the end fire once per storm — the detector re-arms
+        # when the trailing count falls back below the
+        # threshold, so the second burst fires again.
+        seen = []
+        ward = Ward(
+            beds=12,
+            profiles=["stable"] * 12,
+            chaos=[
+                ChaosEvent(
+                    "alarm_storm",
+                    at=10,
+                    duration=20,
+                    beds=[0, 1, 2],
+                ),
+                ChaosEvent(
+                    "alarm_storm",
+                    at=100,
+                    duration=20,
+                    beds=[0, 1, 2],
+                ),
+            ],
+            seed=42,
+            alarm_storm_hooks={"callback": seen.append},
+        )
+        for _ in range(200):
+            ward.tick()
+        self.assertEqual(
+            [(p["event"], p["t"]) for p in seen],
+            [
+                ("alarm_storm_started", 12.0),
+                ("alarm_storm_ended", 73.0),
+                ("alarm_storm_started", 102.0),
+                ("alarm_storm_ended", 163.0),
+            ],
+        )
+        self.assertEqual(
+            ward.alarm_storm_summary()[
+                "alarm_storm_hooks"
+            ],
+            {"configured": True, "invoked": 4, "failed": 0, "retries": 0, "delivered": 4},
+        )
+
+    def test_high_threshold_never_starts_a_storm(self):
+        # The same burst raises 15 alarms; a threshold of 100
+        # never sees a storm, and the ward behaves exactly as
+        # before — no events, no hooks.
+        ward = self._storm_ward(alarm_storm={"threshold": 100})
+        for _ in range(100):
+            ward.tick()
+        summary = ward.alarm_storm_summary()
+        self.assertFalse(summary["storm_active"])
+        self.assertEqual(summary["event_count"], 0)
+        self.assertEqual(summary["alarms_in_window"], 0)
+
+    def test_low_threshold_starts_on_the_first_alarm(self):
+        # A threshold of 1 starts a storm on the very first
+        # alarm a quiet ward raises, and ends it once that
+        # alarm ages out of the window.
+        seen = []
+        ward = Ward(
+            beds=2,
+            profiles=["hypoxic", "stable"],
+            seed=42,
+            alarm_storm={"threshold": 1, "window_s": 10.0},
+            alarm_storm_hooks={"callback": seen.append},
+        )
+        for _ in range(30):
+            ward.tick()
+        self.assertEqual(
+            [p["event"] for p in seen],
+            ["alarm_storm_started", "alarm_storm_ended"],
+        )
+        start, end = seen
+        self.assertEqual(start["alarms_in_window"], 1)
+        # The alarm raised at start["t"] stays inside the
+        # trailing window through start["t"] + window_s — the
+        # window is inclusive at both ends, like the alarm
+        # rate — and ages out on the next tick, which ends
+        # the storm.
+        self.assertEqual(
+            end["t"], start["t"] + 10.0 + 1.0
+        )
+
+    def test_callback_failure_is_not_fatal(self):
+        def boom(payload):
+            raise ValueError("pager is down")
+
+        ward = self._storm_ward({"callback": boom})
+        for _ in range(11):
+            ward.tick()  # t=11: the burst has not crossed yet
+        snap = ward.tick()  # t=12: storm starts, hook raises
+        self.assertTrue(snap["alarm_storm"]["storm_active"])
+        snap = ward.tick()  # t=13: the tick still completes
+        self.assertTrue(snap["alarm_storm"]["storm_active"])
+        event = ward.alarm_storm_summary()["events"][0]
+        self.assertEqual(event["event"], "alarm_storm_started")
+        self.assertTrue(event["hook_invoked"])
+        self.assertEqual(event["hook_errors"], ["pager is down"])
+        self.assertEqual(event["hook_final_status"], "failed")
+        summary = ward.alarm_storm_summary()[
+            "alarm_storm_hooks"
+        ]
+        self.assertEqual(summary["invoked"], 1)
+        self.assertEqual(summary["failed"], 1)
+
+    def test_webhook_posts_to_stub_server(self):
+        server, port, received = capture_server()
+        try:
+            ward = self._storm_ward(
+                {"webhook_url": "http://127.0.0.1:%d/hooks" % port}
+            )
+            for _ in range(100):
+                ward.tick()
+            self.assertTrue(ward.alarm_storm_hooks.wait(timeout=5))
+            self.assertEqual(len(received), 2)
+            payloads = sorted(
+                (json.loads(r[2]) for r in received),
+                key=lambda p: p["t"],
+            )
+            self.assertEqual(
+                [(p["event"], p["t"]) for p in payloads],
+                [
+                    ("alarm_storm_started", 12.0),
+                    ("alarm_storm_ended", 73.0),
+                ],
+            )
+            path, content_type, body = received[0]
+            self.assertEqual(path, "/hooks")
+            self.assertEqual(content_type, "application/json")
+            start = [p for p in payloads if p["event"] == "alarm_storm_started"][0]
+            self.assertEqual(start["beds"], [0, 1, 2])
+            summary = ward.alarm_storm_summary()
+            self.assertEqual(
+                summary["alarm_storm_hooks"],
+                {"configured": True, "invoked": 2, "failed": 0, "retries": 0, "delivered": 2},
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_alarm_storm_endpoint_serves_json_and_is_503_while_partitioned(self):
+        ward = self._storm_ward()
+        server, port = serve_in_thread(ward)
+        try:
+            status, body = get(port, "/alarm-storm")
+            self.assertEqual(status, 200)
+            summary = json.loads(body)
+            self.assertFalse(summary["storm_active"])
+            self.assertEqual(summary["event_count"], 0)
+            for _ in range(12):
+                ward.tick()  # t=12: the storm starts
+            status, body = get(port, "/alarm-storm")
+            self.assertEqual(status, 200)
+            summary = json.loads(body)
+            self.assertTrue(summary["storm_active"])
+            self.assertEqual(summary["event_count"], 1)
+            # 503 while partitioned, like the other live endpoints.
+            ward.partitioned = True
+            status, body = get(port, "/alarm-storm")
+            self.assertEqual(status, 503)
+            ward.partitioned = False
+            status, body = get(port, "/alarm-storm")
+            self.assertEqual(status, 200)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_scenario_alarm_storm_hooks(self):
+        cfg = load_scenario(
+            os.path.join(
+                HERE, "..", "scenarios", "alarm-storm-hooks.json"
+            )
+        )
+        self.assertTrue(cfg["alarm_storm_hooks"].configured)
+        server, port, received = capture_server()
+        path = os.path.join(tempfile.mkdtemp(), "run.jsonl")
+        try:
+            # The scenario's URL is a placeholder; point it at
+            # the stub server for this run.
+            cfg["alarm_storm_hooks"] = (
+                validate_alarm_storm_hooks(
+                    {"webhook_url": "http://127.0.0.1:%d/hooks" % port}
+                )
+            )
+            ward = build_ward(cfg, seed=42)
+            with Recorder(path, ward.beds, ward.rate_hz, seed=42) as rec:
+                ward.recorder = rec
+                for _ in range(100):
+                    snap = ward.tick()
+            self.assertTrue(ward.alarm_storm_hooks.wait(timeout=5))
+            # Two events over the run: the burst crosses 10
+            # alarms in 60 s at 12 s and the trailing count
+            # falls back below 10 at 73 s. The deliveries run
+            # in separate daemon threads, so their arrival
+            # order at the stub is not guaranteed — sort by
+            # event time before asserting.
+            self.assertEqual(len(received), 2)
+            payloads = sorted(
+                (json.loads(r[2]) for r in received),
+                key=lambda p: p["t"],
+            )
+            self.assertEqual(
+                [
+                    (p["event"], p["t"], p.get("beds"))
+                    for p in payloads
+                ],
+                [
+                    ("alarm_storm_started", 12.0, [0, 1, 2]),
+                    ("alarm_storm_ended", 73.0, [0, 1, 2]),
+                ],
+            )
+            # Every event records that its hook was invoked.
+            for event in snap["alarm_storm"]["events"]:
+                self.assertTrue(event["hook_invoked"])
+            summary = ward.alarm_storm_summary()
+            self.assertEqual(summary["event_count"], 2)
+            self.assertEqual(
+                summary["alarm_storm_hooks"],
+                {"configured": True, "invoked": 2, "failed": 0, "retries": 0, "delivered": 2},
+            )
+            # The run summary carries the event count and the
+            # hook totals from the last tick — but only as of
+            # that tick: the snapshot in the file was recorded
+            # before the last delivery settled, so delivered is
+            # read from the live summary above, not from here.
+            run = summarize(path)
+            self.assertEqual(run["alarm_storm"]["event_count"], 2)
+            self.assertFalse(run["alarm_storm"]["storm_active"])
+            self.assertTrue(
+                run["alarm_storm"]["alarm_storm_hooks"][
+                    "configured"
+                ]
+            )
+            self.assertEqual(
+                run["alarm_storm"]["alarm_storm_hooks"][
                     "invoked"
                 ],
                 2,

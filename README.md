@@ -353,6 +353,14 @@ python3 -m ward.cli scenarios/dialysis-failure.json --seed 42
 # endpoint; a dead endpoint is logged, never fatal)
 python3 -m ward.cli scenarios/dialysis-failure-hooks.json --seed 42
 
+# Alarm-storm hooks: an alarm storm on beds 0-2 from 10 s,
+# with the storm starting at 12 s — when the 10th alarm in
+# 60 s lands — and ending at 73 s, once the burst has aged
+# out of the window, also POSTed to a webhook (here a
+# placeholder URL — point it at your own endpoint; a dead
+# endpoint is logged, never fatal)
+python3 -m ward.cli scenarios/alarm-storm-hooks.json --seed 42
+
 # Reproducible run
 python3 -m ward.cli scenarios/example.json --seed 42
 ```
@@ -477,6 +485,11 @@ python3 -m ward.cli scenarios/example.json --seed 42
   now, the dropout event history, and the dropout-hook
   totals, as JSON
   (503 while partitioned)
+- `GET /alarm-storm` — whether the ward is inside an alarm
+  storm right now, how many alarms are inside the trailing
+  window, the storm event history, and the alarm-storm-hook
+  totals, as JSON
+  (503 while partitioned)
 
 A reading looks like:
 
@@ -520,6 +533,7 @@ summary from `/news2`, and the sensor-drift summary from
 and the ventilator-failure summary from `/ventilator-failure`,
 and the dialysis-failure summary from `/dialysis-failure`,
 and the partition summary from `/partition`,
+and the alarm-storm summary from `/alarm-storm`,
 so a client gets bed occupancy, vitals, alarms, staffing,
 medication, and the intake queue in one message. Ping frames are answered with pong, close frames
 are echoed and the connection is then closed; text frames from the
@@ -1123,6 +1137,78 @@ none configured behaves exactly as before. See
 a seeded 70-tick run bed 0's monitor goes dark at 10 s and
 comes back at 40 s — POSTed to the configured webhook, with
 2 hook deliveries invoked and 0 failed against a stub server.
+
+## Alarm-storm hooks
+
+An alarm storm is the moment a ward most needs the outside
+world to hear about it — and the moment the ward's own staff
+are least able to keep up, because alarms are arriving faster
+than anyone can acknowledge them. A storm is recognised from
+the alarm traffic itself, whatever caused it: the tick the
+ward has raised at least `threshold` alarms inside the
+trailing `window_s` seconds — 10 alarms in 60 seconds by
+default — a storm starts, and the tick the count inside that
+window falls back below the threshold it ends. A ward that
+wants the outside world to hear about that moment — a
+dashboard, a pager, an on-call manager — configures
+alarm-storm hooks, the same channels as the NEWS2 hooks
+(webhook and/or in-process callback), on the same
+best-effort, never-fatal terms:
+
+```json
+{"alarm_storm_hooks": {"webhook_url": "http://127.0.0.1:18099/hooks"}}
+```
+
+The detection is configurable per ward, in the scenario,
+with `"alarm_storm"` — `{"threshold": 5, "window_s": 30}`
+starts a storm on 5 alarms in 30 seconds, while a
+threshold above anything the ward ever raises means no
+storm ever fires and the ward behaves exactly as before.
+
+Two events fire. `alarm_storm_started` fires once, in the
+tick the count crosses the threshold, with the threshold
+and window, how many alarms are inside the window, and the
+beds that raised them. `alarm_storm_ended` fires once, in
+the tick the count falls back below the threshold, with
+when the storm started, how long it lasted, the most alarms
+ever inside the window during it, how many alarms were
+raised in total since it started, and the beds. A storm
+that stays open for sixty ticks fires once, not sixty
+times, and a second burst fires again — the detector
+re-arms when the trailing count falls back below the
+threshold. An in-process callback gets the same payloads
+in the tick the event fires (Python API only — a scenario
+file cannot hold a callable), so scenario code can log or
+escalate on the storm directly. Each event records whether
+the hook was invoked (`"hook_invoked"`, False with no
+hooks) and any synchronous error (`"hook_errors"`), and
+the alarm-storm summary carries the current state
+(`"storm_active"`, `"started_t"`, `"alarms_in_window"`),
+the detection settings (`"threshold"`, `"window_s"`), the
+event totals (`"event_count"`, the full `"events"` history)
+and the ward alarm-storm-hook totals
+(`"alarm_storm_hooks"`: whether any hook is configured,
+how many deliveries were invoked, how many failed, how
+many retries were spent, and how many deliveries
+eventually landed) — in `GET /alarm-storm`, every snapshot
+and WebSocket frame, and the run summary (`--summary`).
+The same retry rules as the NEWS2 hooks apply — a failed
+webhook POST is retried with backoff up to `"max_retries"`
+times, and the event records `"hook_retries"` and
+`"hook_final_status"` alongside `"hook_invoked"`. Hooks are
+off by default, so a ward with none configured behaves
+exactly as before — the storm is still detected and
+recorded, it just pages nobody. The detector counts only
+the alarms the bed monitors raise (the same alarms
+`GET /alarms` serves); wait-time alarms from the triage
+queue are not counted. See
+`scenarios/alarm-storm-hooks.json` for a runnable example:
+over a seeded 100-tick run the burst on beds 0-2 starts
+the storm at 12 s, when the 10th alarm in 60 s lands, and
+ends it at 73 s, once the burst has aged out of the window
+— 15 alarms raised in total, POSTed to the configured
+webhook, with 2 hook deliveries invoked and 0 failed
+against a stub server.
 
 ## Bed blocker
 
@@ -4350,7 +4436,26 @@ the hook totals.
   frame, a `GET /dropout` endpoint, and the run summary; off
   by default, configured per ward with `dropout_hooks` in
   the scenario) — done in v0.69.0
-- Next: alarm-storm hooks (`alarm_storm_started` /
-  `alarm_storm_ended`, one start and one end per storm,
-  re-armed for a second storm, same machinery and same
-  surfaces as the dropout hooks)
+- Alarm-storm hooks (when the ward raises at least
+  `threshold` alarms inside the trailing `window_s`
+  seconds — 10 in 60 s by default, configurable per ward
+  with `alarm_storm` in the scenario — a configured
+  webhook URL gets an `alarm_storm_started` /
+  `alarm_storm_ended` event payload POSTed to it, or an
+  in-process callback is called with the same payload in
+  the firing tick, so a hook can page the on-call manager
+  on the ward paging faster than anyone can keep up with;
+  the storm is recognised from the alarm traffic itself,
+  whatever caused it, so no chaos event is needed; one
+  start and one end per storm, re-armed for a second
+  storm; reusing the NEWS2 hook machinery, best effort and
+  never fatal; each event records whether the hook was
+  invoked, and the alarm-storm summary carries the current
+  state, the detection settings, the event history and the
+  alarm-storm-hook totals, in every snapshot, WebSocket
+  frame, a `GET /alarm-storm` endpoint, and the run
+  summary; off by default, configured per ward with
+  `alarm_storm_hooks` in the scenario) — done in v0.70.0
+- Next: alarm-storm acknowledgement metrics (mean time to
+  ack for the alarms raised during a storm, and how many
+  storm alarms are still pending when it ends)

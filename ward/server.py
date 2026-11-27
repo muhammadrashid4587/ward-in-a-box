@@ -185,6 +185,11 @@ def make_handler(ward):
                     self._send_json(503, {"error": "partitioned"})
                     return
                 self._send_json(200, ward.dropout_summary())
+            elif path == "/alarm-storm":
+                if ward.partitioned:
+                    self._send_json(503, {"error": "partitioned"})
+                    return
+                self._send_json(200, ward.alarm_storm_summary())
             elif path == "/stream":
                 if ward.partitioned:
                     self._send_json(503, {"error": "partitioned"})
@@ -304,6 +309,7 @@ def make_handler(ward):
                         ),
                         "partition": ward.partition_summary(),
                         "dropout": ward.dropout_summary(),
+                        "alarm_storm": ward.alarm_storm_summary(),
                     }
                     send(OP_TEXT, json.dumps(msg))
                     stop.wait(1.0 / ward.rate_hz)
