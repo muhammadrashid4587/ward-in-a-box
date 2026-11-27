@@ -85,6 +85,12 @@ class Staffing:
         self.roster = {s: _validate_roster(roster[s], s) for s in SHIFTS}
         self._pending = []  # {"bed", "alarm", "raised_t", "ack_t"}
         self._acked_times = []  # seconds from raise to ack
+        # Optional callback, invoked with the pending dict of
+        # every alarm as it is acknowledged — the ward uses it
+        # to track which of a storm's alarms have been acked.
+        # None by default, so a bare Staffing behaves exactly
+        # as before.
+        self.on_ack = None
         self.raised = 0
         self.acked = 0
         self.checks_performed = 0
@@ -188,6 +194,8 @@ class Staffing:
                     round(pending["ack_t"] - pending["raised_t"], 3)
                 )
                 self.acked += 1
+                if self.on_ack is not None:
+                    self.on_ack(dict(pending))
         for bed in online_beds:
             due = self._next_check_at.get(bed, 0.0)
             if now >= due:
@@ -197,6 +205,18 @@ class Staffing:
                 self.checks_performed += 1
                 self._last_check_at[bed] = now
                 self._next_check_at[bed] = round(now + CHECK_INTERVAL_S * factor, 3)
+
+    def pending_alarm_keys(self):
+        """Keys of the alarms still waiting to be acknowledged.
+
+        One ``(raised_t, bed, alarm)`` tuple per pending alarm —
+        the identity the ward uses to tell which of a storm's
+        alarms have been acked and which are still outstanding.
+        """
+        return {
+            (p["raised_t"], p["bed"], p["alarm"])
+            for p in self._pending
+        }
 
     def mean_time_to_ack(self):
         """Mean seconds from raise to ack, or None before the first ack."""

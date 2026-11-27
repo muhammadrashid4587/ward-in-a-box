@@ -750,7 +750,11 @@ def summarize(path):
         # trailing window, how many storm hook events fired this
         # run, and whether the alarm-storm hooks are configured
         # and how many hook deliveries were invoked, failed,
-        # retried, and delivered.
+        # retried, and delivered — plus the acknowledgement
+        # totals (how many storms there have been, how many are
+        # acknowledged and how many are not, and the mean and
+        # longest time from a storm's start to its last ack)
+        # and the per-storm records.
         "alarm_storm": (
             {
                 "storm_active": last_alarm_storm.get(
@@ -759,6 +763,17 @@ def summarize(path):
                 "alarms_in_window": last_alarm_storm.get(
                     "alarms_in_window", 0
                 ),
+                "acknowledgement": last_alarm_storm.get(
+                    "acknowledgement",
+                    {
+                        "storms": 0,
+                        "acknowledged": 0,
+                        "unacknowledged": 0,
+                        "mean_time_to_ack_s": None,
+                        "max_time_to_ack_s": None,
+                    },
+                ),
+                "storms": last_alarm_storm.get("storms", []),
                 "event_count": last_alarm_storm.get(
                     "event_count", 0
                 ),

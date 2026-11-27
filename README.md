@@ -361,6 +361,15 @@ python3 -m ward.cli scenarios/dialysis-failure-hooks.json --seed 42
 # endpoint is logged, never fatal)
 python3 -m ward.cli scenarios/alarm-storm-hooks.json --seed 42
 
+# Alarm-storm acknowledgement: the same storm, with no hooks
+# — the 15 alarms it raises are all acknowledged by the
+# nurses on duty 31.0 s after the storm starts, at 43 s, so
+# the storm is acknowledged with 0 alarms still pending when
+# it ends at 73 s; on a thin roster of one nurse for twelve
+# beds the same storm would end with all 15 still pending
+# and take 91.0 s to acknowledge
+python3 -m ward.cli scenarios/alarm-storm-ack.json --seed 42
+
 # Reproducible run
 python3 -m ward.cli scenarios/example.json --seed 42
 ```
@@ -487,8 +496,11 @@ python3 -m ward.cli scenarios/example.json --seed 42
   (503 while partitioned)
 - `GET /alarm-storm` — whether the ward is inside an alarm
   storm right now, how many alarms are inside the trailing
-  window, the storm event history, and the alarm-storm-hook
-  totals, as JSON
+  window, the acknowledgement totals (how many storms there
+  have been, how many are acknowledged and how many are not,
+  and the mean and longest time from a storm's start to its
+  last ack) and the per-storm records, the storm event
+  history, and the alarm-storm-hook totals, as JSON
   (503 while partitioned)
 
 A reading looks like:
@@ -1209,6 +1221,35 @@ ends it at 73 s, once the burst has aged out of the window
 — 15 alarms raised in total, POSTed to the configured
 webhook, with 2 hook deliveries invoked and 0 failed
 against a stub server.
+
+## Alarm-storm acknowledgement
+
+A storm ending does not mean the ward has caught up — the
+nurses on duty still have to acknowledge every alarm the
+storm raised, one by one, after the staffing delay. The
+ward tracks that: a storm is acknowledged when its last
+alarm is acked, and `time_to_ack_s` measures from the
+storm's start to that ack. Each storm's record carries when
+it started and ended, how many alarms it raised and how
+many of them have been acked, how many were still pending
+when it ended, and — once acknowledged — when the last ack
+landed and how long it took, with the shift on duty then
+and how many nurses it had. The summary totals it up:
+how many storms there have been, how many are
+acknowledged and how many are not, and the mean and
+longest time to ack — in `GET /alarm-storm`, every
+snapshot and WebSocket frame, and the run summary
+(`--summary`). A storm that is still open is listed with
+no end and its ack still in progress, and one the run
+ends before its alarms are acked stays unacknowledged.
+See `scenarios/alarm-storm-ack.json` for a runnable
+example: over a seeded 100-tick run the burst on beds 0-2
+starts the storm at 12 s and ends it at 73 s, and the
+storm is acknowledged at 43 s — 31.0 s after it started,
+with 0 alarms still pending when it ended — while the
+same storm on a thin roster of one nurse for twelve beds
+ends with all 15 alarms still pending and takes 91.0 s
+to acknowledge.
 
 ## Bed blocker
 
@@ -4456,6 +4497,15 @@ the hook totals.
   frame, a `GET /alarm-storm` endpoint, and the run
   summary; off by default, configured per ward with
   `alarm_storm_hooks` in the scenario) — done in v0.70.0
-- Next: alarm-storm acknowledgement metrics (mean time to
-  ack for the alarms raised during a storm, and how many
-  storm alarms are still pending when it ends)
+- Alarm-storm acknowledgement metrics (a storm is
+  acknowledged when its last alarm is acked by the nurse on
+  duty, with time-to-ack per storm, acknowledged vs
+  unacknowledged storm counts, and how many storm alarms
+  were still pending when it ended, in the alarm-storm
+  summary, every snapshot, WebSocket frame, a
+  `GET /alarm-storm` endpoint, and the run summary) — done
+  in v0.71.0
+- Next: an `alarm_storm_acknowledged` hook event, fired
+  when a storm's last alarm is acked, so a dashboard or
+  pager hears not just that the ward has calmed down but
+  that the nurses have actually caught up

@@ -414,12 +414,25 @@ class Ward:
         # Every alarm-storm hook event this run — the audit
         # trail for the alarm-storm hooks.
         self.alarm_storm_events = []
+        # Every storm that has ended this run, in order — the
+        # acknowledgement record for each: when it started and
+        # ended, how many alarms it raised, how many of them
+        # the nurses on duty have acknowledged, when the last
+        # one was acked, and how many were still pending when
+        # the storm ended. A storm that is still open lives in
+        # ``_alarm_storm_open``, not here.
+        self.alarm_storm_history = []
         # The alarms raised inside the detector's trailing
         # window — (t, bed, alarm) per raise, oldest first —
         # and the storm open right now, if any: when it
         # started, the most alarms ever inside the window
         # during it, how many alarms have been raised since
-        # it started, and which beds raised them.
+        # it started, and which beds raised them. The open
+        # storm also carries its acknowledgement state —
+        # how many of its alarms have been acked, which are
+        # still outstanding, and when the last ack landed —
+        # so the summary can show its progress while it is
+        # still open.
         self._alarm_storm_raised = deque()
         self._alarm_storm_open = None
         # The priority order last sent to the hooks (empty
@@ -508,6 +521,10 @@ class Ward:
             self.staffing = Staffing(**staffing)
         else:
             raise ValueError("staffing must be a Staffing or a dict, got %r" % (staffing,))
+        # Every acknowledged alarm is reported back here, so the
+        # ward can tell which of a storm's alarms the nurses on
+        # duty have got to and which are still outstanding.
+        self.staffing.on_ack = self._on_alarm_acknowledged
         self.beds = beds
         self.rate_hz = rate_hz
         self.partitioned = False
@@ -1440,6 +1457,21 @@ class Ward:
         it ends the storm, so a second burst re-arms and fires
         again. While a storm is open its peak window count, its
         total raises, and its beds keep growing.
+
+        A storm's alarms are the ones inside the window when
+        it starts plus every alarm raised while it is open —
+        the same alarms its ``total`` counts. Each one is
+        acknowledged by the nurse on duty after the staffing
+        delay, and the ward tracks which have been acked and
+        which are still outstanding: a storm is acknowledged
+        when its last alarm is acked, and ``time_to_ack_s``
+        measures from the storm's start to that ack. An alarm
+        raised before the storm started may already have been
+        acked by then — it counts as acked from the start, so
+        it never holds a storm open. A storm that ends with
+        alarms still outstanding records how many were pending
+        at the end; one whose alarms are all acked before the
+        run ends is acknowledged, the rest are not.
         """
         now = self.elapsed
         window_s = self.alarm_storm["window_s"]
@@ -1464,11 +1496,34 @@ class Ward:
                 beds = sorted(
                     {b for _, b, _ in self._alarm_storm_raised}
                 )
+                # The storm's alarms are the ones in the window
+                # — but only the ones still waiting for a nurse
+                # are outstanding: an alarm raised more than an
+                # ack delay before the storm started has already
+                # been acked, so it counts as acked from here.
+                pending = self.staffing.pending_alarm_keys()
+                keys = {
+                    (round(t, 3), b, a)
+                    for t, b, a in self._alarm_storm_raised
+                }
+                outstanding = keys & pending
                 self._alarm_storm_open = {
                     "started_t": now,
+                    "ended_t": None,
+                    "duration_s": None,
                     "peak": count,
                     "total": count,
                     "beds": set(beds),
+                    "keys": keys,
+                    "outstanding": outstanding,
+                    "acked": len(keys) - len(outstanding),
+                    "last_ack_t": None,
+                    "acknowledged": False,
+                    "ack_t": None,
+                    "time_to_ack_s": None,
+                    "ack_shift": None,
+                    "ack_nurses": None,
+                    "alarms_pending_at_end": None,
                 }
                 self._fire_alarm_storm_event(
                     "alarm_storm_started",
@@ -1486,23 +1541,112 @@ class Ward:
             open_storm["beds"].update(
                 b for _, b, _ in self._alarm_storm_raised
             )
+            for m in self.monitors:
+                for alarm in m.raised_this_tick:
+                    key = (round(now, 3), m.bed_id, alarm)
+                    open_storm["keys"].add(key)
+                    open_storm["outstanding"].add(key)
             if count < threshold:
+                open_storm["ended_t"] = now
+                open_storm["duration_s"] = round(
+                    now - open_storm["started_t"], 3
+                )
+                open_storm["alarms_pending_at_end"] = len(
+                    open_storm["outstanding"]
+                )
+                self._maybe_acknowledge_storm(open_storm)
                 self._fire_alarm_storm_event(
                     "alarm_storm_ended",
                     now,
                     {
                         "started_t": open_storm["started_t"],
-                        "duration_s": round(
-                            now - open_storm["started_t"], 3
-                        ),
+                        "duration_s": open_storm["duration_s"],
                         "threshold": threshold,
                         "window_s": window_s,
                         "peak_alarms_in_window": open_storm["peak"],
                         "alarms_raised": open_storm["total"],
+                        "alarms_pending_at_end": (
+                            open_storm["alarms_pending_at_end"]
+                        ),
                         "beds": sorted(open_storm["beds"]),
                     },
                 )
+                self.alarm_storm_history.append(open_storm)
                 self._alarm_storm_open = None
+
+    def _on_alarm_acknowledged(self, pending):
+        """Record one acknowledged alarm against its storm.
+
+        The staffing model calls this with every alarm it acks
+        — the nurse on duty has got to it. If the alarm belongs
+        to a storm that is open, or to one that has ended but
+        is not yet acknowledged, it stops being outstanding
+        for that storm; an ended storm whose last alarm is
+        acked here is acknowledged now.
+        """
+        key = (pending["raised_t"], pending["bed"], pending["alarm"])
+        storms = []
+        if self._alarm_storm_open is not None:
+            storms.append(self._alarm_storm_open)
+        storms.extend(
+            s for s in self.alarm_storm_history
+            if not s["acknowledged"]
+        )
+        for storm in storms:
+            if key in storm["outstanding"]:
+                storm["outstanding"].discard(key)
+                storm["acked"] += 1
+                storm["last_ack_t"] = pending["ack_t"]
+                self._maybe_acknowledge_storm(storm)
+
+    def _maybe_acknowledge_storm(self, storm):
+        """Mark an ended storm acknowledged once its last alarm is acked.
+
+        Only an ended storm can be acknowledged: while it is
+        open more alarms may still be raised, so its ack is
+        never final. A storm whose alarms were all acked before
+        it ended — or before it even started — is acknowledged
+        at its start, with a time to ack of zero; otherwise the
+        ack lands on the last alarm's ack time, and the record
+        names the shift on duty then and how many nurses it
+        had — the nurses who cleared the storm.
+        """
+        if storm["ended_t"] is None or storm["acknowledged"]:
+            return
+        if storm["outstanding"]:
+            return
+        storm["acknowledged"] = True
+        if storm["last_ack_t"] is None:
+            storm["ack_t"] = storm["started_t"]
+            storm["time_to_ack_s"] = 0.0
+        else:
+            storm["ack_t"] = storm["last_ack_t"]
+            storm["time_to_ack_s"] = round(
+                storm["ack_t"] - storm["started_t"], 3
+            )
+        storm["ack_shift"] = self.staffing.shift_at(storm["ack_t"])
+        storm["ack_nurses"] = (
+            self.staffing.on_shift(storm["ack_t"])["nurse"]
+        )
+
+    def _alarm_storm_view(self, storm):
+        """One storm as plain JSON data, for the summary."""
+        return {
+            "started_t": storm["started_t"],
+            "ended_t": storm["ended_t"],
+            "duration_s": storm["duration_s"],
+            "peak_alarms_in_window": storm["peak"],
+            "alarms_raised": storm["total"],
+            "alarms_acked": storm["acked"],
+            "alarms_pending": len(storm["outstanding"]),
+            "alarms_pending_at_end": storm["alarms_pending_at_end"],
+            "beds": sorted(storm["beds"]),
+            "acknowledged": storm["acknowledged"],
+            "ack_t": storm["ack_t"],
+            "time_to_ack_s": storm["time_to_ack_s"],
+            "ack_shift": storm["ack_shift"],
+            "ack_nurses": storm["ack_nurses"],
+        }
 
     def _fire_alarm_storm_event(self, kind, now, extra):
         """Fire one alarm-storm hook event.
@@ -1536,19 +1680,43 @@ class Ward:
         when none is open), ``alarms_in_window`` how many
         alarms have been raised inside the trailing window,
         and ``threshold`` / ``window_s`` the detection
-        settings; ``event_count`` counts every alarm-storm
-        hook event this run — storms starting and ending —
-        and ``events`` lists them, each with the tick, the
-        storm's shape, and whether the ward's hooks were
-        invoked for it (``hook_invoked``) and the retries and
-        final delivery outcome (``hook_retries``,
-        ``hook_final_status``); ``alarm_storm_hooks`` carries
-        the hook totals: whether any hook is configured, how
-        many hook deliveries were invoked, how many failed,
-        how many retries were spent, and how many
-        deliveries eventually landed.
+        settings; ``acknowledgement`` carries the storm ack
+        totals — how many storms there have been, how many
+        are acknowledged (every alarm they raised has been
+        acked by the nurse on duty) and how many are not, and
+        the mean and longest time from a storm's start to its
+        last ack — and ``storms`` lists every storm this run,
+        each with when it started and ended, how many alarms
+        it raised and how many of them have been acked, how
+        many were still pending when it ended, and when it
+        was acknowledged and how long that took, with the
+        shift on duty then and how many nurses it had; the
+        open storm, if any, is listed last with ``ended_t``
+        null and its ack still in progress. ``event_count``
+        counts every alarm-storm hook event this run — storms
+        starting and ending — and ``events`` lists them, each
+        with the tick, the storm's shape, and whether the
+        ward's hooks were invoked for it (``hook_invoked``)
+        and the retries and final delivery outcome
+        (``hook_retries``, ``hook_final_status``);
+        ``alarm_storm_hooks`` carries the hook totals: whether
+        any hook is configured, how many hook deliveries were
+        invoked, how many failed, how many retries were spent,
+        and how many deliveries eventually landed.
         """
         open_storm = self._alarm_storm_open
+        storms = [
+            self._alarm_storm_view(s)
+            for s in self.alarm_storm_history
+        ]
+        if open_storm is not None:
+            storms.append(self._alarm_storm_view(open_storm))
+        acknowledged = [s for s in storms if s["acknowledged"]]
+        times = [
+            s["time_to_ack_s"]
+            for s in acknowledged
+            if s["time_to_ack_s"] is not None
+        ]
         return {
             "t": self.elapsed,
             "storm_active": open_storm is not None,
@@ -1558,6 +1726,17 @@ class Ward:
             "alarms_in_window": len(self._alarm_storm_raised),
             "threshold": self.alarm_storm["threshold"],
             "window_s": self.alarm_storm["window_s"],
+            "acknowledgement": {
+                "storms": len(storms),
+                "acknowledged": len(acknowledged),
+                "unacknowledged": len(storms) - len(acknowledged),
+                "mean_time_to_ack_s": (
+                    round(sum(times) / len(times), 3)
+                    if times else None
+                ),
+                "max_time_to_ack_s": max(times) if times else None,
+            },
+            "storms": storms,
             "event_count": len(self.alarm_storm_events),
             "events": [dict(e) for e in self.alarm_storm_events],
             "alarm_storm_hooks": (

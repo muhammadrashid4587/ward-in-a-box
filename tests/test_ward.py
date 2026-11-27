@@ -960,6 +960,44 @@ class TestStaffing(unittest.TestCase):
             ward.tick()
         return ward
 
+    def test_on_ack_callback_fires_with_the_acked_alarm(self):
+        # The staffing model reports every acknowledgement back
+        # through on_ack, with the alarm's bed, name, and raise
+        # and ack times — the ward uses it to track which of a
+        # storm's alarms the nurses have got to. Off by default.
+        s = Staffing(day={"nurse": 3}, night={"nurse": 3}, start_hour=8)
+        self.assertIsNone(s.on_ack)
+        seen = []
+        s.on_ack = seen.append
+        s.alarm_raised(0, "tachycardia", 0.0, 12)
+        s.tick(29.0, 12, [0])
+        self.assertEqual(seen, [])
+        s.tick(30.0, 12, [0])
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(
+            seen[0],
+            {
+                "bed": 0,
+                "alarm": "tachycardia",
+                "raised_t": 0.0,
+                "ack_t": 30.0,
+            },
+        )
+        self.assertEqual(s.pending_alarm_keys(), set())
+
+    def test_pending_alarm_keys_lists_unacked_alarms(self):
+        s = Staffing(day={"nurse": 3}, night={"nurse": 3}, start_hour=8)
+        s.alarm_raised(0, "tachycardia", 0.0, 12)
+        s.alarm_raised(1, "low_spo2", 5.0, 12)
+        self.assertEqual(
+            s.pending_alarm_keys(),
+            {(0.0, 0, "tachycardia"), (5.0, 1, "low_spo2")},
+        )
+        s.tick(30.0, 12, [0, 1])
+        self.assertEqual(
+            s.pending_alarm_keys(), {(5.0, 1, "low_spo2")}
+        )
+
     def test_understaffing_measurably_worsens_time_to_ack(self):
         full = self._storm_ward(3).staffing_summary()
         thin = self._storm_ward(1).staffing_summary()
@@ -15579,6 +15617,223 @@ class TestAlarmStormHooks(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+    def test_acknowledgement_metrics_for_one_storm(self):
+        # The storm's alarms are acknowledged by the nurse on
+        # duty after the staffing delay: the burst raises its
+        # last alarm at 13 s, so the last ack lands at 43 s —
+        # 31.0 s after the storm started at 12 s — and the
+        # storm is acknowledged, with no alarm still pending
+        # when it ends at 73 s. The record names the shift on
+        # duty at the ack and how many nurses it had.
+        ward = self._storm_ward()
+        for _ in range(100):
+            ward.tick()
+        summary = ward.alarm_storm_summary()
+        self.assertEqual(
+            summary["acknowledgement"],
+            {
+                "storms": 1,
+                "acknowledged": 1,
+                "unacknowledged": 0,
+                "mean_time_to_ack_s": 31.0,
+                "max_time_to_ack_s": 31.0,
+            },
+        )
+        self.assertEqual(
+            summary["storms"],
+            [
+                {
+                    "started_t": 12.0,
+                    "ended_t": 73.0,
+                    "duration_s": 61.0,
+                    "peak_alarms_in_window": 15,
+                    "alarms_raised": 15,
+                    "alarms_acked": 15,
+                    "alarms_pending": 0,
+                    "alarms_pending_at_end": 0,
+                    "beds": [0, 1, 2],
+                    "acknowledged": True,
+                    "ack_t": 43.0,
+                    "time_to_ack_s": 31.0,
+                    "ack_shift": "day",
+                    "ack_nurses": 3,
+                }
+            ],
+        )
+        # The end event carries how many storm alarms were
+        # still pending when the storm ended.
+        end = [
+            e for e in summary["events"]
+            if e["event"] == "alarm_storm_ended"
+        ][0]
+        self.assertEqual(end["alarms_pending_at_end"], 0)
+        # The snapshot carries the same acknowledgement totals.
+        self.assertEqual(
+            ward.snapshot()["alarm_storm"]["acknowledgement"],
+            summary["acknowledgement"],
+        )
+
+    def test_open_storm_is_unacknowledged_with_all_alarms_pending(self):
+        # Mid-storm, before the first ack delay has passed, the
+        # storm is unacknowledged and every one of its alarms
+        # is still pending — the totals say so, and the open
+        # storm is listed with no end and no ack yet.
+        ward = self._storm_ward()
+        for _ in range(40):
+            ward.tick()
+        summary = ward.alarm_storm_summary()
+        self.assertTrue(summary["storm_active"])
+        self.assertEqual(
+            summary["acknowledgement"],
+            {
+                "storms": 1,
+                "acknowledged": 0,
+                "unacknowledged": 1,
+                "mean_time_to_ack_s": None,
+                "max_time_to_ack_s": None,
+            },
+        )
+        storm = summary["storms"][0]
+        self.assertIsNone(storm["ended_t"])
+        self.assertIsNone(storm["duration_s"])
+        self.assertIsNone(storm["alarms_pending_at_end"])
+        self.assertEqual(storm["alarms_raised"], 15)
+        self.assertEqual(storm["alarms_acked"], 0)
+        self.assertEqual(storm["alarms_pending"], 15)
+        self.assertFalse(storm["acknowledged"])
+        self.assertIsNone(storm["ack_t"])
+        self.assertIsNone(storm["time_to_ack_s"])
+
+    def test_thin_roster_storm_ends_with_every_alarm_pending(self):
+        # One nurse for twelve beds takes 90 s to acknowledge,
+        # so the storm is over at 73 s long before its alarms
+        # are acked: all 15 are still pending when it ends, and
+        # the last ack lands at 103 s — 91.0 s after the storm
+        # started — with the one nurse on duty named in the
+        # record.
+        ward = Ward(
+            beds=12,
+            profiles=["stable"] * 12,
+            chaos=[
+                ChaosEvent(
+                    "alarm_storm",
+                    at=10,
+                    duration=20,
+                    beds=[0, 1, 2],
+                ),
+            ],
+            seed=42,
+            staffing={
+                "day": {"nurse": 1, "doctor": 1, "tech": 1},
+                "night": {"nurse": 1, "doctor": 1, "tech": 0},
+            },
+        )
+        for _ in range(200):
+            ward.tick()
+        summary = ward.alarm_storm_summary()
+        self.assertEqual(
+            summary["acknowledgement"],
+            {
+                "storms": 1,
+                "acknowledged": 1,
+                "unacknowledged": 0,
+                "mean_time_to_ack_s": 91.0,
+                "max_time_to_ack_s": 91.0,
+            },
+        )
+        storm = summary["storms"][0]
+        self.assertEqual(storm["alarms_pending_at_end"], 15)
+        self.assertTrue(storm["acknowledged"])
+        self.assertEqual(storm["ack_t"], 103.0)
+        self.assertEqual(storm["time_to_ack_s"], 91.0)
+        self.assertEqual(storm["ack_shift"], "day")
+        self.assertEqual(storm["ack_nurses"], 1)
+
+    def test_two_storms_acknowledge_each_and_mean(self):
+        # Two bursts, two storms, each acknowledged 31.0 s
+        # after it started — the mean and the max agree, and
+        # both records are listed in order.
+        seen = []
+        ward = Ward(
+            beds=12,
+            profiles=["stable"] * 12,
+            chaos=[
+                ChaosEvent(
+                    "alarm_storm",
+                    at=10,
+                    duration=20,
+                    beds=[0, 1, 2],
+                ),
+                ChaosEvent(
+                    "alarm_storm",
+                    at=100,
+                    duration=20,
+                    beds=[0, 1, 2],
+                ),
+            ],
+            seed=42,
+            alarm_storm_hooks={"callback": seen.append},
+        )
+        for _ in range(200):
+            ward.tick()
+        summary = ward.alarm_storm_summary()
+        self.assertEqual(
+            summary["acknowledgement"],
+            {
+                "storms": 2,
+                "acknowledged": 2,
+                "unacknowledged": 0,
+                "mean_time_to_ack_s": 31.0,
+                "max_time_to_ack_s": 31.0,
+            },
+        )
+        self.assertEqual(
+            [
+                (s["started_t"], s["ended_t"], s["ack_t"],
+                 s["time_to_ack_s"])
+                for s in summary["storms"]
+            ],
+            [
+                (12.0, 73.0, 43.0, 31.0),
+                (102.0, 163.0, 133.0, 31.0),
+            ],
+        )
+
+    def test_scenario_alarm_storm_ack(self):
+        cfg = load_scenario(
+            os.path.join(
+                HERE, "..", "scenarios", "alarm-storm-ack.json"
+            )
+        )
+        path = os.path.join(tempfile.mkdtemp(), "run.jsonl")
+        ward = build_ward(cfg, seed=42)
+        with Recorder(path, ward.beds, ward.rate_hz, seed=42) as rec:
+            ward.recorder = rec
+            for _ in range(100):
+                ward.tick()
+        summary = ward.alarm_storm_summary()
+        self.assertEqual(
+            summary["acknowledgement"],
+            {
+                "storms": 1,
+                "acknowledged": 1,
+                "unacknowledged": 0,
+                "mean_time_to_ack_s": 31.0,
+                "max_time_to_ack_s": 31.0,
+            },
+        )
+        # The run summary carries the same acknowledgement
+        # totals and the per-storm record from the last tick.
+        run = summarize(path)
+        self.assertEqual(
+            run["alarm_storm"]["acknowledgement"],
+            summary["acknowledgement"],
+        )
+        self.assertEqual(
+            run["alarm_storm"]["storms"], summary["storms"]
+        )
+        self.assertFalse(run["alarm_storm"]["storm_active"])
 
     def test_alarm_storm_endpoint_serves_json_and_is_503_while_partitioned(self):
         ward = self._storm_ward()
