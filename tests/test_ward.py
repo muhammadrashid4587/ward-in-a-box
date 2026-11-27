@@ -13083,6 +13083,427 @@ class TestPumpFailure(unittest.TestCase):
         self.assertEqual(snaps, snaps2)
 
 
+class TestVentilatorFailure(unittest.TestCase):
+    # A ventilator failure: bed 0's ventilator stops from t=5
+    # for 55 s, so the patient loses ventilatory support — their
+    # SpO2 falls 0.25 points a tick and their respiratory rate
+    # climbs 0.3 a tick while the ventilator is down, then both
+    # recover 0.5 a tick once it restarts — and a
+    # ventilator_failure alarm raises until the ventilator is
+    # running again. Bed 1, with no ventilator, has no
+    # ventilator to fail and never drifts.
+    VENT = {
+        "drift": {"spo2": -0.25, "resp_rate": 0.3},
+        "recovery_rate": 0.5,
+    }
+
+    def _vent_ward(self):
+        return Ward(
+            beds=2,
+            profiles=["stable", "stable"],
+            ventilators=[True, False],
+            chaos=[
+                ChaosEvent(
+                    "ventilator_failure",
+                    at=5,
+                    duration=55,
+                    bed=0,
+                    ventilator=self.VENT,
+                )
+            ],
+            seed=42,
+        )
+
+    def test_ventilator_config_validation(self):
+        # A ventilator-failure event needs a ventilator config.
+        with self.assertRaises(ValueError):
+            ChaosEvent("ventilator_failure", at=0, duration=10, bed=0)
+        with self.assertRaises(ValueError):
+            ChaosEvent(
+                "ventilator_failure",
+                at=0,
+                duration=10,
+                bed=0,
+                ventilator="spo2",
+            )
+        # The drift map is required: unknown vitals and all-zero
+        # rates are rejected, like a sensor drift.
+        for bad_drift in (None, {}, {"spo2": 0}, {"wbc": 0.5}):
+            with self.assertRaises(ValueError):
+                ChaosEvent(
+                    "ventilator_failure",
+                    at=0,
+                    duration=10,
+                    bed=0,
+                    ventilator={"drift": bad_drift},
+                )
+        # The recovery rate must be positive too.
+        with self.assertRaises(ValueError):
+            ChaosEvent(
+                "ventilator_failure",
+                at=0,
+                duration=10,
+                bed=0,
+                ventilator={
+                    "drift": {"spo2": -0.25},
+                    "recovery_rate": 0,
+                },
+            )
+        # Defaults: the recovery rate is the largest absolute
+        # drift rate unless told otherwise.
+        ev = ChaosEvent(
+            "ventilator_failure",
+            at=0,
+            duration=10,
+            bed=0,
+            ventilator={"drift": {"spo2": -0.25, "resp_rate": 0.3}},
+        )
+        self.assertEqual(
+            ev.ventilator,
+            {
+                "drift": {"spo2": -0.25, "resp_rate": 0.3},
+                "recovery_rate": 0.3,
+            },
+        )
+        ev = ChaosEvent(
+            "ventilator_failure",
+            at=0,
+            duration=10,
+            bed=0,
+            ventilator=self.VENT,
+        )
+        self.assertEqual(ev.ventilator, self.VENT)
+
+    def test_ventilator_validation(self):
+        # A ventilator flag is a bool, off by default.
+        with self.assertRaises(ValueError):
+            Monitor(0, on_ventilator="yes")
+        self.assertTrue(Monitor(0, on_ventilator=True).on_ventilator)
+        self.assertFalse(Monitor(0).on_ventilator)
+
+    def test_vitals_drift_while_ventilator_down(self):
+        ward = self._vent_ward()
+        snaps = [ward.tick() for _ in range(60)]
+        # Nothing drifts before the ventilator fails at t=5.
+        self.assertEqual(
+            snaps[3]["beds"][0]["ventilator_failure_drift"], {}
+        )
+        # The drift ramps exactly: SpO2 0.25 points a tick down
+        # and respiratory rate 0.3 a tick up from t=5, so -13.75
+        # and +16.5 by t=59 — and the reported vitals carry it,
+        # while the control bed never drifts.
+        self.assertEqual(
+            snaps[4]["beds"][0]["ventilator_failure_drift"],
+            {"spo2": -0.25, "resp_rate": 0.3},
+        )
+        self.assertEqual(
+            snaps[58]["beds"][0]["ventilator_failure_drift"],
+            {"spo2": -13.75, "resp_rate": 16.5},
+        )
+        self.assertEqual(snaps[58]["beds"][0]["spo2"], 82.42)
+        self.assertEqual(snaps[58]["beds"][0]["resp_rate"], 29.84)
+        self.assertTrue(
+            all(
+                s["beds"][1]["ventilator_failure_drift"] == {}
+                for s in snaps
+            )
+        )
+        # The drift is a real deterioration: the SpO2 and
+        # respiratory-rate components of the NEWS2 score climb
+        # with it, to 3 each and a score of 6 (medium) at t=59.
+        self.assertEqual(
+            snaps[58]["beds"][0]["news2"]["components"]["spo2"], 3
+        )
+        self.assertEqual(
+            snaps[58]["beds"][0]["news2"]["components"]["resp_rate"],
+            3,
+        )
+        self.assertEqual(snaps[58]["beds"][0]["news2"]["score"], 6)
+        # The per-bed detail: the failure window and the drift.
+        detail = snaps[29]["ventilator_failure"]["beds"][0]
+        self.assertTrue(detail["failure_active"])
+        self.assertEqual(detail["failure_until"], 60.0)
+        self.assertTrue(detail["on_ventilator"])
+        self.assertEqual(
+            detail["drift"], {"spo2": -6.5, "resp_rate": 7.8}
+        )
+        self.assertTrue(detail["drifting"])
+        summary = snaps[29]["ventilator_failure"]
+        self.assertEqual(summary["beds_on_ventilator"], 1)
+        self.assertEqual(summary["beds_affected"], 1)
+        self.assertEqual(summary["beds_drifting"], 1)
+        self.assertEqual(
+            summary["max_drift"], {"spo2": -6.5, "resp_rate": 7.8}
+        )
+
+    def test_ventilator_failure_alarm(self):
+        ward = self._vent_ward()
+        snaps = [ward.tick() for _ in range(100)]
+        # The alarm raises the tick the ventilator fails and
+        # clears the tick it restarts — the control bed never
+        # alarms.
+        self.assertNotIn(
+            "ventilator_failure", snaps[3]["beds"][0]["alarms"]
+        )
+        self.assertIn(
+            "ventilator_failure", snaps[4]["beds"][0]["alarms"]
+        )
+        self.assertIn(
+            "ventilator_failure", snaps[58]["beds"][0]["alarms"]
+        )
+        self.assertNotIn(
+            "ventilator_failure", snaps[59]["beds"][0]["alarms"]
+        )
+        self.assertTrue(
+            all(
+                "ventilator_failure" not in s["beds"][1]["alarms"]
+                for s in snaps
+            )
+        )
+        history = list(ward.monitors[0].alarm_history)
+        self.assertEqual(
+            [a for a in history if a["alarm"] == "ventilator_failure"],
+            [{"alarm": "ventilator_failure", "raised_t": 5.0,
+              "cleared_t": 60.0}],
+        )
+        # The drift itself trips the clinical alarms: low_spo2
+        # as the saturation falls below 90, tachypnea as the
+        # respiratory rate climbs past 24.
+        self.assertEqual(
+            [a for a in history if a["alarm"] == "low_spo2"][0],
+            {"alarm": "low_spo2", "raised_t": 31.0,
+             "cleared_t": 72.0},
+        )
+        self.assertEqual(
+            [a for a in history if a["alarm"] == "tachypnea"][0]
+            ["raised_t"],
+            35.0,
+        )
+
+    def test_drift_recovers_after_ventilator_restarts(self):
+        ward = self._vent_ward()
+        snaps = [ward.tick() for _ in range(100)]
+        # The ventilator restarts at t=60: both drifts shrink
+        # 0.5 a tick from -13.75 and +16.5, so -13.25 and +16.0
+        # at t=60, the SpO2 drift is gone at t=87, and the
+        # respiratory-rate drift — the larger one — is gone at
+        # t=92.
+        self.assertEqual(
+            snaps[59]["beds"][0]["ventilator_failure_drift"],
+            {"spo2": -13.25, "resp_rate": 16.0},
+        )
+        self.assertEqual(
+            snaps[86]["beds"][0]["ventilator_failure_drift"],
+            {"resp_rate": 2.5},
+        )
+        self.assertEqual(
+            snaps[91]["beds"][0]["ventilator_failure_drift"], {}
+        )
+        self.assertFalse(
+            snaps[95]["ventilator_failure"]["beds"][0]["drifting"]
+        )
+        self.assertEqual(
+            snaps[95]["ventilator_failure"]["beds_drifting"], 0
+        )
+        self.assertEqual(
+            snaps[95]["ventilator_failure"]["max_drift"], {}
+        )
+
+    def test_no_drift_without_ventilator(self):
+        # A ward-wide ventilator failure with no ventilator
+        # anywhere: the ventilators are down, but nothing drifts
+        # and no alarm raises, because there is no ventilator
+        # to fail.
+        ward = Ward(
+            beds=2,
+            profiles=["stable", "stable"],
+            chaos=[
+                ChaosEvent(
+                    "ventilator_failure",
+                    at=5,
+                    duration=55,
+                    ventilator=self.VENT,
+                )
+            ],
+            seed=42,
+        )
+        snaps = [ward.tick() for _ in range(70)]
+        self.assertTrue(
+            all(
+                s["beds"][0]["ventilator_failure_drift"] == {}
+                for s in snaps
+            )
+        )
+        # Both ventilators are down inside the window, but
+        # neither bed is drifting and no patient is on one.
+        self.assertEqual(
+            snaps[29]["ventilator_failure"]["beds_on_ventilator"], 0
+        )
+        self.assertEqual(snaps[29]["ventilator_failure"]["beds_affected"], 2)
+        self.assertEqual(snaps[29]["ventilator_failure"]["beds_drifting"], 0)
+        self.assertNotIn(
+            "ventilator_failure", snaps[29]["beds"][0]["alarms"]
+        )
+
+    def test_drift_clears_on_new_admission(self):
+        ward = Ward(
+            beds=2,
+            profiles=["stable", "stable"],
+            ventilators=[True, False],
+            chaos=[
+                ChaosEvent(
+                    "ventilator_failure",
+                    at=5,
+                    duration=55,
+                    bed=0,
+                    ventilator=self.VENT,
+                )
+            ],
+            seed=42,
+            cleaning_s=1.0,
+        )
+        for _ in range(30):
+            ward.tick()
+        m = ward.monitors[0]
+        self.assertEqual(
+            m.ventilator_failure_drift,
+            {"spo2": -6.5, "resp_rate": 7.8},
+        )
+        # Discharged, cleaned, and re-admitted — the new patient
+        # starts with no drift and no ventilator, even though the
+        # ventilator is still down.
+        ward.discharge(0)
+        ward.tick()
+        ward.admit(0, profile="stable")
+        self.assertEqual(m.ventilator_failure_drift, {})
+        self.assertFalse(m.on_ventilator)
+
+    def test_ventilator_failure_summary_and_endpoint(self):
+        ward = self._vent_ward()
+        snaps = [ward.tick() for _ in range(40)]
+        summary = snaps[39]["ventilator_failure"]
+        self.assertEqual(summary["beds_on_ventilator"], 1)
+        self.assertEqual(summary["beds_affected"], 1)
+        self.assertEqual(summary["beds_drifting"], 1)
+        self.assertEqual(
+            summary["max_drift"], {"spo2": -9.0, "resp_rate": 10.8}
+        )
+        server, port = serve_in_thread(ward)
+        try:
+            status, body = get(port, "/ventilator-failure")
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                json.loads(body)["beds"][0]["drift"],
+                {"spo2": -9.0, "resp_rate": 10.8},
+            )
+            self.assertEqual(
+                json.loads(body)["beds_on_ventilator"], 1
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+        # 503 while partitioned, like the other live endpoints.
+        partitioned = Ward(
+            beds=2,
+            chaos=[ChaosEvent("partition", at=1, duration=5)],
+            seed=4,
+        )
+        partitioned.tick()  # t=1: partitioned
+        server, port = serve_in_thread(partitioned)
+        try:
+            status, body = get(port, "/ventilator-failure")
+            self.assertEqual(status, 503)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_summary_reports_ventilator_failure(self):
+        ward = self._vent_ward()
+        path = os.path.join(tempfile.mkdtemp(), "run.jsonl")
+        with Recorder(path, ward.beds, ward.rate_hz, seed=42) as rec:
+            ward.recorder = rec
+            for _ in range(40):
+                ward.tick()
+        summary = summarize(path)
+        self.assertEqual(
+            summary["ventilator_failure"],
+            {
+                "beds_on_ventilator": 1,
+                "beds_affected": 1,
+                "beds_drifting": 1,
+                "max_drift": {"spo2": -9.0, "resp_rate": 10.8},
+                "beds": {"0": {"spo2": -9.0, "resp_rate": 10.8}},
+            },
+        )
+
+    def test_websocket_carries_ventilator_failure(self):
+        ward = self._vent_ward()
+        for _ in range(10):
+            ward.tick()  # t=10: the drift is -1.5 SpO2, +1.8 resp
+        server, port = serve_in_thread(ward)
+        try:
+            ws = WsClient(port)
+            try:
+                msg = json.loads(ws.read_until_opcode(1))
+                # The frame is the next tick, t=11, so the drift
+                # has grown one more step past the t=10 tick.
+                self.assertEqual(
+                    msg["ventilator_failure"]["beds_affected"], 1
+                )
+                self.assertEqual(
+                    msg["ventilator_failure"]["beds"][0]["drift"],
+                    {"spo2": -1.75, "resp_rate": 2.1},
+                )
+                self.assertEqual(
+                    msg["beds"][0]["ventilator_failure_drift"],
+                    {"spo2": -1.75, "resp_rate": 2.1},
+                )
+            finally:
+                ws.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_scenario_file_loads_and_runs(self):
+        cfg = load_scenario("scenarios/ventilator-failure.json")
+        self.assertEqual(len(cfg["chaos"]), 1)
+        self.assertEqual(cfg["chaos"][0].type, "ventilator_failure")
+        self.assertEqual(cfg["chaos"][0].ventilator, self.VENT)
+        self.assertEqual(cfg["ventilators"], [True, False])
+        ward = build_ward(cfg, seed=42)
+        snaps = [ward.tick() for _ in range(130)]
+        # Ward-wide, so both beds' ventilators are down from t=5
+        # to t=60 — but only the bed on a ventilator drifts,
+        # SpO2 0.25 a tick down and respiratory rate 0.3 a tick
+        # up from t=5 to -13.75 and +16.5 at t=59, then back to
+        # zero by t=92 once the ventilator restarts.
+        self.assertEqual(
+            snaps[58]["ventilator_failure"]["beds_affected"], 2
+        )
+        self.assertEqual(
+            snaps[58]["ventilator_failure"]["beds_drifting"], 1
+        )
+        self.assertEqual(
+            snaps[58]["beds"][0]["ventilator_failure_drift"],
+            {"spo2": -13.75, "resp_rate": 16.5},
+        )
+        self.assertEqual(
+            snaps[91]["beds"][0]["ventilator_failure_drift"], {}
+        )
+        # The ventilator_failure alarm raises at 5 s and clears
+        # at 60 s, when the ventilator restarts.
+        self.assertEqual(
+            [a for a in ward.monitors[0].alarm_history
+             if a["alarm"] == "ventilator_failure"],
+            [{"alarm": "ventilator_failure", "raised_t": 5.0,
+              "cleared_t": 60.0}],
+        )
+        # Seeded, so a second run reproduces every tick.
+        ward2 = build_ward(cfg, seed=42)
+        snaps2 = [ward2.tick() for _ in range(130)]
+        self.assertEqual(snaps, snaps2)
+
+
 class TestLabDelay(unittest.TestCase):
     # A lab-result delay: bed 0's bloods are due at t=30, but the
     # lab is slow from t=5 for 60 s, so they land 120 s late, at

@@ -12,8 +12,9 @@ device dropout, alarm storms, stale readings, network partitions
 between the ward and the server, network outages that cut the
 link to the central station while the monitors keep recording
 locally, pharmacy stockouts, infusion pump failures that stop
-a patient's drug mid-infusion, and lab results that come back late
-and hold up a discharge. An HTTP endpoint streams the vitals as
+a patient's drug mid-infusion, ventilator failures that leave a
+ventilated patient losing saturation and breathing faster, and
+lab results that come back late and hold up a discharge. An HTTP endpoint streams the vitals as
 JSON lines so real health software can be tested against it, and a small
 CLI runs a scenario file.
 
@@ -304,6 +305,16 @@ python3 -m ward.cli scenarios/lab-delay-hooks.json --seed 42
 # endpoint; a dead endpoint is logged, never fatal)
 python3 -m ward.cli scenarios/lab-overdue-hooks.json --seed 42
 
+# Ventilator failure: bed 0's ventilator stops from 5 s to 60 s —
+# a ventilator_failure alarm raises at 5 s and clears at 60 s,
+# the patient's SpO2 falls 0.25 points a tick to -13.75 by 59 s —
+# reading 82.42 with the NEWS2 SpO2 component at 3 — and the
+# respiratory rate climbs 0.3 a tick to +16.5 — reading 29.84
+# with the NEWS2 respiratory-rate component at 3 — then both
+# recover 0.5 a tick once the ventilator restarts and are back
+# to zero at 92 s, while bed 1, with no ventilator, is untouched
+python3 -m ward.cli scenarios/ventilator-failure.json --seed 42
+
 # Reproducible run
 python3 -m ward.cli scenarios/example.json --seed 42
 ```
@@ -403,6 +414,14 @@ python3 -m ward.cli scenarios/example.json --seed 42
   plus the lab-delay event history and the lab-delay hook
   totals, plus the lab-overdue event history and the
   lab-overdue hook totals, as JSON (503 while partitioned)
+- `GET /ventilator-failure` — per-bed ventilator-failure state:
+  whether the patient is on a ventilator, whether the
+  ventilator is down, when it is running again, and how far
+  each vital has drifted for want of ventilatory support, plus
+  ward totals — how many beds have a patient on a ventilator,
+  how many ventilators are down, how many beds are drifting,
+  and the largest drift per vital — as JSON
+  (503 while partitioned)
 
 A reading looks like:
 
@@ -442,7 +461,9 @@ summary from `/news2`, and the sensor-drift summary from
 `/power-outage`, the network-outage summary from
 `/network-outage`, and the medication-stockout summary from
 `/medication-stockout`, and the pump-failure summary from
-`/pump-failure`, and the lab-delay summary from `/lab-delay`, so a client gets bed occupancy, vitals, alarms, staffing,
+`/pump-failure`, and the lab-delay summary from `/lab-delay`,
+and the ventilator-failure summary from `/ventilator-failure`,
+so a client gets bed occupancy, vitals, alarms, staffing,
 medication, and the intake queue in one message. Ping frames are answered with pong, close frames
 are echoed and the connection is then closed; text frames from the
 client are accepted and ignored — the ward pushes ticks, it takes no
@@ -627,6 +648,21 @@ Chaos types:
   outside the window lands on time, one that has already landed
   cannot be delayed, and a bed with no result of that name
   ordered is untouched. See Lab-result delay below.
+- `ventilator_failure` — a bedside ventilator fails for
+  `duration` seconds; needs `"ventilator"`, a map with
+  `"drift"` (a map of vital to drift rate per second,
+  required — for example `{"spo2": -0.25, "resp_rate": 0.3}`),
+  and `"recovery_rate"` (how fast each vital's drift shrinks
+  back per second once the ventilator is running again, default
+  the largest absolute drift rate). While it is down the patient
+  on that bed loses ventilatory support and drifts: their true
+  vitals move by the configured rates per second, the alarms,
+  the NEWS2 score, trend alerts, and escalations all respond,
+  and a `ventilator_failure` alarm raises until the ventilator
+  restarts. A bed with no ventilator has no ventilator to fail
+  and is untouched. Once the ventilator is running again the
+  drift recovers at `recovery_rate` per second. See Ventilator
+  failure below.
 
 `bed` targets one bed, `beds` targets several, neither targets all beds
 (`partition` is always ward-wide). Times are elapsed seconds from start.
@@ -1329,6 +1365,69 @@ over a seeded 70-tick run the same ward as
 `pump-failure.json` stops bed 0's insulin pump at 5 s and
 restarts it at 60 s — POSTed to the configured webhook, with
 2 hook deliveries invoked and 0 failed against a stub server.
+
+## Ventilator failure
+
+A `ventilator_failure` chaos event stops a bedside ventilator
+for a window — a circuit disconnect, a failed flow sensor, a
+power fault in the ventilator itself — so the patient on that
+bed loses ventilatory support and drifts off it:
+
+```json
+{"type": "ventilator_failure", "at": 5, "duration": 55,
+ "ventilator": {"drift": {"spo2": -0.25, "resp_rate": 0.3},
+                "recovery_rate": 0.5}}
+```
+
+A patient is on a ventilator when their scenario entry says so
+(`"ventilator": true`), the way a patient is on oxygen
+(`"on_oxygen"`) — a ventilator is support the patient either
+has or has not, not a drug with a name. While the ventilator
+is down, a patient on one has their true vitals move by the
+configured `drift` rates per second — the saturation falls
+and the respiratory rate climbs, because the machine that was
+breathing for them has stopped — so the low_spo2 and
+tachypnea alarms, the NEWS2 score, trend alerts, and
+escalations all respond exactly as they would to a patient
+genuinely deteriorating off ventilatory support, and a
+`ventilator_failure` alarm raises the tick the ventilator
+fails and clears the tick it restarts. It is a real change,
+not a sensor error: the drift is added to the patient's
+walked vitals, like the pump-failure drift, and the reported
+reading is still clamped inside the plausible envelope. A bed
+with no ventilator has no ventilator to fail: its ventilator
+is down in the summary but its vitals never move and it never
+alarms. Once the ventilator is running again the drift shrinks
+back toward zero at `recovery_rate` per second. The drift is
+cleared on a new admission, like the oxygen deficit — and the
+new patient starts off the ventilator unless one is named for
+them. Every reading carries its drift
+(`"ventilator_failure_drift"`) and whether the patient is on a
+ventilator (`"ventilator"`), every snapshot carries a
+`"ventilator_failure"` object with the per-bed ventilator
+state — whether the patient is on a ventilator, whether the
+ventilator is down, when it is running again, and how far
+each vital has drifted — and ward totals (how many beds have
+a patient on a ventilator, how many ventilators are down, how
+many beds are drifting, and the largest drift per vital),
+served on its own by `GET /ventilator-failure` and carried in
+every WebSocket frame, and the run summary (`--summary`)
+reports the same totals from the last tick. One honest
+limitation, shared with the pump failure: the drift has no cap
+of its own — a very long failure keeps drifting the patient
+until the ventilator restarts, and only the plausible-envelope
+clamp on the reported reading bounds it, so a scenario with a
+long window should use a modest rate. See
+`scenarios/ventilator-failure.json` for a runnable example:
+over a seeded 130-tick run the ventilator is down from 5 s to
+60 s, the `ventilator_failure` alarm raises at 5 s and clears
+at 60 s, the patient's SpO2 falls 0.25 points a tick to -13.75
+at 59 s — reading 82.42 with the NEWS2 SpO2 component at 3 —
+and the respiratory rate climbs 0.3 a tick to +16.5 — reading
+29.84 with the NEWS2 respiratory-rate component at 3, score 6
+(medium) — then both recover 0.5 a tick once the ventilator
+restarts and are back to zero at 92 s, while the control bed,
+with no ventilator, never drifts.
 
 ## Lab-result delay
 
@@ -3769,3 +3868,30 @@ the hook totals.
   frame, a `GET /lab-delay` endpoint, and the run summary; off
   by default, configured per ward with `lab_overdue_hooks` in
   the scenario) — done in v0.62.0
+- Ventilator failure (a `ventilator_failure` chaos event stops
+  a bedside ventilator for a window — a circuit disconnect, a
+  failed flow sensor, a power fault in the ventilator itself —
+  so a patient on a ventilator drifts off support: their true
+  vitals move by the configured `drift` rates per second while
+  the ventilator is down, so the alarms, the NEWS2 score,
+  trend alerts, and escalations all respond, and a
+  `ventilator_failure` alarm raises until the ventilator
+  restarts; a bed with no ventilator has no ventilator to fail
+  and is untouched; once the ventilator is running again the
+  drift recovers at `recovery_rate` per second; the drift rides
+  in every reading, a `"ventilator_failure"` object in every
+  snapshot, WebSocket frame, a `GET /ventilator-failure`
+  endpoint, and the run summary) — done in v0.63.0
+- Ventilator-failure hooks (when a ventilator fails or restarts
+  — a configured webhook URL gets a `ventilator_failure_started`
+  / `ventilator_failure_ended` event payload POSTed to it, or an
+  in-process callback is called with the same payload in the
+  firing tick, so a hook can escalate on the ventilator
+  stopping; one start and one end per failure, re-armed for a
+  second failure; reusing the NEWS2 hook machinery, best effort
+  and never fatal; each event records whether the hook was
+  invoked, and the ventilator-failure summary carries the event
+  history and the ventilator-failure-hook totals, in every
+  snapshot, WebSocket frame, a `GET /ventilator-failure`
+  endpoint, and the run summary; off by default, configured per
+  ward with `ventilator_failure_hooks` in the scenario)

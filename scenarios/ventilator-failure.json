@@ -1,0 +1,1 @@
+{"beds":2,"chaos":[{"at":5,"duration":55,"type":"ventilator_failure","ventilator":{"drift":{"resp_rate":0.3,"spo2":-0.25},"recovery_rate":0.5}}],"host":"127.0.0.1","patients":[{"bed":0,"profile":"stable","ventilator":true},{"bed":1,"profile":"stable"}],"port":8080,"rate_hz":1.0}

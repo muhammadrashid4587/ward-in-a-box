@@ -156,6 +156,7 @@ def summarize(path):
     last_medication_stockout = None
     last_pump_failure = None
     last_lab_delay = None
+    last_ventilator_failure = None
     with open(path) as f:
         for line in f:
             line = line.strip()
@@ -231,6 +232,8 @@ def summarize(path):
                 last_pump_failure = obj["pump_failure"]
             if isinstance(obj.get("lab_delay"), dict):
                 last_lab_delay = obj["lab_delay"]
+            if isinstance(obj.get("ventilator_failure"), dict):
+                last_ventilator_failure = obj["ventilator_failure"]
             for bed in obj["beds"]:
                 b = bed["bed"]
                 if not bed.get("online", True):
@@ -894,6 +897,34 @@ def summarize(path):
                 ),
             }
             if last_lab_delay is not None
+            else None
+        ),
+        # Ventilator-failure totals from the last tick: how many
+        # beds have a patient on a ventilator, how many have
+        # their ventilator down, how many are drifting off
+        # support, the largest drift per vital, and each
+        # drifting bed's drift — so a run's failed ventilators
+        # and their clinical cost are visible without replaying
+        # every tick.
+        "ventilator_failure": (
+            {
+                "beds_on_ventilator": (
+                    last_ventilator_failure["beds_on_ventilator"]
+                ),
+                "beds_affected": (
+                    last_ventilator_failure["beds_affected"]
+                ),
+                "beds_drifting": (
+                    last_ventilator_failure["beds_drifting"]
+                ),
+                "max_drift": last_ventilator_failure["max_drift"],
+                "beds": {
+                    str(b["bed"]): b["drift"]
+                    for b in last_ventilator_failure["beds"]
+                    if b["drifting"]
+                },
+            }
+            if last_ventilator_failure is not None
             else None
         ),
     }

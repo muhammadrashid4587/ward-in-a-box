@@ -1,12 +1,12 @@
 """Chaos events: device dropout, alarm storms, stale readings, partitions,
 discharges, pharmacy stockouts, slow sensor drift, staff shortages, bed
 blockers, oxygen outages, power outages, network outages, medication
-stockouts, infusion pump failures, lab-result delays."""
+stockouts, infusion pump failures, lab-result delays, ventilator failures."""
 
 from .staffing import ROLES
 from .vitals import NORMAL, PLAUSIBLE
 
-VALID_TYPES = ("dropout", "alarm_storm", "stale", "partition", "discharge", "stockout", "sensor_drift", "staff_shortage", "bed_blocker", "oxygen_outage", "power_outage", "network_outage", "medication_stockout", "pump_failure", "lab_delay")
+VALID_TYPES = ("dropout", "alarm_storm", "stale", "partition", "discharge", "stockout", "sensor_drift", "staff_shortage", "bed_blocker", "oxygen_outage", "power_outage", "network_outage", "medication_stockout", "pump_failure", "lab_delay", "ventilator_failure")
 
 # Default readings a monitor buffers locally while the network is
 # down, per bed, before the oldest drops off — ten minutes at
@@ -17,6 +17,51 @@ DEFAULT_NETWORK_BACKLOG_CAP = 300
 # an isolation clean after an infectious patient, or an equipment
 # fault on the bed itself.
 BLOCK_REASONS = ("porter", "isolation_clean", "equipment_fault")
+
+
+def validate_ventilator(ventilator):
+    """A ventilator-failure config: ``{"drift": ..., "recovery_rate": ...}``.
+
+    ``drift`` is required: a map of vital to drift rate per
+    second (see :func:`validate_drift`) — how fast the
+    patient's true vitals move once their ventilator has
+    stopped, because they have lost ventilatory support: a
+    ventilator that stops lets the SpO2 fall and the
+    respiratory rate climb. ``recovery_rate`` is how fast
+    each vital's drift shrinks back toward zero per second
+    once the ventilator is running again (default the
+    largest absolute drift rate) — a positive finite number.
+    A config with no drift does nothing at all, so it is
+    rejected. Which patient is affected is not part of the
+    config: it is the patient's own ventilator (see
+    ``Monitor.on_ventilator``) — the ventilator supports
+    whoever is on it, and a bed with no ventilator has no
+    ventilator to fail.
+    """
+    if not isinstance(ventilator, dict):
+        raise ValueError(
+            "ventilator_failure needs a ventilator config, got %r"
+            % (ventilator,)
+        )
+    drift = validate_drift(ventilator.get("drift"))
+    recovery_rate = ventilator.get(
+        "recovery_rate", max(abs(r) for r in drift.values())
+    )
+    if (
+        not isinstance(recovery_rate, (int, float))
+        or isinstance(recovery_rate, bool)
+        or recovery_rate != recovery_rate
+        or recovery_rate in (float("inf"), float("-inf"))
+        or recovery_rate <= 0
+    ):
+        raise ValueError(
+            "ventilator_failure: recovery_rate must be a positive "
+            "finite number, got %r" % (recovery_rate,)
+        )
+    return {
+        "drift": drift,
+        "recovery_rate": float(recovery_rate),
+    }
 
 
 def validate_lab_delay(lab):
@@ -496,9 +541,25 @@ class ChaosEvent:
     bed with no result of that name ordered is untouched.
     One event delays a result once, however long its window
     runs, and overlapping events for the same result add up.
+    ``ventilator_failure`` needs ``ventilator`` (see
+    :func:`validate_ventilator`): a bedside ventilator fails
+    for the window — a circuit disconnect, a failed flow
+    sensor, a power fault in the ventilator itself — so the
+    patient on that bed loses ventilatory support and drifts:
+    their true vitals move by the configured ``drift`` rates
+    per second while the ventilator is down, so the alarms,
+    the NEWS2 score, trend alerts, and escalations all
+    respond exactly as they would to a patient genuinely
+    deteriorating off their ventilator, and a
+    ``ventilator_failure`` alarm raises while the ventilator
+    is down. Only a bed with a ventilator is affected — a bed
+    with no ventilator has no ventilator to fail — and which
+    patient is on one is the patient's own flag, not part of
+    the event. Once the ventilator is running again the drift
+    shrinks back toward zero at ``recovery_rate`` per second.
     """
 
-    def __init__(self, type, at, duration=None, bed=None, beds=None, med=None, drift=None, shortage=None, reason=None, oxygen=None, power=None, network=None, medication=None, pump=None, lab=None):
+    def __init__(self, type, at, duration=None, bed=None, beds=None, med=None, drift=None, shortage=None, reason=None, oxygen=None, power=None, network=None, medication=None, pump=None, lab=None, ventilator=None):
         if type not in VALID_TYPES:
             raise ValueError("unknown chaos type: %r" % type)
         if type == "stockout":
@@ -511,6 +572,8 @@ class ChaosEvent:
             pump = validate_pump(pump)
         if type == "lab_delay":
             lab = validate_lab_delay(lab)
+        if type == "ventilator_failure":
+            ventilator = validate_ventilator(ventilator)
         if type == "sensor_drift":
             drift = validate_drift(drift)
         if type == "staff_shortage":
@@ -546,6 +609,7 @@ class ChaosEvent:
         self.medication = medication
         self.pump = pump
         self.lab = lab
+        self.ventilator = ventilator
 
     @property
     def end(self):
@@ -937,6 +1001,20 @@ class ChaosEngine:
                 # pushing the same result out tick after tick.
                 for b in ev.targets(ward):
                     ward.monitors[b].apply_lab_delay(ev)
+            elif ev.type == "ventilator_failure":
+                # The bedside ventilator has failed for the
+                # window. The monitor holds the failure end and
+                # the config; the drift itself grows and recovers
+                # in the monitor tick (see
+                # Monitor._step_ventilator_failure), gated on
+                # the bed actually having a ventilator, so a bed
+                # with no ventilator never drifts. An overlapping
+                # event only extends the window and refreshes
+                # the config, like the pump failure above.
+                for b in ev.targets(ward):
+                    m = ward.monitors[b]
+                    m.ventilator_failure_until = ev.end
+                    m.ventilator_failure_cfg = ev.ventilator
             elif ev.type == "dropout":
                 for b in ev.targets(ward):
                     ward.monitors[b].offline_until = ev.end

@@ -54,6 +54,7 @@ def load_scenario(path):
     acuities = []
     oxygen = []
     infusions = []
+    ventilators = []
     consciousness = []
     consciousness_dynamics = []
     meds = []
@@ -86,6 +87,15 @@ def load_scenario(path):
         infusions.append(
             infusion.strip().lower() if isinstance(infusion, str) else None
         )
+        on_ventilator = (
+            p.get("ventilator", False) if isinstance(p, dict) else False
+        )
+        if not isinstance(on_ventilator, bool):
+            raise ValueError(
+                "patient %d: ventilator must be a bool, got %r"
+                % (i, on_ventilator)
+            )
+        ventilators.append(on_ventilator)
         level = p.get("consciousness", "alert") if isinstance(p, dict) else "alert"
         try:
             validate_consciousness(level)
@@ -144,6 +154,7 @@ def load_scenario(path):
                     medication=ev.get("medication"),
                     pump=ev.get("pump"),
                     lab=ev.get("lab"),
+                    ventilator=ev.get("ventilator"),
                 )
             )
         except KeyError as e:
@@ -403,6 +414,7 @@ def load_scenario(path):
         "acuities": acuities,
         "oxygen": oxygen,
         "infusions": infusions,
+        "ventilators": ventilators,
         "consciousness": consciousness,
         "consciousness_dynamics": consciousness_dynamics,
         "meds": meds,
@@ -446,6 +458,7 @@ def build_ward(cfg, seed=None, recorder=None):
         acuities=cfg.get("acuities"),
         oxygen=cfg.get("oxygen"),
         infusions=cfg.get("infusions"),
+        ventilators=cfg.get("ventilators"),
         consciousness=cfg.get("consciousness"),
         consciousness_dynamics=cfg.get("consciousness_dynamics"),
         meds=cfg.get("meds"),
