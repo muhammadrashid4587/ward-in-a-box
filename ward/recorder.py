@@ -702,7 +702,11 @@ def summarize(path):
         # buffered, synced, and dropped over the run, and how
         # many alarms raised while down are still undelivered
         # and how many have since synced — so a run's cut-off
-        # link is visible without replaying every tick.
+        # link is visible without replaying every tick — plus
+        # how many network-outage hook events fired this run,
+        # and whether the network-outage hooks are configured
+        # and how many hook deliveries were invoked, failed,
+        # retried, and delivered.
         "network_outage": (
             {
                 "beds_down": last_network_outage["beds_down"],
@@ -719,6 +723,19 @@ def summarize(path):
                     for b in last_network_outage["beds"]
                     if b["backlog"] > 0
                 },
+                "event_count": last_network_outage.get(
+                    "event_count", 0
+                ),
+                "network_outage_hooks": last_network_outage.get(
+                    "network_outage_hooks",
+                    {
+                        "configured": False,
+                        "invoked": 0,
+                        "failed": 0,
+                        "retries": 0,
+                        "delivered": 0,
+                    },
+                ),
             }
             if last_network_outage is not None
             else None

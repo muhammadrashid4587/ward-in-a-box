@@ -474,6 +474,12 @@ class ChaosEngine:
         # same bed is a new event, so it fires again.
         self._bed_blocker_started = set()
         self._bed_blocker_ended = set()
+        # Network-outage events fire their start hook once, on
+        # the first tick inside the window, and their end hook
+        # once, on the first tick after it — a second outage on
+        # the same beds is a new event, so it fires again.
+        self._network_started = set()
+        self._network_ended = set()
 
     def stockouts(self, ward, now):
         """Active pharmacy stockouts: ``{bed_id: {med, ...}}``.
@@ -602,6 +608,25 @@ class ChaosEngine:
                 ):
                     self._bed_blocker_ended.add(id(ev))
                     ward._bed_blocker_ended(ev, now)
+            # Network outage: the start hook fires once, on the
+            # first tick inside the window, and the end hook
+            # once, on the first tick after it — so scenario
+            # code hears the link fail and return exactly once
+            # per event, even across a run that ticks past the
+            # end. The check runs before the active gate below,
+            # so an end is caught on the tick the window
+            # closes.
+            if ev.type == "network_outage":
+                if ev.active(now):
+                    if id(ev) not in self._network_started:
+                        self._network_started.add(id(ev))
+                        ward._network_outage_started(ev, now)
+                elif (
+                    id(ev) in self._network_started
+                    and id(ev) not in self._network_ended
+                ):
+                    self._network_ended.add(id(ev))
+                    ward._network_outage_ended(ev, now)
             if not ev.active(now):
                 continue
             if ev.type == "sensor_drift":

@@ -252,6 +252,12 @@ python3 -m ward.cli scenarios/news2-staffing-escalation.json --seed 42
 # that never reach the dashboard until the sync
 python3 -m ward.cli scenarios/network-outage.json --seed 42
 
+# Network-outage hooks: the same ward, with the link failing
+# at 5 s and returning at 35 s also POSTed to a webhook (here
+# a placeholder URL — point it at your own endpoint; a dead
+# endpoint is logged, never fatal)
+python3 -m ward.cli scenarios/network-outage-hooks.json --seed 42
+
 # Medication stockout: metoprolol runs out from 5 s to 60 s —
 # the two doses due inside the window are skipped, a missed_dose
 # alarm raises at 10 s, and the patient's heart rate climbs
@@ -334,8 +340,9 @@ python3 -m ward.cli scenarios/example.json --seed 42
 - `GET /network-outage` — per-bed network-outage state: whether
   the link to the central station is down, when it returns, how
   many readings are buffered locally, and this stay's buffered /
-  synced / dropped counts and undelivered alarms, as JSON
-  (503 while partitioned)
+  synced / dropped counts and undelivered alarms, plus the
+  outage event history and the network-outage hook totals, as
+  JSON (503 while partitioned)
 - `GET /medication-stockout` — per-bed medication-stockout state:
   whether the pharmacy is out of a medication, which one, when
   the stock returns, and how far each vital has drifted for want
@@ -1228,6 +1235,54 @@ configured behaves exactly as before. See
 over a seeded 70-tick run the same ward as
 `sensor-drift.json` starts drifting at 5 s and the drift window
 closes at 65 s — POSTed to the configured webhook, with 2 hook
+deliveries invoked and 0 failed against a stub server.
+
+## Network-outage hooks
+
+A network outage is the moment a ward most needs the outside
+world to hear about it — the link to the central station is
+down, the monitors are buffering readings locally instead of
+reporting them, and the alarms they raise will not reach the
+dashboard until the link returns — so the hook makes sure
+something outside the ward hears about it. A ward that wants
+the outside world to hear about that moment — a dashboard, a
+pager, an escalation policy — configures network-outage hooks,
+the same channels as the NEWS2 hooks (webhook and/or in-process
+callback), on the same best-effort, never-fatal terms:
+
+```json
+{"network_outage_hooks": {"webhook_url": "http://127.0.0.1:18099/hooks"}}
+```
+
+Two events fire. `network_outage_started` fires once, in the
+tick the link fails, with the outage window (`"at"`,
+`"ends"`, `"duration"`), the beds it targets, and the outage's
+backlog cap. `network_outage_ended` fires once, in the tick the
+link returns, with the same window. A link that stays down for
+thirty ticks fires once, not thirty times, and a second outage
+fires again — the start and end are per event, not per run. An
+in-process callback gets the same payloads in the tick the event
+fires (Python API only — a scenario file cannot hold a
+callable), so scenario code can log or escalate on the link
+failing directly. Each event records whether the hook was
+invoked (`"hook_invoked"`, False with no hooks) and any
+synchronous error (`"hook_errors"`), and the network-outage
+summary carries the event totals (`"event_count"`, the full
+`"events"` history) and the ward network-outage-hook totals
+(`"network_outage_hooks"`: whether any hook is configured, how
+many deliveries were invoked, how many failed, how many retries
+were spent, and how many deliveries eventually landed) — in
+`GET /network-outage`, every snapshot and WebSocket frame, and
+the run summary (`--summary`). The same retry rules as the
+NEWS2 hooks apply — a failed webhook POST is retried with
+backoff up to `"max_retries"` times, and the event records
+`"hook_retries"` and `"hook_final_status"` alongside
+`"hook_invoked"`. Hooks are off by default, so a ward with none
+configured behaves exactly as before. See
+`scenarios/network-outage-hooks.json` for a runnable example:
+over a seeded 70-tick run the same ward as
+`network-outage.json` loses its link at 5 s and gets it back at
+35 s — POSTed to the configured webhook, with 2 hook
 deliveries invoked and 0 failed against a stub server.
 
 ## Triage / ED intake queue
@@ -2433,7 +2488,7 @@ endpoints returned 503 while it lasted, the ticks did not stop.
 make test
 ```
 
-464 tests: vitals stay inside plausible ranges, dropout actually stops a
+471 tests: vitals stay inside plausible ranges, dropout actually stops a
 monitor's stream, an alarm storm produces alarms, stale readings freeze,
 a partition blocks the snapshot endpoint, the HTTP endpoints serve valid
 JSON, the stream serves JSON lines, scenario files validate, alarm
@@ -2773,7 +2828,17 @@ partitioned) and WebSocket frames, the run summary carrying the
 network-outage totals, and the `network-outage.json` scenario
 buffering 30 readings a bed, dropping 20 a bed, syncing 10 a
 bed at 35 s, and delivering 5 undelivered alarms from the
-hypoxic bed over a seeded run.
+hypoxic bed over a seeded run. Network-outage-hooks tests cover
+validation of the hook config, hooks off by default with the
+events still recorded, a callback firing once on start and once
+on end with the outage window, the targeted beds, and the
+backlog cap, the start and end firing again for a second outage,
+a callback that raises being caught with the tick completing and
+the failure counted, a webhook POST reaching a local stub server
+with the event payloads as JSON, and the
+`network-outage-hooks.json` scenario POSTing both events to a
+stub server with the run summary carrying the event count and
+the hook totals.
 
 ## Roadmap
 
@@ -3199,3 +3264,16 @@ hypoxic bed over a seeded run.
   `"medication_stockout"` object in every snapshot, WebSocket
   frame, a `GET /medication-stockout` endpoint, and the run
   summary) — done in v0.55.0
+- Network-outage hooks (when a network outage starts or ends —
+  a configured webhook URL gets a `network_outage_started` /
+  `network_outage_ended` event payload POSTed to it, or an
+  in-process callback is called with the same payload in the
+  firing tick, so a hook can escalate on the link to the central
+  station failing; one start and one end per outage, re-armed
+  for a second outage; reusing the NEWS2 hook machinery, best
+  effort and never fatal; each event records whether the hook
+  was invoked, and the network-outage summary carries the event
+  history and the network-outage-hook totals, in every snapshot,
+  WebSocket frame, a `GET /network-outage` endpoint, and the run
+  summary; off by default, configured per ward with
+  `network_outage_hooks` in the scenario) — done in v0.56.0
