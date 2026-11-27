@@ -20,6 +20,7 @@ from .alert_hooks import (
     validate_pump_failure_hooks,
     validate_sensor_drift_hooks,
     validate_trend_alert_hooks,
+    validate_ventilator_failure_hooks,
     validate_wait_time_hooks,
 )
 from .chaos import ChaosEngine
@@ -55,7 +56,7 @@ class Ward:
     snapshot to a JSONL file.
     """
 
-    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None, cleaning_s=30.0, meds=None, triage=None, discharge_planning=None, cleaning_capacity=None, discharge_readiness=None, oxygen=None, infusions=None, ventilators=None, consciousness=None, consciousness_dynamics=None, news2_trend=None, trend_alert_hooks=None, escalation_hooks=None, boarding_full_hooks=None, wait_time_hooks=None, missed_dose_hooks=None, discharge_readiness_hooks=None, discharge_priority_hooks=None, oxygen_outage_hooks=None, power_outage_hooks=None, sensor_drift_hooks=None, bed_blocker_hooks=None, network_outage_hooks=None, medication_stockout_hooks=None, pump_failure_hooks=None, lab_delay_hooks=None, lab_overdue_hooks=None, news2_staffing_escalation=None, labs=None):
+    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None, cleaning_s=30.0, meds=None, triage=None, discharge_planning=None, cleaning_capacity=None, discharge_readiness=None, oxygen=None, infusions=None, ventilators=None, consciousness=None, consciousness_dynamics=None, news2_trend=None, trend_alert_hooks=None, escalation_hooks=None, boarding_full_hooks=None, wait_time_hooks=None, missed_dose_hooks=None, discharge_readiness_hooks=None, discharge_priority_hooks=None, oxygen_outage_hooks=None, power_outage_hooks=None, sensor_drift_hooks=None, bed_blocker_hooks=None, network_outage_hooks=None, medication_stockout_hooks=None, pump_failure_hooks=None, lab_delay_hooks=None, lab_overdue_hooks=None, ventilator_failure_hooks=None, news2_staffing_escalation=None, labs=None):
         if not 1 <= beds <= 64:
             raise ValueError("beds must be 1..64")
         if rate_hz <= 0:
@@ -255,6 +256,20 @@ class Ward:
         # Every lab-overdue hook event this run — the audit
         # trail for the lab-overdue hooks.
         self.lab_overdue_events = []
+        # Ventilator-failure hooks: one shared object for the
+        # whole ward (a webhook URL and/or an in-process
+        # callback), invoked when a ventilator fails or
+        # restarts. Off by default. The ward owns the object:
+        # a ventilator failure is a ward-level event, not a
+        # per-bed one.
+        self.ventilator_failure_hooks = (
+            validate_ventilator_failure_hooks(
+                ventilator_failure_hooks
+            )
+        )
+        # Every ventilator-failure hook event this run — the
+        # audit trail for the ventilator-failure hooks.
+        self.ventilator_failure_events = []
         # The priority order last sent to the hooks (empty
         # before the first ready bed), and every order change
         # this run — the audit trail for the priority hooks.
@@ -945,6 +960,56 @@ class Ward:
         payload["hook_invoked"] = result["invoked"]
         payload["hook_errors"] = result["errors"]
 
+    def _ventilator_failure_started(self, event, now):
+        """Fire the start hook for one ventilator-failure event.
+
+        Called by the chaos engine on the first tick inside the
+        event's window (see :meth:`chaos.ChaosEngine.apply`).
+        """
+        self._fire_ventilator_failure_event(
+            "ventilator_failure_started", event, now
+        )
+
+    def _ventilator_failure_ended(self, event, now):
+        """Fire the end hook for one ventilator-failure event.
+
+        Called by the chaos engine on the first tick after the
+        event's window closes.
+        """
+        self._fire_ventilator_failure_event(
+            "ventilator_failure_ended", event, now
+        )
+
+    def _fire_ventilator_failure_event(self, kind, event, now):
+        """Fire one ward-level ventilator-failure hook event.
+
+        The payload carries the event kind, the tick, the
+        failure window (``at``, ``ends``, ``duration``), the
+        beds it targets, and the failure's ventilator config —
+        its drift rates and its recovery rate — so a hook can
+        tell a ward-wide failure from a single-bed one and know
+        how fast the patients on a ventilator will drift off
+        support. The event is recorded on the audit trail with
+        whether the hook was invoked for it, any synchronous
+        error, and the retries and final delivery outcome.
+        """
+        payload = {
+            "event": kind,
+            "t": now,
+            "at": event.at,
+            "ends": event.end,
+            "duration": event.duration,
+            "beds": event.targets(self),
+            "ventilator": dict(event.ventilator),
+        }
+        self.ventilator_failure_events.append(payload)
+        result = self.ventilator_failure_hooks.fire(
+            dict(payload),
+            record=payload,
+        )
+        payload["hook_invoked"] = result["invoked"]
+        payload["hook_errors"] = result["errors"]
+
     def _fire_lab_overdue_event(self, kind, bed_id, transition, now):
         """Fire one ward-level lab-overdue hook event.
 
@@ -1397,6 +1462,17 @@ class Ward:
         per vital, so a client can see at a glance how far the
         ward's ventilated patients have drifted off support
         and how far they still have to recover.
+        ``event_count`` counts every ventilator-failure hook
+        event this run — ventilator failures and ventilator
+        restarts — and ``events`` lists them, each with the
+        tick, the failure window, and whether the ward's hooks
+        were invoked for it (``hook_invoked``) and the retries
+        and final delivery outcome (``hook_retries``,
+        ``hook_final_status``); ``ventilator_failure_hooks``
+        carries the hook totals: whether any hook is
+        configured, how many hook deliveries were invoked, how
+        many failed, how many retries were spent, and how many
+        deliveries eventually landed.
         """
         beds = [
             m.ventilator_failure_detail(self.elapsed)
@@ -1418,6 +1494,13 @@ class Ward:
             ),
             "beds_drifting": sum(1 for b in beds if b["drifting"]),
             "max_drift": max_drift,
+            "event_count": len(self.ventilator_failure_events),
+            "events": [
+                dict(e) for e in self.ventilator_failure_events
+            ],
+            "ventilator_failure_hooks": (
+                self.ventilator_failure_hooks.summary()
+            ),
         }
 
     def lab_delay_summary(self):

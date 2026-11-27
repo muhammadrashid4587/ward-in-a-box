@@ -315,6 +315,12 @@ python3 -m ward.cli scenarios/lab-overdue-hooks.json --seed 42
 # to zero at 92 s, while bed 1, with no ventilator, is untouched
 python3 -m ward.cli scenarios/ventilator-failure.json --seed 42
 
+# Ventilator-failure hooks: the same ward, with the ventilator
+# failing at 5 s and restarting at 60 s also POSTed to a webhook
+# (here a placeholder URL — point it at your own endpoint; a dead
+# endpoint is logged, never fatal)
+python3 -m ward.cli scenarios/ventilator-failure-hooks.json --seed 42
+
 # Reproducible run
 python3 -m ward.cli scenarios/example.json --seed 42
 ```
@@ -1428,6 +1434,57 @@ and the respiratory rate climbs 0.3 a tick to +16.5 — reading
 (medium) — then both recover 0.5 a tick once the ventilator
 restarts and are back to zero at 92 s, while the control bed,
 with no ventilator, never drifts.
+
+## Ventilator-failure hooks
+
+A ventilator failing is the moment a ward most needs the
+outside world to hear about it — the patient on that bed is
+about to drift off ventilatory support, and support will not
+return until the ventilator restarts — so the hook makes sure
+something outside the ward hears about it. A ward that wants
+the outside world to hear about that moment — a dashboard, a
+pager, a respiratory therapist — configures ventilator-failure
+hooks, the same channels as the NEWS2 hooks (webhook and/or
+in-process callback), on the same best-effort, never-fatal
+terms:
+
+```json
+{"ventilator_failure_hooks": {"webhook_url": "http://127.0.0.1:18099/hooks"}}
+```
+
+Two events fire. `ventilator_failure_started` fires once, in
+the tick the ventilator fails, with the failure window
+(`"at"`, `"ends"`, `"duration"`), the beds it targets, and
+the failure's ventilator config — its drift rates and its
+recovery rate. `ventilator_failure_ended` fires once, in the
+tick the ventilator restarts, with the same window. A
+ventilator that stays down for fifty ticks fires once, not
+fifty times, and a second failure fires again — the start and
+end are per event, not per run. An in-process callback gets
+the same payloads in the tick the event fires (Python API
+only — a scenario file cannot hold a callable), so scenario
+code can log or escalate on the ventilator failing directly.
+Each event records whether the hook was invoked
+(`"hook_invoked"`, False with no hooks) and any synchronous
+error (`"hook_errors"`), and the ventilator-failure summary
+carries the event totals (`"event_count"`, the full
+`"events"` history) and the ward ventilator-failure-hook
+totals (`"ventilator_failure_hooks"`: whether any hook is
+configured, how many deliveries were invoked, how many
+failed, how many retries were spent, and how many deliveries
+eventually landed) — in `GET /ventilator-failure`, every
+snapshot and WebSocket frame, and the run summary
+(`--summary`). The same retry rules as the NEWS2 hooks apply
+— a failed webhook POST is retried with backoff up to
+`"max_retries"` times, and the event records `"hook_retries"`
+and `"hook_final_status"` alongside `"hook_invoked"`. Hooks
+are off by default, so a ward with none configured behaves
+exactly as before. See
+`scenarios/ventilator-failure-hooks.json` for a runnable
+example: over a seeded 70-tick run the same ward as
+`ventilator-failure.json` stops bed 0's ventilator at 5 s and
+restarts it at 60 s — POSTed to the configured webhook, with
+2 hook deliveries invoked and 0 failed against a stub server.
 
 ## Lab-result delay
 
@@ -3894,4 +3951,5 @@ the hook totals.
   history and the ventilator-failure-hook totals, in every
   snapshot, WebSocket frame, a `GET /ventilator-failure`
   endpoint, and the run summary; off by default, configured per
-  ward with `ventilator_failure_hooks` in the scenario)
+  ward with `ventilator_failure_hooks` in the scenario) — done in
+  v0.64.0

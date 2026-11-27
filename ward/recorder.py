@@ -905,7 +905,11 @@ def summarize(path):
         # support, the largest drift per vital, and each
         # drifting bed's drift — so a run's failed ventilators
         # and their clinical cost are visible without replaying
-        # every tick.
+        # every tick — plus how many ventilator-failure hook
+        # events fired this run, and whether the
+        # ventilator-failure hooks are configured and how many
+        # hook deliveries were invoked, failed, retried, and
+        # delivered.
         "ventilator_failure": (
             {
                 "beds_on_ventilator": (
@@ -923,6 +927,21 @@ def summarize(path):
                     for b in last_ventilator_failure["beds"]
                     if b["drifting"]
                 },
+                "event_count": last_ventilator_failure.get(
+                    "event_count", 0
+                ),
+                "ventilator_failure_hooks": (
+                    last_ventilator_failure.get(
+                        "ventilator_failure_hooks",
+                        {
+                            "configured": False,
+                            "invoked": 0,
+                            "failed": 0,
+                            "retries": 0,
+                            "delivered": 0,
+                        },
+                    )
+                ),
             }
             if last_ventilator_failure is not None
             else None

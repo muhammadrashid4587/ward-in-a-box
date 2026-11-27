@@ -35,6 +35,7 @@ from ward.alert_hooks import (
     validate_pump_failure_hooks,
     validate_sensor_drift_hooks,
     validate_trend_alert_hooks,
+    validate_ventilator_failure_hooks,
     validate_wait_time_hooks,
 )
 from ward.chaos import ChaosEvent
@@ -13433,6 +13434,14 @@ class TestVentilatorFailure(unittest.TestCase):
                 "beds_drifting": 1,
                 "max_drift": {"spo2": -9.0, "resp_rate": 10.8},
                 "beds": {"0": {"spo2": -9.0, "resp_rate": 10.8}},
+                "event_count": 1,
+                "ventilator_failure_hooks": {
+                    "configured": False,
+                    "invoked": 0,
+                    "failed": 0,
+                    "retries": 0,
+                    "delivered": 0,
+                },
             },
         )
 
@@ -14608,6 +14617,326 @@ class TestPumpFailureHooks(unittest.TestCase):
             )
             self.assertEqual(
                 run["pump_failure"]["pump_failure_hooks"][
+                    "invoked"
+                ],
+                2,
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+class TestVentilatorFailureHooks(unittest.TestCase):
+    # Ventilator-failure hooks: a ventilator failing or
+    # restarting fires the ward's ventilator_failure_hooks —
+    # the same webhook/callback machinery as the NEWS2 hooks
+    # — so something outside the ward hears the ventilator
+    # stop and start again. A callback can use the start to
+    # escalate: the patient on that bed is about to drift off
+    # ventilatory support, and support will not return until
+    # the ventilator restarts.
+    VENT = {
+        "drift": {"spo2": -0.25, "resp_rate": 0.3},
+        "recovery_rate": 0.5,
+    }
+
+    def _vent_ward(self, hooks=None):
+        return Ward(
+            beds=2,
+            profiles=["stable", "stable"],
+            ventilators=[True, False],
+            chaos=[
+                ChaosEvent(
+                    "ventilator_failure",
+                    at=5,
+                    duration=55,
+                    bed=0,
+                    ventilator=self.VENT,
+                )
+            ],
+            seed=42,
+            ventilator_failure_hooks=hooks,
+        )
+
+    def test_validate_ventilator_failure_hooks(self):
+        hooks = validate_ventilator_failure_hooks(None)
+        self.assertIsInstance(hooks, TrendAlertHooks)
+        self.assertFalse(hooks.configured)
+        self.assertEqual(hooks.kind, "ventilator-failure")
+        custom = validate_ventilator_failure_hooks(
+            {"webhook_url": "https://example.invalid/hooks", "timeout_s": 2}
+        )
+        self.assertTrue(custom.configured)
+        self.assertEqual(custom.kind, "ventilator-failure")
+        self.assertEqual(custom.timeout_s, 2.0)
+        seen = []
+        append = seen.append
+        cb = validate_ventilator_failure_hooks({"callback": append})
+        self.assertTrue(cb.configured)
+        self.assertIs(cb.callback, append)
+        with self.assertRaises(ValueError):
+            validate_ventilator_failure_hooks(
+                {"webhook_url": "ftp://x/hooks"}
+            )
+        with self.assertRaises(ValueError):
+            validate_ventilator_failure_hooks({"callback": "not callable"})
+        with self.assertRaises(ValueError):
+            validate_ventilator_failure_hooks({"timeout_s": 0})
+        with self.assertRaises(ValueError):
+            validate_ventilator_failure_hooks({"url": "http://x/hooks"})
+        with self.assertRaises(ValueError):
+            validate_ventilator_failure_hooks("http://x/hooks")
+
+    def test_hooks_off_by_default(self):
+        # No hooks configured: the ventilator still fails and
+        # restarts, and each event is recorded with no hook
+        # invoked.
+        ward = self._vent_ward()
+        self.assertFalse(ward.ventilator_failure_hooks.configured)
+        for _ in range(70):
+            ward.tick()
+        summary = ward.ventilator_failure_summary()
+        self.assertEqual(summary["event_count"], 2)
+        self.assertEqual(
+            [
+                (e["event"], e["t"])
+                for e in summary["events"]
+            ],
+            [
+                ("ventilator_failure_started", 5.0),
+                ("ventilator_failure_ended", 60.0),
+            ],
+        )
+        for event in summary["events"]:
+            self.assertFalse(event["hook_invoked"])
+            self.assertEqual(event["hook_errors"], [])
+            self.assertEqual(event["hook_retries"], 0)
+            self.assertEqual(
+                event["hook_final_status"], "not_invoked"
+            )
+        self.assertEqual(
+            summary["ventilator_failure_hooks"],
+            {"configured": False, "invoked": 0, "failed": 0, "retries": 0, "delivered": 0},
+        )
+        self.assertEqual(
+            ward.snapshot()["ventilator_failure"]["event_count"], 2
+        )
+
+    def test_callback_hook_fires_for_start_and_end(self):
+        seen = []
+        ward = self._vent_ward({"callback": seen.append})
+        self.assertTrue(ward.ventilator_failure_hooks.configured)
+        for _ in range(70):
+            ward.tick()
+        # Two events over the run: the ventilator fails at 5 s
+        # and restarts at 60 s. The patient drifts in between,
+        # but the failure itself fires once on start and once
+        # on end, not once a tick.
+        self.assertEqual(
+            [(p["event"], p["t"]) for p in seen],
+            [
+                ("ventilator_failure_started", 5.0),
+                ("ventilator_failure_ended", 60.0),
+            ],
+        )
+        start, end = seen
+        self.assertEqual(
+            {k: v for k, v in start.items() if k != "hook_retries"
+             and k != "hook_final_status"},
+            {
+                "event": "ventilator_failure_started",
+                "t": 5.0,
+                "at": 5.0,
+                "ends": 60.0,
+                "duration": 55,
+                "beds": [0],
+                "ventilator": self.VENT,
+            },
+        )
+        self.assertEqual(end["event"], "ventilator_failure_ended")
+        self.assertEqual(end["t"], 60.0)
+        self.assertEqual(end["beds"], [0])
+        # Every event records the invocation.
+        summary = ward.ventilator_failure_summary()
+        self.assertEqual(summary["event_count"], 2)
+        for event in summary["events"]:
+            self.assertTrue(event["hook_invoked"])
+            self.assertEqual(event["hook_errors"], [])
+            self.assertEqual(event["hook_final_status"], "delivered")
+        self.assertEqual(
+            summary["ventilator_failure_hooks"],
+            {"configured": True, "invoked": 2, "failed": 0, "retries": 0, "delivered": 2},
+        )
+
+    def test_start_and_end_fire_again_for_a_second_failure(self):
+        # Two ventilator failures on the same bed: the start
+        # and the end fire once per failure — the engine tracks
+        # each event separately, so the second failure fires
+        # again.
+        seen = []
+        ward = Ward(
+            beds=1,
+            profiles=["stable"],
+            ventilators=[True],
+            chaos=[
+                ChaosEvent(
+                    "ventilator_failure",
+                    at=5,
+                    duration=10,
+                    bed=0,
+                    ventilator=self.VENT,
+                ),
+                ChaosEvent(
+                    "ventilator_failure",
+                    at=30,
+                    duration=10,
+                    bed=0,
+                    ventilator=self.VENT,
+                ),
+            ],
+            seed=42,
+            ventilator_failure_hooks={"callback": seen.append},
+        )
+        for _ in range(45):
+            ward.tick()
+        self.assertEqual(
+            [(p["event"], p["t"]) for p in seen],
+            [
+                ("ventilator_failure_started", 5.0),
+                ("ventilator_failure_ended", 15.0),
+                ("ventilator_failure_started", 30.0),
+                ("ventilator_failure_ended", 40.0),
+            ],
+        )
+        self.assertEqual(
+            ward.ventilator_failure_summary()[
+                "ventilator_failure_hooks"
+            ],
+            {"configured": True, "invoked": 4, "failed": 0, "retries": 0, "delivered": 4},
+        )
+
+    def test_callback_failure_is_not_fatal(self):
+        def boom(payload):
+            raise ValueError("pager is down")
+
+        ward = self._vent_ward({"callback": boom})
+        for _ in range(5):
+            ward.tick()  # t=5: ventilator fails, hook raises
+        snap = ward.tick()  # t=6: the tick still completes
+        self.assertTrue(snap["beds"][0]["online"])
+        event = ward.ventilator_failure_summary()["events"][0]
+        self.assertEqual(event["event"], "ventilator_failure_started")
+        self.assertTrue(event["hook_invoked"])
+        self.assertEqual(event["hook_errors"], ["pager is down"])
+        self.assertEqual(event["hook_final_status"], "failed")
+        summary = ward.ventilator_failure_summary()[
+            "ventilator_failure_hooks"
+        ]
+        self.assertEqual(summary["invoked"], 1)
+        self.assertEqual(summary["failed"], 1)
+
+    def test_webhook_posts_to_stub_server(self):
+        server, port, received = capture_server()
+        try:
+            ward = self._vent_ward(
+                {"webhook_url": "http://127.0.0.1:%d/hooks" % port}
+            )
+            for _ in range(70):
+                ward.tick()
+            self.assertTrue(ward.ventilator_failure_hooks.wait(timeout=5))
+            self.assertEqual(len(received), 2)
+            payloads = sorted(
+                (json.loads(r[2]) for r in received),
+                key=lambda p: p["t"],
+            )
+            self.assertEqual(
+                [(p["event"], p["t"]) for p in payloads],
+                [
+                    ("ventilator_failure_started", 5.0),
+                    ("ventilator_failure_ended", 60.0),
+                ],
+            )
+            path, content_type, body = received[0]
+            self.assertEqual(path, "/hooks")
+            self.assertEqual(content_type, "application/json")
+            start = [p for p in payloads if p["event"] == "ventilator_failure_started"][0]
+            self.assertEqual(start["ventilator"], self.VENT)
+            self.assertEqual(start["beds"], [0])
+            summary = ward.ventilator_failure_summary()
+            self.assertEqual(
+                summary["ventilator_failure_hooks"],
+                {"configured": True, "invoked": 2, "failed": 0, "retries": 0, "delivered": 2},
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_scenario_ventilator_failure_hooks(self):
+        cfg = load_scenario(
+            os.path.join(
+                HERE, "..", "scenarios", "ventilator-failure-hooks.json"
+            )
+        )
+        self.assertTrue(cfg["ventilator_failure_hooks"].configured)
+        server, port, received = capture_server()
+        path = os.path.join(tempfile.mkdtemp(), "run.jsonl")
+        try:
+            # The scenario's URL is a placeholder; point it at
+            # the stub server for this run.
+            cfg["ventilator_failure_hooks"] = (
+                validate_ventilator_failure_hooks(
+                    {"webhook_url": "http://127.0.0.1:%d/hooks" % port}
+                )
+            )
+            ward = build_ward(cfg, seed=42)
+            with Recorder(path, ward.beds, ward.rate_hz, seed=42) as rec:
+                ward.recorder = rec
+                for _ in range(70):
+                    snap = ward.tick()
+            self.assertTrue(ward.ventilator_failure_hooks.wait(timeout=5))
+            # Two events over the run: the ventilator fails at
+            # 5 s and restarts at 60 s. The deliveries run in
+            # separate daemon threads, so their arrival order
+            # at the stub is not guaranteed — sort by event
+            # time before asserting.
+            self.assertEqual(len(received), 2)
+            payloads = sorted(
+                (json.loads(r[2]) for r in received),
+                key=lambda p: p["t"],
+            )
+            self.assertEqual(
+                [
+                    (p["event"], p["t"], p.get("bed"))
+                    for p in payloads
+                ],
+                [
+                    ("ventilator_failure_started", 5.0, None),
+                    ("ventilator_failure_ended", 60.0, None),
+                ],
+            )
+            # Every event records that its hook was invoked.
+            for event in snap["ventilator_failure"]["events"]:
+                self.assertTrue(event["hook_invoked"])
+            summary = ward.ventilator_failure_summary()
+            self.assertEqual(summary["event_count"], 2)
+            self.assertEqual(
+                summary["ventilator_failure_hooks"],
+                {"configured": True, "invoked": 2, "failed": 0, "retries": 0, "delivered": 2},
+            )
+            # The run summary carries the event count and the
+            # hook totals from the last tick — but only as of
+            # that tick: the snapshot in the file was recorded
+            # before the last delivery settled, so delivered is
+            # read from the live summary above, not from here.
+            run = summarize(path)
+            self.assertEqual(run["ventilator_failure"]["event_count"], 2)
+            self.assertTrue(
+                run["ventilator_failure"]["ventilator_failure_hooks"][
+                    "configured"
+                ]
+            )
+            self.assertEqual(
+                run["ventilator_failure"]["ventilator_failure_hooks"][
                     "invoked"
                 ],
                 2,
