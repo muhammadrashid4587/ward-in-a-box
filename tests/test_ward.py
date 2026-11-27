@@ -31,6 +31,7 @@ from ward.alert_hooks import (
     validate_missed_dose_hooks,
     validate_network_outage_hooks,
     validate_oxygen_outage_hooks,
+    validate_partition_hooks,
     validate_power_outage_hooks,
     validate_pump_failure_hooks,
     validate_sensor_drift_hooks,
@@ -14561,6 +14562,327 @@ class TestStaffShortageHooks(unittest.TestCase):
             )
             self.assertEqual(
                 run["staffing"]["staff_shortage_hooks"][
+                    "invoked"
+                ],
+                2,
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+class TestPartitionHooks(unittest.TestCase):
+    # Partition hooks: the ward going dark — cut off from the
+    # server — or coming back fires the ward's partition_hooks
+    # — the same webhook/callback machinery as the NEWS2 hooks
+    # — so something outside the ward hears the link fail and
+    # return. The hook is the one channel that still works while
+    # the ward is cut off: every HTTP endpoint returns 503 for
+    # the whole window, so a webhook or callback is how anything
+    # outside the ward hears about it at all.
+
+    def _partition_ward(self, hooks=None):
+        return Ward(
+            beds=12,
+            profiles=["stable"] * 12,
+            chaos=[
+                ChaosEvent(
+                    "partition",
+                    at=10,
+                    duration=30,
+                ),
+            ],
+            seed=42,
+            partition_hooks=hooks,
+        )
+
+    def test_validate_partition_hooks(self):
+        hooks = validate_partition_hooks(None)
+        self.assertIsInstance(hooks, TrendAlertHooks)
+        self.assertFalse(hooks.configured)
+        self.assertEqual(hooks.kind, "partition")
+        custom = validate_partition_hooks(
+            {"webhook_url": "https://example.invalid/hooks", "timeout_s": 2}
+        )
+        self.assertTrue(custom.configured)
+        self.assertEqual(custom.kind, "partition")
+        self.assertEqual(custom.timeout_s, 2.0)
+        seen = []
+        append = seen.append
+        cb = validate_partition_hooks({"callback": append})
+        self.assertTrue(cb.configured)
+        self.assertIs(cb.callback, append)
+        with self.assertRaises(ValueError):
+            validate_partition_hooks(
+                {"webhook_url": "ftp://x/hooks"}
+            )
+        with self.assertRaises(ValueError):
+            validate_partition_hooks({"callback": "not callable"})
+        with self.assertRaises(ValueError):
+            validate_partition_hooks({"timeout_s": 0})
+        with self.assertRaises(ValueError):
+            validate_partition_hooks({"url": "http://x/hooks"})
+        with self.assertRaises(ValueError):
+            validate_partition_hooks("http://x/hooks")
+
+    def test_hooks_off_by_default(self):
+        # No hooks configured: the ward still goes dark and
+        # comes back, and each event is recorded with no hook
+        # invoked.
+        ward = self._partition_ward()
+        self.assertFalse(ward.partition_hooks.configured)
+        for _ in range(70):
+            ward.tick()
+        summary = ward.partition_summary()
+        self.assertFalse(summary["partitioned"])
+        self.assertEqual(summary["event_count"], 2)
+        self.assertEqual(
+            [
+                (e["event"], e["t"])
+                for e in summary["events"]
+            ],
+            [
+                ("partition_started", 10.0),
+                ("partition_ended", 40.0),
+            ],
+        )
+        for event in summary["events"]:
+            self.assertFalse(event["hook_invoked"])
+            self.assertEqual(event["hook_errors"], [])
+            self.assertEqual(event["hook_retries"], 0)
+            self.assertEqual(
+                event["hook_final_status"], "not_invoked"
+            )
+        self.assertEqual(
+            summary["partition_hooks"],
+            {"configured": False, "invoked": 0, "failed": 0, "retries": 0, "delivered": 0},
+        )
+        self.assertEqual(
+            ward.snapshot()["partition"]["event_count"], 2
+        )
+
+    def test_callback_hook_fires_for_start_and_end(self):
+        seen = []
+        ward = self._partition_ward({"callback": seen.append})
+        self.assertTrue(ward.partition_hooks.configured)
+        for _ in range(70):
+            ward.tick()
+        # Two events over the run: the ward goes dark at 10 s
+        # and comes back at 40 s. The ward stays cut off in
+        # between, but the partition itself fires once on start
+        # and once on end, not once a tick.
+        self.assertEqual(
+            [(p["event"], p["t"]) for p in seen],
+            [
+                ("partition_started", 10.0),
+                ("partition_ended", 40.0),
+            ],
+        )
+        start, end = seen
+        self.assertEqual(
+            {k: v for k, v in start.items() if k != "hook_retries"
+             and k != "hook_final_status"},
+            {
+                "event": "partition_started",
+                "t": 10.0,
+                "at": 10.0,
+                "ends": 40.0,
+                "duration": 30,
+                "beds": list(range(12)),
+            },
+        )
+        self.assertEqual(end["event"], "partition_ended")
+        self.assertEqual(end["t"], 40.0)
+        self.assertEqual(end["beds"], list(range(12)))
+        # Every event records the invocation.
+        summary = ward.partition_summary()
+        self.assertEqual(summary["event_count"], 2)
+        for event in summary["events"]:
+            self.assertTrue(event["hook_invoked"])
+            self.assertEqual(event["hook_errors"], [])
+            self.assertEqual(event["hook_final_status"], "delivered")
+        self.assertEqual(
+            summary["partition_hooks"],
+            {"configured": True, "invoked": 2, "failed": 0, "retries": 0, "delivered": 2},
+        )
+
+    def test_start_and_end_fire_again_for_a_second_partition(self):
+        # Two partitions: the start and the end fire once per
+        # partition — the engine tracks each event separately,
+        # so the second cut-off fires again.
+        seen = []
+        ward = Ward(
+            beds=12,
+            profiles=["stable"] * 12,
+            chaos=[
+                ChaosEvent(
+                    "partition",
+                    at=5,
+                    duration=10,
+                ),
+                ChaosEvent(
+                    "partition",
+                    at=30,
+                    duration=10,
+                ),
+            ],
+            seed=42,
+            partition_hooks={"callback": seen.append},
+        )
+        for _ in range(45):
+            ward.tick()
+        self.assertEqual(
+            [(p["event"], p["t"]) for p in seen],
+            [
+                ("partition_started", 5.0),
+                ("partition_ended", 15.0),
+                ("partition_started", 30.0),
+                ("partition_ended", 40.0),
+            ],
+        )
+        self.assertEqual(
+            ward.partition_summary()[
+                "partition_hooks"
+            ],
+            {"configured": True, "invoked": 4, "failed": 0, "retries": 0, "delivered": 4},
+        )
+
+    def test_partitioned_flag_tracks_the_window(self):
+        ward = self._partition_ward()
+        for _ in range(9):
+            ward.tick()
+        self.assertFalse(ward.partition_summary()["partitioned"])
+        ward.tick()  # t=10: the ward goes dark
+        self.assertTrue(ward.partition_summary()["partitioned"])
+        for _ in range(29):
+            ward.tick()
+        self.assertTrue(ward.partition_summary()["partitioned"])
+        ward.tick()  # t=40: the ward is back
+        self.assertFalse(ward.partition_summary()["partitioned"])
+
+    def test_callback_failure_is_not_fatal(self):
+        def boom(payload):
+            raise ValueError("pager is down")
+
+        ward = self._partition_ward({"callback": boom})
+        for _ in range(9):
+            ward.tick()  # t=9: the ward is still connected
+        snap = ward.tick()  # t=10: cut off, hook raises
+        self.assertTrue(snap["partition"]["partitioned"])
+        snap = ward.tick()  # t=11: the tick still completes
+        self.assertTrue(snap["partition"]["partitioned"])
+        event = ward.partition_summary()["events"][0]
+        self.assertEqual(event["event"], "partition_started")
+        self.assertTrue(event["hook_invoked"])
+        self.assertEqual(event["hook_errors"], ["pager is down"])
+        self.assertEqual(event["hook_final_status"], "failed")
+        summary = ward.partition_summary()[
+            "partition_hooks"
+        ]
+        self.assertEqual(summary["invoked"], 1)
+        self.assertEqual(summary["failed"], 1)
+
+    def test_webhook_posts_to_stub_server(self):
+        server, port, received = capture_server()
+        try:
+            ward = self._partition_ward(
+                {"webhook_url": "http://127.0.0.1:%d/hooks" % port}
+            )
+            for _ in range(70):
+                ward.tick()
+            self.assertTrue(ward.partition_hooks.wait(timeout=5))
+            self.assertEqual(len(received), 2)
+            payloads = sorted(
+                (json.loads(r[2]) for r in received),
+                key=lambda p: p["t"],
+            )
+            self.assertEqual(
+                [(p["event"], p["t"]) for p in payloads],
+                [
+                    ("partition_started", 10.0),
+                    ("partition_ended", 40.0),
+                ],
+            )
+            path, content_type, body = received[0]
+            self.assertEqual(path, "/hooks")
+            self.assertEqual(content_type, "application/json")
+            start = [p for p in payloads if p["event"] == "partition_started"][0]
+            self.assertEqual(start["beds"], list(range(12)))
+            summary = ward.partition_summary()
+            self.assertEqual(
+                summary["partition_hooks"],
+                {"configured": True, "invoked": 2, "failed": 0, "retries": 0, "delivered": 2},
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_scenario_partition_hooks(self):
+        cfg = load_scenario(
+            os.path.join(
+                HERE, "..", "scenarios", "partition-hooks.json"
+            )
+        )
+        self.assertTrue(cfg["partition_hooks"].configured)
+        server, port, received = capture_server()
+        path = os.path.join(tempfile.mkdtemp(), "run.jsonl")
+        try:
+            # The scenario's URL is a placeholder; point it at
+            # the stub server for this run.
+            cfg["partition_hooks"] = (
+                validate_partition_hooks(
+                    {"webhook_url": "http://127.0.0.1:%d/hooks" % port}
+                )
+            )
+            ward = build_ward(cfg, seed=42)
+            with Recorder(path, ward.beds, ward.rate_hz, seed=42) as rec:
+                ward.recorder = rec
+                for _ in range(70):
+                    snap = ward.tick()
+            self.assertTrue(ward.partition_hooks.wait(timeout=5))
+            # Two events over the run: the ward goes dark at
+            # 10 s and comes back at 40 s. The deliveries run
+            # in separate daemon threads, so their arrival
+            # order at the stub is not guaranteed — sort by
+            # event time before asserting.
+            self.assertEqual(len(received), 2)
+            payloads = sorted(
+                (json.loads(r[2]) for r in received),
+                key=lambda p: p["t"],
+            )
+            self.assertEqual(
+                [
+                    (p["event"], p["t"], p.get("bed"))
+                    for p in payloads
+                ],
+                [
+                    ("partition_started", 10.0, None),
+                    ("partition_ended", 40.0, None),
+                ],
+            )
+            # Every event records that its hook was invoked.
+            for event in snap["partition"]["events"]:
+                self.assertTrue(event["hook_invoked"])
+            summary = ward.partition_summary()
+            self.assertEqual(summary["event_count"], 2)
+            self.assertEqual(
+                summary["partition_hooks"],
+                {"configured": True, "invoked": 2, "failed": 0, "retries": 0, "delivered": 2},
+            )
+            # The run summary carries the event count and the
+            # hook totals from the last tick — but only as of
+            # that tick: the snapshot in the file was recorded
+            # before the last delivery settled, so delivered is
+            # read from the live summary above, not from here.
+            run = summarize(path)
+            self.assertEqual(run["partition"]["event_count"], 2)
+            self.assertTrue(
+                run["partition"]["partition_hooks"][
+                    "configured"
+                ]
+            )
+            self.assertEqual(
+                run["partition"]["partition_hooks"][
                     "invoked"
                 ],
                 2,

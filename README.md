@@ -196,6 +196,14 @@ python3 -m ward.cli scenarios/staff-shortage.json --seed 42
 # own endpoint; a dead endpoint is logged, never fatal)
 python3 -m ward.cli scenarios/staff-shortage-hooks.json --seed 42
 
+# Partition hooks: the ward is cut off from the server at 10 s
+# and back at 40 s, also POSTed to a webhook (here a placeholder
+# URL — point it at your own endpoint; a dead endpoint is logged,
+# never fatal) — the hook is the one channel that still works
+# while the ward is cut off, because every HTTP endpoint returns
+# 503 for the whole window
+python3 -m ward.cli scenarios/partition-hooks.json --seed 42
+
 # Bed blocker: bed 1 waits for a porter from 5 s to 25 s, so its
 # discharge at 10 s is held until 25 s (15 s late), and bed 3
 # finishes cleaning at 15 s but is blocked for an isolation clean
@@ -461,6 +469,10 @@ python3 -m ward.cli scenarios/example.json --seed 42
   many machines are down, how many beds are drifting, and
   the largest drift per vital — as JSON
   (503 while partitioned)
+- `GET /partition` — whether the ward is cut off from the
+  server right now, the partition event history, and the
+  partition-hook totals, as JSON
+  (503 while partitioned)
 
 A reading looks like:
 
@@ -503,6 +515,7 @@ summary from `/news2`, and the sensor-drift summary from
 `/pump-failure`, and the lab-delay summary from `/lab-delay`,
 and the ventilator-failure summary from `/ventilator-failure`,
 and the dialysis-failure summary from `/dialysis-failure`,
+and the partition summary from `/partition`,
 so a client gets bed occupancy, vitals, alarms, staffing,
 medication, and the intake queue in one message. Ping frames are answered with pong, close frames
 are echoed and the connection is then closed; text frames from the
@@ -1011,6 +1024,54 @@ ward as `staff-shortage.json` loses one nurse at 10 s and
 gets them back at 40 s — POSTed to the configured webhook,
 with 2 hook deliveries invoked and 0 failed against a stub
 server.
+
+## Partition hooks
+
+A partition is the moment a ward most needs the outside world
+to hear about it — and the moment the outside world can least
+hear it through the usual channels, because every HTTP endpoint
+returns 503 for the whole window: the snapshot, the stream, the
+alarms, all of them — so the hook is the one channel that still
+works while the ward is cut off. A ward that wants the outside
+world to hear about that moment — a dashboard, a pager, an
+on-call manager — configures partition hooks, the same channels
+as the NEWS2 hooks (webhook and/or in-process callback), on the
+same best-effort, never-fatal terms:
+
+```json
+{"partition_hooks": {"webhook_url": "http://127.0.0.1:18099/hooks"}}
+```
+
+Two events fire. `partition_started` fires once, in the tick
+the ward is cut off, with the partition window (`"at"`,
+`"ends"`, `"duration"`) and the beds it covers — a partition
+is ward-wide, so every bed. `partition_ended` fires once, in
+the tick the ward reconnects, with the same window. A ward
+that stays dark for thirty ticks fires once, not thirty times,
+and a second partition fires again — the start and end are
+per event, not per run. An in-process callback gets the same
+payloads in the tick the event fires (Python API only — a
+scenario file cannot hold a callable), so scenario code can
+log or escalate on the cut-off directly. Each event records
+whether the hook was invoked (`"hook_invoked"`, False with
+no hooks) and any synchronous error (`"hook_errors"`), and
+the partition summary carries the current state
+(`"partitioned"`), the event totals (`"event_count"`, the full
+`"events"` history) and the ward partition-hook totals
+(`"partition_hooks"`: whether any hook is configured, how
+many deliveries were invoked, how many failed, how many
+retries were spent, and how many deliveries eventually
+landed) — in `GET /partition`, every snapshot and WebSocket
+frame, and the run summary (`--summary`). The same retry
+rules as the NEWS2 hooks apply — a failed webhook POST is
+retried with backoff up to `"max_retries"` times, and the
+event records `"hook_retries"` and `"hook_final_status"`
+alongside `"hook_invoked"`. Hooks are off by default, so a
+ward with none configured behaves exactly as before. See
+`scenarios/partition-hooks.json` for a runnable example: over
+a seeded 70-tick run the ward is cut off at 10 s and back at
+40 s — POSTed to the configured webhook, with 2 hook
+deliveries invoked and 0 failed against a stub server.
 
 ## Bed blocker
 
@@ -4207,3 +4268,19 @@ the hook totals.
   snapshot, WebSocket frame, a `GET /staffing` endpoint, and the
   run summary; off by default, configured per ward with
   `staff_shortage_hooks` in the scenario) — done in v0.67.0
+- Partition hooks (when the ward is cut off from the server
+  or reconnects — a configured webhook URL gets a
+  `partition_started` / `partition_ended` event payload POSTed
+  to it, or an in-process callback is called with the same
+  payload in the firing tick, so a hook can page the on-call
+  manager on the ward going dark; the hook is the one channel
+  that still works while the ward is cut off, because every
+  HTTP endpoint returns 503 for the whole window; one start
+  and one end per partition, re-armed for a second partition;
+  reusing the NEWS2 hook machinery, best effort and never
+  fatal; each event records whether the hook was invoked, and
+  the partition summary carries the current state, the event
+  history and the partition-hook totals, in every snapshot,
+  WebSocket frame, a `GET /partition` endpoint, and the run
+  summary; off by default, configured per ward with
+  `partition_hooks` in the scenario) — done in v0.68.0

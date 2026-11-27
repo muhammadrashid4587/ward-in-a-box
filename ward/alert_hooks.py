@@ -49,8 +49,13 @@ failing or restarting fires the ward's
 restarting fires the ward's ``dialysis_failure_hooks``; a
 staff shortage starting or ending — a nurse calling in sick
 and the roster coming whole again — fires the ward's
-``staff_shortage_hooks``.
-All nineteen share
+``staff_shortage_hooks``; a
+staff shortage starting or ending — a nurse calling in sick
+and the roster coming whole again — fires the ward's
+``staff_shortage_hooks``; a partition starting or ending —
+the ward cut off from the server and reconnected — fires
+the ward's ``partition_hooks``.
+All twenty share
 the same ``AlertHooks`` machinery — the same webhook and
 callback channels, the same best-effort delivery — just a
 different event payload.
@@ -376,6 +381,19 @@ def validate_staff_shortage_hooks(value):
     )
 
 
+def validate_partition_hooks(value):
+    """Normalize a partition hook config (see
+    :func:`_validate_hooks`).
+
+    Fires when a partition starts or ends — when the ward is
+    cut off from the server and when it reconnects — rather
+    than when a NEWS2 event fires.
+    """
+    return _validate_hooks(
+        value, "partition", "partition_hooks"
+    )
+
+
 class AlertHooks:
     """The configured hooks for one ward event, shared by its monitors.
 
@@ -386,8 +404,8 @@ class AlertHooks:
     ``"power-outage"``, ``"sensor-drift"``, ``"bed-blocker"``, or
     ``"network-outage"``, ``"medication-stockout"``,
     ``"pump-failure"``, ``"lab-delay"``, ``"lab-overdue"``,
-    ``"ventilator-failure"``, ``"dialysis-failure"``, or
-    ``"staff-shortage"``); it changes
+    ``"ventilator-failure"``, ``"dialysis-failure"``,
+    ``"staff-shortage"``, or ``"partition"``); it changes
     nothing about delivery.
     """
 

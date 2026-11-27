@@ -175,6 +175,11 @@ def make_handler(ward):
                     self._send_json(503, {"error": "partitioned"})
                     return
                 self._send_json(200, ward.dialysis_failure_summary())
+            elif path == "/partition":
+                if ward.partitioned:
+                    self._send_json(503, {"error": "partitioned"})
+                    return
+                self._send_json(200, ward.partition_summary())
             elif path == "/stream":
                 if ward.partitioned:
                     self._send_json(503, {"error": "partitioned"})
@@ -292,6 +297,7 @@ def make_handler(ward):
                         "dialysis_failure": (
                             ward.dialysis_failure_summary()
                         ),
+                        "partition": ward.partition_summary(),
                     }
                     send(OP_TEXT, json.dumps(msg))
                     stop.wait(1.0 / ward.rate_hz)

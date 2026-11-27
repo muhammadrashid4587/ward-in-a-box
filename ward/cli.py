@@ -16,6 +16,7 @@ from .alert_hooks import (
     validate_missed_dose_hooks,
     validate_network_outage_hooks,
     validate_oxygen_outage_hooks,
+    validate_partition_hooks,
     validate_power_outage_hooks,
     validate_pump_failure_hooks,
     validate_sensor_drift_hooks,
@@ -469,6 +470,16 @@ def load_scenario(path):
             raise ValueError(
                 "staff_shortage_hooks: %s" % e
             )
+    partition_hooks = None
+    if "partition_hooks" in data:
+        if not isinstance(data["partition_hooks"], dict):
+            raise ValueError("partition_hooks must be an object")
+        try:
+            partition_hooks = validate_partition_hooks(
+                data["partition_hooks"]
+            )
+        except ValueError as e:
+            raise ValueError("partition_hooks: %s" % e)
     return {
         "beds": beds,
         "rate_hz": rate,
@@ -510,6 +521,7 @@ def load_scenario(path):
         "ventilator_failure_hooks": ventilator_failure_hooks,
         "dialysis_failure_hooks": dialysis_failure_hooks,
         "staff_shortage_hooks": staff_shortage_hooks,
+        "partition_hooks": partition_hooks,
         "triage": triage,
         "host": data.get("host", "127.0.0.1"),
         "port": data.get("port", 8080),
@@ -565,6 +577,7 @@ def build_ward(cfg, seed=None, recorder=None):
         staff_shortage_hooks=cfg.get(
             "staff_shortage_hooks"
         ),
+        partition_hooks=cfg.get("partition_hooks"),
         triage=cfg.get("triage"),
         recorder=recorder,
     )

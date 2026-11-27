@@ -765,6 +765,12 @@ class ChaosEngine:
         # is a new event, so it fires again.
         self._staff_shortage_started = set()
         self._staff_shortage_ended = set()
+        # Partition events fire their start hook once, on the
+        # first tick inside the window, and their end hook
+        # once, on the first tick after it — a second partition
+        # is a new event, so it fires again.
+        self._partition_started = set()
+        self._partition_ended = set()
 
     def stockouts(self, ward, now):
         """Active pharmacy stockouts: ``{bed_id: {med, ...}}``.
@@ -1025,6 +1031,29 @@ class ChaosEngine:
                 ):
                     self._staff_shortage_ended.add(id(ev))
                     ward._staff_shortage_ended(ev, now)
+            # Partition: the start hook fires once, on the
+            # first tick inside the window, and the end hook
+            # once, on the first tick after it — so scenario
+            # code hears the ward go dark and come back exactly
+            # once per event, even across a run that ticks past
+            # the end. The check runs before the active gate
+            # below, so an end is caught on the tick the window
+            # closes. The hook is the one channel that still
+            # works while the ward is cut off: the HTTP
+            # endpoints all return 503 for the whole window,
+            # so a webhook or callback is how anything outside
+            # the ward hears about it at all.
+            if ev.type == "partition":
+                if ev.active(now):
+                    if id(ev) not in self._partition_started:
+                        self._partition_started.add(id(ev))
+                        ward._partition_started(ev, now)
+                elif (
+                    id(ev) in self._partition_started
+                    and id(ev) not in self._partition_ended
+                ):
+                    self._partition_ended.add(id(ev))
+                    ward._partition_ended(ev, now)
             if not ev.active(now):
                 continue
             if ev.type == "sensor_drift":

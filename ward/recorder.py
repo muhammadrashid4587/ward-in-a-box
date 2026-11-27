@@ -161,6 +161,7 @@ def summarize(path):
     last_lab_delay = None
     last_ventilator_failure = None
     last_dialysis_failure = None
+    last_partition = None
     with open(path) as f:
         for line in f:
             line = line.strip()
@@ -240,6 +241,8 @@ def summarize(path):
                 last_ventilator_failure = obj["ventilator_failure"]
             if isinstance(obj.get("dialysis_failure"), dict):
                 last_dialysis_failure = obj["dialysis_failure"]
+            if isinstance(obj.get("partition"), dict):
+                last_partition = obj["partition"]
             for bed in obj["beds"]:
                 b = bed["bed"]
                 if not bed.get("online", True):
@@ -680,6 +683,32 @@ def summarize(path):
                 ),
             }
             if last_power_outage is not None
+            else None
+        ),
+        # Partition totals from the last tick: whether the ward
+        # is cut off from the server right now — plus how many
+        # partition hook events fired this run, and whether the
+        # partition hooks are configured and how many hook
+        # deliveries were invoked, failed, retried, and
+        # delivered.
+        "partition": (
+            {
+                "partitioned": last_partition["partitioned"],
+                "event_count": last_partition.get(
+                    "event_count", 0
+                ),
+                "partition_hooks": last_partition.get(
+                    "partition_hooks",
+                    {
+                        "configured": False,
+                        "invoked": 0,
+                        "failed": 0,
+                        "retries": 0,
+                        "delivered": 0,
+                    },
+                ),
+            }
+            if last_partition is not None
             else None
         ),
         # Staffing totals from the last tick: the load factor, how
