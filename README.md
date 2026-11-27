@@ -375,6 +375,13 @@ python3 -m ward.cli scenarios/alarm-storm-ack.json --seed 42
 # 17 s, bed 0 clears in 26.0 s, beds 1 and 2 in 30.0 s
 python3 -m ward.cli scenarios/alarm-storm-ack-per-bed.json --seed 42
 
+# Per-bed acknowledgement totals across storms: the same
+# burst twice — the first storm starts at 17 s, the second
+# at 127 s — bed 0 clears in 26.0 s both times, beds 1 and
+# 2 in 30.0 s then 31.0 s, so over the whole run bed 0
+# averages 26.0 s and beds 1 and 2 average 30.5 s
+python3 -m ward.cli scenarios/alarm-storm-ack-totals.json --seed 42
+
 # Reproducible run
 python3 -m ward.cli scenarios/example.json --seed 42
 ```
@@ -507,7 +514,11 @@ python3 -m ward.cli scenarios/example.json --seed 42
   last ack) and the per-storm records, each with the
   per-bed acknowledgement times (how many of each bed's
   storm alarms were acked and how long that bed took from
-  the storm's start), the storm event history, and the
+  the storm's start), the per-bed acknowledgement totals
+  across storms (how many storms each bed raised in, how
+  many of its storm alarms were raised, acked, and are
+  still pending, and the mean and longest time it took to
+  clear a storm's alarms), the storm event history, and the
   alarm-storm-hook totals, as JSON
   (503 while partitioned)
 
@@ -4562,6 +4573,18 @@ the hook totals.
   `alarm_storm_acknowledged` hook payload, so a dashboard
   can see which bed's alarms the nurses cleared last) —
   done in v0.73.0
-- Next: per-bed acknowledgement totals across storms, so
-  a dashboard can see which bed is slowest to clear over
-  a whole run, not just inside one storm
+- Per-bed acknowledgement totals across storms (one entry
+  per bed that raised a storm alarm in any storm this run —
+  how many storms it raised in, how many of its storm
+  alarms were raised, acked, and are still pending, and
+  the mean and longest time it took to clear a storm's
+  alarms, counting only the storms it fully cleared, null
+  while none of its storms has fully cleared — in the
+  alarm-storm summary, every snapshot, WebSocket frame, a
+  `GET /alarm-storm` endpoint, and the run summary, so a
+  dashboard can see which bed is slowest to clear over a
+  whole run, not just inside one storm) — done in v0.74.0
+- Next: a slowest-bed alert when one bed's mean time to
+  ack across storms crosses a configurable threshold, so
+  a dashboard hears about the bed falling behind instead
+  of having to poll the totals

@@ -753,7 +753,8 @@ def summarize(path):
         # retried, and delivered — plus the acknowledgement
         # totals (how many storms there have been, how many are
         # acknowledged and how many are not, and the mean and
-        # longest time from a storm's start to its last ack)
+        # longest time from a storm's start to its last ack),
+        # the per-bed acknowledgement totals across storms,
         # and the per-storm records.
         "alarm_storm": (
             {
@@ -774,6 +775,9 @@ def summarize(path):
                     },
                 ),
                 "storms": last_alarm_storm.get("storms", []),
+                "bed_ack_totals": last_alarm_storm.get(
+                    "bed_ack_totals", []
+                ),
                 "event_count": last_alarm_storm.get(
                     "event_count", 0
                 ),

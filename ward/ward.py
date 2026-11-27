@@ -1742,6 +1742,62 @@ class Ward:
             )
         return view
 
+    def _bed_ack_totals(self, storms):
+        """Per-bed acknowledgement totals across storms.
+
+        One entry per bed that raised a storm alarm in any
+        storm this run, in bed order: how many storms it
+        raised in, how many of its storm alarms were raised,
+        acked, and are still pending, and the mean and
+        longest time it took to clear a storm's alarms —
+        over the storms where that bed's alarms are all
+        acked, null while none of its storms has fully
+        cleared — so a dashboard can see which bed is
+        slowest to clear over a whole run, not just inside
+        one storm.
+        """
+        totals = {}
+        for storm in storms:
+            for entry in storm["bed_acks"]:
+                total = totals.setdefault(
+                    entry["bed"],
+                    {
+                        "bed": entry["bed"],
+                        "storms": 0,
+                        "alarms_raised": 0,
+                        "alarms_acked": 0,
+                        "alarms_pending": 0,
+                        "times": [],
+                    },
+                )
+                total["storms"] += 1
+                total["alarms_raised"] += entry["alarms_raised"]
+                total["alarms_acked"] += entry["alarms_acked"]
+                total["alarms_pending"] += entry["alarms_pending"]
+                if entry["time_to_ack_s"] is not None:
+                    total["times"].append(entry["time_to_ack_s"])
+        view = []
+        for bed in sorted(totals):
+            total = totals[bed]
+            times = total.pop("times")
+            view.append(
+                {
+                    "bed": bed,
+                    "storms": total["storms"],
+                    "alarms_raised": total["alarms_raised"],
+                    "alarms_acked": total["alarms_acked"],
+                    "alarms_pending": total["alarms_pending"],
+                    "mean_time_to_ack_s": (
+                        round(sum(times) / len(times), 3)
+                        if times else None
+                    ),
+                    "max_time_to_ack_s": (
+                        max(times) if times else None
+                    ),
+                }
+            )
+        return view
+
     def _alarm_storm_view(self, storm):
         """One storm as plain JSON data, for the summary."""
         return {
@@ -1815,7 +1871,14 @@ class Ward:
         bed took from the storm's start, null while any of
         its alarms is still pending; the open storm, if any,
         is listed last with ``ended_t``
-        null and its ack still in progress. ``event_count``
+        null and its ack still in progress. ``bed_ack_totals``
+        aggregates the per-bed times across every storm this
+        run — how many storms each bed raised in, how many of
+        its storm alarms were raised, acked, and are still
+        pending, and the mean and longest time it took to
+        clear a storm's alarms, null while none of its storms
+        has fully cleared — so a dashboard can see which bed
+        is slowest to clear over a whole run. ``event_count``
         counts every alarm-storm hook event this run — storms
         starting, ending, and being acknowledged — and
         ``events`` lists them, each with the tick, the storm's
@@ -1861,6 +1924,7 @@ class Ward:
                 "max_time_to_ack_s": max(times) if times else None,
             },
             "storms": storms,
+            "bed_ack_totals": self._bed_ack_totals(storms),
             "event_count": len(self.alarm_storm_events),
             "events": [dict(e) for e in self.alarm_storm_events],
             "alarm_storm_hooks": (

@@ -16093,6 +16093,108 @@ class TestAlarmStormHooks(unittest.TestCase):
             run["alarm_storm"]["storms"], summary["storms"]
         )
 
+    def test_scenario_alarm_storm_ack_totals(self):
+        # Two staggered bursts, two storms: bed 0 clears
+        # in 26.0 s both times, beds 1 and 2 in 30.0 s then
+        # 31.0 s — the totals across storms say bed 0 is
+        # the fastest to clear over the whole run, beds 1
+        # and 2 the slowest. The run summary carries the
+        # same totals from the last tick.
+        cfg = load_scenario(
+            os.path.join(
+                HERE, "..", "scenarios", "alarm-storm-ack-totals.json"
+            )
+        )
+        path = os.path.join(tempfile.mkdtemp(), "run.jsonl")
+        ward = build_ward(cfg, seed=42)
+        with Recorder(path, ward.beds, ward.rate_hz, seed=42) as rec:
+            ward.recorder = rec
+            for _ in range(220):
+                ward.tick()
+        summary = ward.alarm_storm_summary()
+        self.assertEqual(
+            summary["bed_ack_totals"],
+            [
+                {
+                    "bed": 0,
+                    "storms": 2,
+                    "alarms_raised": 10,
+                    "alarms_acked": 10,
+                    "alarms_pending": 0,
+                    "mean_time_to_ack_s": 26.0,
+                    "max_time_to_ack_s": 26.0,
+                },
+                {
+                    "bed": 1,
+                    "storms": 2,
+                    "alarms_raised": 10,
+                    "alarms_acked": 10,
+                    "alarms_pending": 0,
+                    "mean_time_to_ack_s": 30.5,
+                    "max_time_to_ack_s": 31.0,
+                },
+                {
+                    "bed": 2,
+                    "storms": 2,
+                    "alarms_raised": 10,
+                    "alarms_acked": 10,
+                    "alarms_pending": 0,
+                    "mean_time_to_ack_s": 30.5,
+                    "max_time_to_ack_s": 31.0,
+                },
+            ],
+        )
+        run = summarize(path)
+        self.assertEqual(
+            run["alarm_storm"]["bed_ack_totals"],
+            summary["bed_ack_totals"],
+        )
+
+    def test_alarm_storm_ack_totals_skip_pending_storms(self):
+        # One nurse for twelve beds: the first storm's
+        # alarms take 86-90 s to clear and the second storm
+        # is still open at 160 s, so each bed's mean and
+        # longest time count only the storm it fully
+        # cleared — the open storm adds pending alarms but
+        # no time.
+        cfg = load_scenario(
+            os.path.join(
+                HERE, "..", "scenarios", "alarm-storm-ack-totals.json"
+            )
+        )
+        cfg["staffing"] = {
+            "day": {"nurse": 1, "doctor": 1, "tech": 1},
+            "night": {"nurse": 1, "doctor": 1, "tech": 0},
+            "start_hour": 8,
+        }
+        ward = build_ward(cfg, seed=42)
+        for _ in range(160):
+            ward.tick()
+        summary = ward.alarm_storm_summary()
+        self.assertEqual(
+            [
+                (
+                    b["bed"],
+                    b["mean_time_to_ack_s"],
+                    b["max_time_to_ack_s"],
+                )
+                for b in summary["bed_ack_totals"]
+            ],
+            [(0, 86.0, 86.0), (1, 90.0, 90.0), (2, 90.0, 90.0)],
+        )
+        self.assertTrue(
+            all(
+                b["alarms_pending"] == 5
+                for b in summary["bed_ack_totals"]
+            )
+        )
+
+    def test_alarm_storm_ack_totals_empty_without_storms(self):
+        ward = Ward(beds=12, rate_hz=1.0, seed=42)
+        self.assertEqual(
+            ward.alarm_storm_summary()["bed_ack_totals"], []
+        )
+
     def test_alarm_storm_endpoint_serves_json_and_is_503_while_partitioned(self):
         ward = self._storm_ward()
         server, port = serve_in_thread(ward)
