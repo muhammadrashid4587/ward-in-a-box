@@ -1177,14 +1177,24 @@ starts a storm on 5 alarms in 30 seconds, while a
 threshold above anything the ward ever raises means no
 storm ever fires and the ward behaves exactly as before.
 
-Two events fire. `alarm_storm_started` fires once, in the
+Three events fire. `alarm_storm_started` fires once, in the
 tick the count crosses the threshold, with the threshold
 and window, how many alarms are inside the window, and the
 beds that raised them. `alarm_storm_ended` fires once, in
 the tick the count falls back below the threshold, with
 when the storm started, how long it lasted, the most alarms
 ever inside the window during it, how many alarms were
-raised in total since it started, and the beds. A storm
+raised in total since it started, and the beds.
+`alarm_storm_acknowledged` fires once, in the tick the storm
+is recognised as acknowledged — the tick it ends, when its
+alarms were already acked, or the tick its last alarm is
+acked, when it ended with alarms still pending — with when
+the storm started and ended and how long it lasted, its peak
+and total raises, how many alarms were acked, when the last
+ack landed and how long that took from the storm's start,
+and the shift on duty then with how many nurses it had, so
+a hook hears not just that the ward has calmed down but
+that the nurses have actually caught up. A storm
 that stays open for sixty ticks fires once, not sixty
 times, and a second burst fires again — the detector
 re-arms when the trailing count falls back below the
@@ -1218,9 +1228,16 @@ queue are not counted. See
 over a seeded 100-tick run the burst on beds 0-2 starts
 the storm at 12 s, when the 10th alarm in 60 s lands, and
 ends it at 73 s, once the burst has aged out of the window
-— 15 alarms raised in total, POSTed to the configured
-webhook, with 2 hook deliveries invoked and 0 failed
-against a stub server.
+— 15 alarms raised in total, the last of them acked at 43 s,
+so the storm is recognised as acknowledged at 73 s, 31.0 s
+after it started, with the day shift and its 3 nurses —
+POSTed to the configured webhook, with 3 hook deliveries
+invoked and 0 failed against a stub server. See
+`scenarios/alarm-storm-ack-hooks.json` for the same burst on
+a thin roster of one nurse for twelve beds: the storm ends
+at 73 s with all 15 alarms still pending, so the
+acknowledged event fires only at 103 s, 91.0 s after the
+storm started.
 
 ## Alarm-storm acknowledgement
 
@@ -4505,7 +4522,18 @@ the hook totals.
   summary, every snapshot, WebSocket frame, a
   `GET /alarm-storm` endpoint, and the run summary) — done
   in v0.71.0
-- Next: an `alarm_storm_acknowledged` hook event, fired
-  when a storm's last alarm is acked, so a dashboard or
-  pager hears not just that the ward has calmed down but
-  that the nurses have actually caught up
+- Alarm-storm acknowledged hook event (an
+  `alarm_storm_acknowledged` event fires when a storm's last
+  alarm is acked — in the tick the storm ends, when its
+  alarms were already acked, or in the tick the last alarm
+  is acked, when it ended with alarms still pending — with
+  the storm's start and end, its peak and total raises, how
+  many alarms were acked, when the last ack landed and how
+  long that took, and the shift on duty then with how many
+  nurses it had, through the same `alarm_storm_hooks`, in
+  the alarm-storm summary, every snapshot, WebSocket frame,
+  a `GET /alarm-storm` endpoint, and the run summary) — done
+  in v0.72.0
+- Next: per-bed acknowledgement times in the storm record,
+  so a dashboard can see which bed's alarms the nurses
+  cleared last

@@ -56,10 +56,11 @@ and the roster coming whole again — fires the ward's
 the ward cut off from the server and reconnected — fires
 the ward's ``partition_hooks``; a monitor dropping out or
 coming back — a bed's monitor going offline and returning —
-fires the ward's ``dropout_hooks``; an alarm storm starting or
-ending — the ward raising at least ``threshold`` alarms within
-``window_s`` seconds, and the rate falling back below it — fires
-the ward's ``alarm_storm_hooks``.
+fires the ward's ``dropout_hooks``; an alarm storm starting, ending, or
+becoming fully acknowledged — the ward raising at least
+``threshold`` alarms within ``window_s`` seconds, the rate
+falling back below it, and the storm's last alarm being
+acked — fires the ward's ``alarm_storm_hooks``.
 All twenty-two share
 the same ``AlertHooks`` machinery — the same webhook and
 callback channels, the same best-effort delivery — just a

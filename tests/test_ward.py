@@ -15385,7 +15385,7 @@ class TestAlarmStormHooks(unittest.TestCase):
         self.assertEqual(summary["alarms_in_window"], 0)
         self.assertEqual(summary["threshold"], 10)
         self.assertEqual(summary["window_s"], 60.0)
-        self.assertEqual(summary["event_count"], 2)
+        self.assertEqual(summary["event_count"], 3)
         self.assertEqual(
             [
                 (e["event"], e["t"])
@@ -15394,6 +15394,7 @@ class TestAlarmStormHooks(unittest.TestCase):
             [
                 ("alarm_storm_started", 12.0),
                 ("alarm_storm_ended", 73.0),
+                ("alarm_storm_acknowledged", 73.0),
             ],
         )
         for event in summary["events"]:
@@ -15408,29 +15409,32 @@ class TestAlarmStormHooks(unittest.TestCase):
             {"configured": False, "invoked": 0, "failed": 0, "retries": 0, "delivered": 0},
         )
         self.assertEqual(
-            ward.snapshot()["alarm_storm"]["event_count"], 2
+            ward.snapshot()["alarm_storm"]["event_count"], 3
         )
 
-    def test_callback_hook_fires_for_start_and_end(self):
+    def test_callback_hook_fires_for_start_end_and_acknowledged(self):
         seen = []
         ward = self._storm_ward({"callback": seen.append})
         self.assertTrue(ward.alarm_storm_hooks.configured)
         for _ in range(100):
             ward.tick()
-        # Two events over the run: the burst on beds 0-2
-        # crosses 10 alarms in 60 s at 12 s, and the trailing
-        # count falls back below 10 at 73 s, once the burst
-        # has aged out of the window. The storm stays open
-        # in between, but the hooks fire once on start and
-        # once on end, not once a tick.
+        # Three events over the run: the burst on beds 0-2
+        # crosses 10 alarms in 60 s at 12 s, the trailing
+        # count falls back below 10 at 73 s, and the storm is
+        # recognised as acknowledged in the same tick — its
+        # last alarm was acked at 43 s, long before it ended,
+        # so no alarm was still pending. The storm stays open
+        # in between, but the hooks fire once on start, once
+        # on end, and once on acknowledgement, not once a tick.
         self.assertEqual(
             [(p["event"], p["t"]) for p in seen],
             [
                 ("alarm_storm_started", 12.0),
                 ("alarm_storm_ended", 73.0),
+                ("alarm_storm_acknowledged", 73.0),
             ],
         )
-        start, end = seen
+        start, end, ack = seen
         self.assertEqual(start["threshold"], 10)
         self.assertEqual(start["window_s"], 60.0)
         self.assertEqual(start["alarms_in_window"], 13)
@@ -15442,16 +15446,34 @@ class TestAlarmStormHooks(unittest.TestCase):
         self.assertEqual(end["peak_alarms_in_window"], 15)
         self.assertEqual(end["alarms_raised"], 15)
         self.assertEqual(end["beds"], [0, 1, 2])
+        # The acknowledged event names the storm by when it
+        # started, and carries when the last ack landed and
+        # how long that took, with the shift on duty then.
+        self.assertEqual(ack["event"], "alarm_storm_acknowledged")
+        self.assertEqual(ack["t"], 73.0)
+        self.assertEqual(ack["started_t"], 12.0)
+        self.assertEqual(ack["ended_t"], 73.0)
+        self.assertEqual(ack["duration_s"], 61.0)
+        self.assertEqual(ack["threshold"], 10)
+        self.assertEqual(ack["window_s"], 60.0)
+        self.assertEqual(ack["peak_alarms_in_window"], 15)
+        self.assertEqual(ack["alarms_raised"], 15)
+        self.assertEqual(ack["alarms_acked"], 15)
+        self.assertEqual(ack["ack_t"], 43.0)
+        self.assertEqual(ack["time_to_ack_s"], 31.0)
+        self.assertEqual(ack["ack_shift"], "day")
+        self.assertEqual(ack["ack_nurses"], 3)
+        self.assertEqual(ack["beds"], [0, 1, 2])
         # Every event records the invocation.
         summary = ward.alarm_storm_summary()
-        self.assertEqual(summary["event_count"], 2)
+        self.assertEqual(summary["event_count"], 3)
         for event in summary["events"]:
             self.assertTrue(event["hook_invoked"])
             self.assertEqual(event["hook_errors"], [])
             self.assertEqual(event["hook_final_status"], "delivered")
         self.assertEqual(
             summary["alarm_storm_hooks"],
-            {"configured": True, "invoked": 2, "failed": 0, "retries": 0, "delivered": 2},
+            {"configured": True, "invoked": 3, "failed": 0, "retries": 0, "delivered": 3},
         )
 
     def test_storm_active_tracks_the_window(self):
@@ -15477,10 +15499,11 @@ class TestAlarmStormHooks(unittest.TestCase):
         self.assertIsNone(summary["started_t"])
 
     def test_start_and_end_fire_again_for_a_second_storm(self):
-        # Two alarm storms on the same beds: the start and
-        # the end fire once per storm — the detector re-arms
-        # when the trailing count falls back below the
-        # threshold, so the second burst fires again.
+        # Two alarm storms on the same beds: the start, the
+        # end, and the acknowledgement fire once per storm —
+        # the detector re-arms when the trailing count falls
+        # back below the threshold, so the second burst fires
+        # again.
         seen = []
         ward = Ward(
             beds=12,
@@ -15509,15 +15532,17 @@ class TestAlarmStormHooks(unittest.TestCase):
             [
                 ("alarm_storm_started", 12.0),
                 ("alarm_storm_ended", 73.0),
+                ("alarm_storm_acknowledged", 73.0),
                 ("alarm_storm_started", 102.0),
                 ("alarm_storm_ended", 163.0),
+                ("alarm_storm_acknowledged", 163.0),
             ],
         )
         self.assertEqual(
             ward.alarm_storm_summary()[
                 "alarm_storm_hooks"
             ],
-            {"configured": True, "invoked": 4, "failed": 0, "retries": 0, "delivered": 4},
+            {"configured": True, "invoked": 6, "failed": 0, "retries": 0, "delivered": 6},
         )
 
     def test_high_threshold_never_starts_a_storm(self):
@@ -15535,7 +15560,10 @@ class TestAlarmStormHooks(unittest.TestCase):
     def test_low_threshold_starts_on_the_first_alarm(self):
         # A threshold of 1 starts a storm on the very first
         # alarm a quiet ward raises, and ends it once that
-        # alarm ages out of the window.
+        # alarm ages out of the window — but the storm is only
+        # acknowledged when the nurse acks that alarm, 30 s
+        # after it was raised, so the acknowledged event lands
+        # later than the ended one.
         seen = []
         ward = Ward(
             beds=2,
@@ -15544,13 +15572,17 @@ class TestAlarmStormHooks(unittest.TestCase):
             alarm_storm={"threshold": 1, "window_s": 10.0},
             alarm_storm_hooks={"callback": seen.append},
         )
-        for _ in range(30):
+        for _ in range(40):
             ward.tick()
         self.assertEqual(
             [p["event"] for p in seen],
-            ["alarm_storm_started", "alarm_storm_ended"],
+            [
+                "alarm_storm_started",
+                "alarm_storm_ended",
+                "alarm_storm_acknowledged",
+            ],
         )
-        start, end = seen
+        start, end, ack = seen
         self.assertEqual(start["alarms_in_window"], 1)
         # The alarm raised at start["t"] stays inside the
         # trailing window through start["t"] + window_s — the
@@ -15560,6 +15592,14 @@ class TestAlarmStormHooks(unittest.TestCase):
         self.assertEqual(
             end["t"], start["t"] + 10.0 + 1.0
         )
+        # The one alarm is acked 30 s after it was raised —
+        # after the storm has already ended — and that is
+        # when the acknowledged event fires.
+        self.assertEqual(ack["t"], start["t"] + 30.0)
+        self.assertEqual(ack["ack_t"], start["t"] + 30.0)
+        self.assertEqual(ack["time_to_ack_s"], 30.0)
+        self.assertEqual(ack["alarms_raised"], 1)
+        self.assertEqual(ack["alarms_acked"], 1)
 
     def test_callback_failure_is_not_fatal(self):
         def boom(payload):
@@ -15592,7 +15632,7 @@ class TestAlarmStormHooks(unittest.TestCase):
             for _ in range(100):
                 ward.tick()
             self.assertTrue(ward.alarm_storm_hooks.wait(timeout=5))
-            self.assertEqual(len(received), 2)
+            self.assertEqual(len(received), 3)
             payloads = sorted(
                 (json.loads(r[2]) for r in received),
                 key=lambda p: p["t"],
@@ -15602,6 +15642,7 @@ class TestAlarmStormHooks(unittest.TestCase):
                 [
                     ("alarm_storm_started", 12.0),
                     ("alarm_storm_ended", 73.0),
+                    ("alarm_storm_acknowledged", 73.0),
                 ],
             )
             path, content_type, body = received[0]
@@ -15609,10 +15650,16 @@ class TestAlarmStormHooks(unittest.TestCase):
             self.assertEqual(content_type, "application/json")
             start = [p for p in payloads if p["event"] == "alarm_storm_started"][0]
             self.assertEqual(start["beds"], [0, 1, 2])
+            ack = [p for p in payloads if p["event"] == "alarm_storm_acknowledged"][0]
+            self.assertEqual(ack["started_t"], 12.0)
+            self.assertEqual(ack["ack_t"], 43.0)
+            self.assertEqual(ack["time_to_ack_s"], 31.0)
+            self.assertEqual(ack["ack_shift"], "day")
+            self.assertEqual(ack["ack_nurses"], 3)
             summary = ward.alarm_storm_summary()
             self.assertEqual(
                 summary["alarm_storm_hooks"],
-                {"configured": True, "invoked": 2, "failed": 0, "retries": 0, "delivered": 2},
+                {"configured": True, "invoked": 3, "failed": 0, "retries": 0, "delivered": 3},
             )
         finally:
             server.shutdown()
@@ -15750,6 +15797,54 @@ class TestAlarmStormHooks(unittest.TestCase):
         self.assertEqual(storm["ack_shift"], "day")
         self.assertEqual(storm["ack_nurses"], 1)
 
+    def test_acknowledged_event_fires_when_last_alarm_acked_after_end(self):
+        # One nurse for twelve beds takes 90 s to acknowledge,
+        # so the storm ends at 73 s with all 15 alarms still
+        # pending — and the acknowledged event fires only when
+        # the last of them is acked, at 103 s, 91.0 s after the
+        # storm started, naming the one nurse on duty.
+        seen = []
+        ward = Ward(
+            beds=12,
+            profiles=["stable"] * 12,
+            chaos=[
+                ChaosEvent(
+                    "alarm_storm",
+                    at=10,
+                    duration=20,
+                    beds=[0, 1, 2],
+                ),
+            ],
+            seed=42,
+            staffing={
+                "day": {"nurse": 1, "doctor": 1, "tech": 1},
+                "night": {"nurse": 1, "doctor": 1, "tech": 0},
+            },
+            alarm_storm_hooks={"callback": seen.append},
+        )
+        for _ in range(200):
+            ward.tick()
+        self.assertEqual(
+            [(p["event"], p["t"]) for p in seen],
+            [
+                ("alarm_storm_started", 12.0),
+                ("alarm_storm_ended", 73.0),
+                ("alarm_storm_acknowledged", 103.0),
+            ],
+        )
+        ack = seen[2]
+        self.assertEqual(ack["started_t"], 12.0)
+        self.assertEqual(ack["ended_t"], 73.0)
+        self.assertEqual(ack["duration_s"], 61.0)
+        self.assertEqual(ack["peak_alarms_in_window"], 15)
+        self.assertEqual(ack["alarms_raised"], 15)
+        self.assertEqual(ack["alarms_acked"], 15)
+        self.assertEqual(ack["ack_t"], 103.0)
+        self.assertEqual(ack["time_to_ack_s"], 91.0)
+        self.assertEqual(ack["ack_shift"], "day")
+        self.assertEqual(ack["ack_nurses"], 1)
+        self.assertEqual(ack["beds"], [0, 1, 2])
+
     def test_two_storms_acknowledge_each_and_mean(self):
         # Two bursts, two storms, each acknowledged 31.0 s
         # after it started — the mean and the max agree, and
@@ -15885,13 +15980,15 @@ class TestAlarmStormHooks(unittest.TestCase):
                 for _ in range(100):
                     snap = ward.tick()
             self.assertTrue(ward.alarm_storm_hooks.wait(timeout=5))
-            # Two events over the run: the burst crosses 10
-            # alarms in 60 s at 12 s and the trailing count
-            # falls back below 10 at 73 s. The deliveries run
+            # Three events over the run: the burst crosses 10
+            # alarms in 60 s at 12 s, the trailing count
+            # falls back below 10 at 73 s, and the storm is
+            # recognised as acknowledged in the same tick —
+            # its last alarm was acked at 43 s. The deliveries run
             # in separate daemon threads, so their arrival
             # order at the stub is not guaranteed — sort by
             # event time before asserting.
-            self.assertEqual(len(received), 2)
+            self.assertEqual(len(received), 3)
             payloads = sorted(
                 (json.loads(r[2]) for r in received),
                 key=lambda p: p["t"],
@@ -15904,16 +16001,17 @@ class TestAlarmStormHooks(unittest.TestCase):
                 [
                     ("alarm_storm_started", 12.0, [0, 1, 2]),
                     ("alarm_storm_ended", 73.0, [0, 1, 2]),
+                    ("alarm_storm_acknowledged", 73.0, [0, 1, 2]),
                 ],
             )
             # Every event records that its hook was invoked.
             for event in snap["alarm_storm"]["events"]:
                 self.assertTrue(event["hook_invoked"])
             summary = ward.alarm_storm_summary()
-            self.assertEqual(summary["event_count"], 2)
+            self.assertEqual(summary["event_count"], 3)
             self.assertEqual(
                 summary["alarm_storm_hooks"],
-                {"configured": True, "invoked": 2, "failed": 0, "retries": 0, "delivered": 2},
+                {"configured": True, "invoked": 3, "failed": 0, "retries": 0, "delivered": 3},
             )
             # The run summary carries the event count and the
             # hook totals from the last tick — but only as of
@@ -15921,7 +16019,7 @@ class TestAlarmStormHooks(unittest.TestCase):
             # before the last delivery settled, so delivered is
             # read from the live summary above, not from here.
             run = summarize(path)
-            self.assertEqual(run["alarm_storm"]["event_count"], 2)
+            self.assertEqual(run["alarm_storm"]["event_count"], 3)
             self.assertFalse(run["alarm_storm"]["storm_active"])
             self.assertTrue(
                 run["alarm_storm"]["alarm_storm_hooks"][
@@ -15932,8 +16030,92 @@ class TestAlarmStormHooks(unittest.TestCase):
                 run["alarm_storm"]["alarm_storm_hooks"][
                     "invoked"
                 ],
-                2,
+                3,
             )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+    def test_scenario_alarm_storm_ack_hooks(self):
+        cfg = load_scenario(
+            os.path.join(
+                HERE, "..", "scenarios", "alarm-storm-ack-hooks.json"
+            )
+        )
+        self.assertTrue(cfg["alarm_storm_hooks"].configured)
+        server, port, received = capture_server()
+        path = os.path.join(tempfile.mkdtemp(), "run.jsonl")
+        try:
+            # The scenario's URL is a placeholder; point it at
+            # the stub server for this run.
+            cfg["alarm_storm_hooks"] = (
+                validate_alarm_storm_hooks(
+                    {"webhook_url": "http://127.0.0.1:%d/hooks" % port}
+                )
+            )
+            ward = build_ward(cfg, seed=42)
+            with Recorder(path, ward.beds, ward.rate_hz, seed=42) as rec:
+                ward.recorder = rec
+                for _ in range(200):
+                    snap = ward.tick()
+            self.assertTrue(ward.alarm_storm_hooks.wait(timeout=5))
+            # Three events over the run: the burst crosses 10
+            # alarms in 60 s at 12 s and the trailing count
+            # falls back below 10 at 73 s — but with one nurse
+            # for twelve beds the storm ends with all 15 alarms
+            # still pending, so the acknowledged event fires
+            # only when the last of them is acked, at 103 s.
+            # The deliveries run in separate daemon threads, so
+            # their arrival order at the stub is not
+            # guaranteed — sort by event time before asserting.
+            self.assertEqual(len(received), 3)
+            payloads = sorted(
+                (json.loads(r[2]) for r in received),
+                key=lambda p: p["t"],
+            )
+            self.assertEqual(
+                [
+                    (p["event"], p["t"])
+                    for p in payloads
+                ],
+                [
+                    ("alarm_storm_started", 12.0),
+                    ("alarm_storm_ended", 73.0),
+                    ("alarm_storm_acknowledged", 103.0),
+                ],
+            )
+            ack = [
+                p for p in payloads
+                if p["event"] == "alarm_storm_acknowledged"
+            ][0]
+            self.assertEqual(ack["started_t"], 12.0)
+            self.assertEqual(ack["ack_t"], 103.0)
+            self.assertEqual(ack["time_to_ack_s"], 91.0)
+            self.assertEqual(ack["ack_shift"], "day")
+            self.assertEqual(ack["ack_nurses"], 1)
+            # Every event records that its hook was invoked.
+            for event in snap["alarm_storm"]["events"]:
+                self.assertTrue(event["hook_invoked"])
+            summary = ward.alarm_storm_summary()
+            self.assertEqual(summary["event_count"], 3)
+            self.assertEqual(
+                summary["alarm_storm_hooks"],
+                {"configured": True, "invoked": 3, "failed": 0, "retries": 0, "delivered": 3},
+            )
+            # The run summary carries the event count, the
+            # acknowledgement totals, and the per-storm record
+            # from the last tick.
+            run = summarize(path)
+            self.assertEqual(run["alarm_storm"]["event_count"], 3)
+            self.assertEqual(
+                run["alarm_storm"]["acknowledgement"],
+                summary["acknowledgement"],
+            )
+            self.assertEqual(
+                run["alarm_storm"]["storms"], summary["storms"]
+            )
+            self.assertFalse(run["alarm_storm"]["storm_active"])
         finally:
             server.shutdown()
             server.server_close()

@@ -1471,7 +1471,10 @@ class Ward:
         it never holds a storm open. A storm that ends with
         alarms still outstanding records how many were pending
         at the end; one whose alarms are all acked before the
-        run ends is acknowledged, the rest are not.
+        run ends is acknowledged, the rest are not — and the
+        tick a storm is recognised as acknowledged fires an
+        ``alarm_storm_acknowledged`` hook event, so a hook
+        hears when the nurses have actually caught up.
         """
         now = self.elapsed
         window_s = self.alarm_storm["window_s"]
@@ -1554,7 +1557,6 @@ class Ward:
                 open_storm["alarms_pending_at_end"] = len(
                     open_storm["outstanding"]
                 )
-                self._maybe_acknowledge_storm(open_storm)
                 self._fire_alarm_storm_event(
                     "alarm_storm_ended",
                     now,
@@ -1571,6 +1573,11 @@ class Ward:
                         "beds": sorted(open_storm["beds"]),
                     },
                 )
+                # A storm whose alarms are all acked already is
+                # acknowledged now — after the ended event, so
+                # the audit trail reads started, ended,
+                # acknowledged, in that order.
+                self._maybe_acknowledge_storm(open_storm)
                 self.alarm_storm_history.append(open_storm)
                 self._alarm_storm_open = None
 
@@ -1610,6 +1617,20 @@ class Ward:
         ack lands on the last alarm's ack time, and the record
         names the shift on duty then and how many nurses it
         had — the nurses who cleared the storm.
+
+        Marking a storm acknowledged fires an
+        ``alarm_storm_acknowledged`` hook event, once, in the
+        tick the acknowledgement is recognised — the tick the
+        storm ends, when its alarms were already acked, or the
+        tick the last alarm is acked, when it ends with alarms
+        still pending. The payload names the storm by when it
+        started, carries when it ended and how long it lasted,
+        its peak and total raises, how many alarms were acked,
+        when the last ack landed and how long that took from
+        the storm's start, and the shift on duty then with how
+        many nurses it had — so a hook hears not just that the
+        ward has calmed down but that the nurses have actually
+        caught up.
         """
         if storm["ended_t"] is None or storm["acknowledged"]:
             return
@@ -1627,6 +1648,25 @@ class Ward:
         storm["ack_shift"] = self.staffing.shift_at(storm["ack_t"])
         storm["ack_nurses"] = (
             self.staffing.on_shift(storm["ack_t"])["nurse"]
+        )
+        self._fire_alarm_storm_event(
+            "alarm_storm_acknowledged",
+            self.elapsed,
+            {
+                "started_t": storm["started_t"],
+                "ended_t": storm["ended_t"],
+                "duration_s": storm["duration_s"],
+                "threshold": self.alarm_storm["threshold"],
+                "window_s": self.alarm_storm["window_s"],
+                "peak_alarms_in_window": storm["peak"],
+                "alarms_raised": storm["total"],
+                "alarms_acked": storm["acked"],
+                "ack_t": storm["ack_t"],
+                "time_to_ack_s": storm["time_to_ack_s"],
+                "ack_shift": storm["ack_shift"],
+                "ack_nurses": storm["ack_nurses"],
+                "beds": sorted(storm["beds"]),
+            },
         )
 
     def _alarm_storm_view(self, storm):
@@ -1657,7 +1697,11 @@ class Ward:
         the storm's peak and total raises (on end), and the
         beds that raised them — so a hook can tell the outside
         world the ward is paging faster than anyone can keep
-        up with, and when it has settled again. The event is
+        up with, and when it has settled again. An
+        acknowledged event carries the same shape plus when
+        the last ack landed and how long that took from the
+        storm's start, and the shift on duty then with how
+        many nurses it had. The event is
         recorded on the audit trail with whether the hook was
         invoked for it, any synchronous error, and the retries
         and final delivery outcome.
@@ -1694,8 +1738,9 @@ class Ward:
         open storm, if any, is listed last with ``ended_t``
         null and its ack still in progress. ``event_count``
         counts every alarm-storm hook event this run — storms
-        starting and ending — and ``events`` lists them, each
-        with the tick, the storm's shape, and whether the
+        starting, ending, and being acknowledged — and
+        ``events`` lists them, each with the tick, the storm's
+        shape, and whether the
         ward's hooks were invoked for it (``hook_invoked``)
         and the retries and final delivery outcome
         (``hook_retries``, ``hook_final_status``);
