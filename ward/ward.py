@@ -53,7 +53,7 @@ class Ward:
     snapshot to a JSONL file.
     """
 
-    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None, cleaning_s=30.0, meds=None, triage=None, discharge_planning=None, cleaning_capacity=None, discharge_readiness=None, oxygen=None, infusions=None, consciousness=None, consciousness_dynamics=None, news2_trend=None, trend_alert_hooks=None, escalation_hooks=None, boarding_full_hooks=None, wait_time_hooks=None, missed_dose_hooks=None, discharge_readiness_hooks=None, discharge_priority_hooks=None, oxygen_outage_hooks=None, power_outage_hooks=None, sensor_drift_hooks=None, bed_blocker_hooks=None, network_outage_hooks=None, medication_stockout_hooks=None, pump_failure_hooks=None, news2_staffing_escalation=None):
+    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None, cleaning_s=30.0, meds=None, triage=None, discharge_planning=None, cleaning_capacity=None, discharge_readiness=None, oxygen=None, infusions=None, consciousness=None, consciousness_dynamics=None, news2_trend=None, trend_alert_hooks=None, escalation_hooks=None, boarding_full_hooks=None, wait_time_hooks=None, missed_dose_hooks=None, discharge_readiness_hooks=None, discharge_priority_hooks=None, oxygen_outage_hooks=None, power_outage_hooks=None, sensor_drift_hooks=None, bed_blocker_hooks=None, network_outage_hooks=None, medication_stockout_hooks=None, pump_failure_hooks=None, news2_staffing_escalation=None, labs=None):
         if not 1 <= beds <= 64:
             raise ValueError("beds must be 1..64")
         if rate_hz <= 0:
@@ -347,7 +347,12 @@ class Ward:
                 and i < len(consciousness_dynamics)
                 else None
             )
-            monitor = Monitor(i, profile, rng=self.rng, acuity=acuity, meds=bed_meds, on_oxygen=on_oxygen, infusion=bed_infusion, consciousness=bed_consciousness, consciousness_dynamics=bed_dynamics, news2_trend=self.news2_trend, trend_alert_hooks=self.trend_alert_hooks, escalation_hooks=self.escalation_hooks, missed_dose_hooks=self.missed_dose_hooks, discharge_readiness_hooks=self.discharge_readiness_hooks)
+            bed_labs = (
+                labs[i]
+                if labs is not None and i < len(labs)
+                else None
+            )
+            monitor = Monitor(i, profile, rng=self.rng, acuity=acuity, meds=bed_meds, on_oxygen=on_oxygen, infusion=bed_infusion, consciousness=bed_consciousness, consciousness_dynamics=bed_dynamics, news2_trend=self.news2_trend, trend_alert_hooks=self.trend_alert_hooks, escalation_hooks=self.escalation_hooks, missed_dose_hooks=self.missed_dose_hooks, discharge_readiness_hooks=self.discharge_readiness_hooks, labs=bed_labs)
             # With a timeline, beds start unadmitted and come online as
             # the timeline admits them; without one, all beds start open.
             if timeline is not None:
@@ -553,7 +558,7 @@ class Ward:
         # in, and before the snapshot, so the event is in it.
         # A tick where the order is unchanged fires nothing.
         self._check_priority_order()
-        snap = {"t": self.elapsed, "beds": readings, "staffing": self.staffing_summary(), "turnover": self.turnover_summary(), "meds": self.meds_summary(), "triage": self.triage_summary(), "arrivals": self.arrivals_summary(), "discharge": self.discharge_summary(), "discharge_readiness": self.readiness_summary(), "discharge_priority": self.discharge_priority_summary(), "early_warning": self.early_warning_summary(), "sensor_drift": self.sensor_drift_summary(), "bed_blocker": self.bed_blocker_summary(), "oxygen_outage": self.oxygen_outage_summary(), "power_outage": self.power_outage_summary(), "network_outage": self.network_outage_summary(), "medication_stockout": self.medication_stockout_summary(), "pump_failure": self.pump_failure_summary()}
+        snap = {"t": self.elapsed, "beds": readings, "staffing": self.staffing_summary(), "turnover": self.turnover_summary(), "meds": self.meds_summary(), "triage": self.triage_summary(), "arrivals": self.arrivals_summary(), "discharge": self.discharge_summary(), "discharge_readiness": self.readiness_summary(), "discharge_priority": self.discharge_priority_summary(), "early_warning": self.early_warning_summary(), "sensor_drift": self.sensor_drift_summary(), "bed_blocker": self.bed_blocker_summary(), "oxygen_outage": self.oxygen_outage_summary(), "power_outage": self.power_outage_summary(), "network_outage": self.network_outage_summary(), "medication_stockout": self.medication_stockout_summary(), "pump_failure": self.pump_failure_summary(), "lab_delay": self.lab_delay_summary()}
         with self._lock:
             self.latest = snap
         if self.recorder is not None:
@@ -1234,6 +1239,49 @@ class Ward:
             ),
         }
 
+    def lab_delay_summary(self):
+        """Per-bed lab-delay state and ward totals.
+
+        ``beds`` carries each bed's lab state — every ordered
+        result, when it was due, when it is now expected to land,
+        when it landed, how much it has been delayed, and when
+        its overdue alarm raised and cleared — ``beds_pending``
+        counts the beds still waiting on a result, ``beds_overdue``
+        counts the beds with a result past due, ``labs_pending`` /
+        ``labs_overdue`` / ``labs_landed`` count the results in
+        each state across the ward, ``labs_delayed`` counts the
+        results a delay event has pushed out, ``total_delayed_s``
+        is the seconds of delay applied, and ``overdue_raised``
+        counts the overdue alarms raised this run, so a client
+        can see at a glance how long the ward has been waiting
+        on the lab and how late the results are.
+        """
+        beds = [m.lab_delay_detail(self.elapsed) for m in self.monitors]
+        return {
+            "t": self.elapsed,
+            "beds": beds,
+            "beds_pending": sum(
+                1 for b in beds if b["pending"]
+            ),
+            "beds_overdue": sum(
+                1 for b in beds if b["overdue"]
+            ),
+            "labs_pending": sum(
+                len(b["pending"]) for b in beds
+            ),
+            "labs_overdue": sum(
+                len(b["overdue"]) for b in beds
+            ),
+            "labs_landed": sum(b["landed"] for b in beds),
+            "labs_delayed": sum(b["delayed"] for b in beds),
+            "total_delayed_s": round(
+                sum(b["total_delayed_s"] for b in beds), 3
+            ),
+            "overdue_raised": sum(
+                b["overdue_raised"] for b in beds
+            ),
+        }
+
     def bed_blocker_summary(self):
         """Per-bed bed-blocker state and ward totals.
 
@@ -1792,12 +1840,12 @@ class Ward:
         summary["cleaning_queue"] = self.cleaning_queue()
         return summary
 
-    def admit(self, bed_id, profile=None, acuity=None, on_oxygen=None, infusion=None, consciousness=None):
+    def admit(self, bed_id, profile=None, acuity=None, on_oxygen=None, infusion=None, consciousness=None, labs=None):
         """Admit a new patient to an available bed.
 
         Raises ValueError if the bed is occupied or still cleaning.
         """
-        self._monitor(bed_id).admit(self.elapsed, profile=profile, acuity=acuity, on_oxygen=on_oxygen, infusion=infusion, consciousness=consciousness)
+        self._monitor(bed_id).admit(self.elapsed, profile=profile, acuity=acuity, on_oxygen=on_oxygen, infusion=infusion, consciousness=consciousness, labs=labs)
 
     def _monitor(self, bed_id):
         if not 0 <= bed_id < self.beds:

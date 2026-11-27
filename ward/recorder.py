@@ -155,6 +155,7 @@ def summarize(path):
     last_network_outage = None
     last_medication_stockout = None
     last_pump_failure = None
+    last_lab_delay = None
     with open(path) as f:
         for line in f:
             line = line.strip()
@@ -228,6 +229,8 @@ def summarize(path):
                 last_medication_stockout = obj["medication_stockout"]
             if isinstance(obj.get("pump_failure"), dict):
                 last_pump_failure = obj["pump_failure"]
+            if isinstance(obj.get("lab_delay"), dict):
+                last_lab_delay = obj["lab_delay"]
             for bed in obj["beds"]:
                 b = bed["bed"]
                 if not bed.get("online", True):
@@ -825,6 +828,36 @@ def summarize(path):
                 ),
             }
             if last_pump_failure is not None
+            else None
+        ),
+        # Lab-delay totals from the last tick: how many beds are
+        # still waiting on a result, how many have one past due,
+        # how many results are pending, overdue, and landed, how
+        # many a delay event pushed out and by how much, and how
+        # many overdue alarms raised — plus each bed still
+        # waiting, with the results it is waiting on — so a run's
+        # late results and the discharges they held up are visible
+        # without replaying every tick.
+        "lab_delay": (
+            {
+                "beds_pending": last_lab_delay["beds_pending"],
+                "beds_overdue": last_lab_delay["beds_overdue"],
+                "labs_pending": last_lab_delay["labs_pending"],
+                "labs_overdue": last_lab_delay["labs_overdue"],
+                "labs_landed": last_lab_delay["labs_landed"],
+                "labs_delayed": last_lab_delay["labs_delayed"],
+                "total_delayed_s": last_lab_delay["total_delayed_s"],
+                "overdue_raised": last_lab_delay["overdue_raised"],
+                "beds": {
+                    str(b["bed"]): {
+                        "pending": b["pending"],
+                        "overdue": b["overdue"],
+                    }
+                    for b in last_lab_delay["beds"]
+                    if b["pending"] or b["overdue"]
+                },
+            }
+            if last_lab_delay is not None
             else None
         ),
     }

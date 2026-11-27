@@ -7,14 +7,15 @@ A patient is flagged discharge-ready when two things are true:
   alarms cleared (or from admission, if they never alarmed), and
 - all their orders are complete — no medication dose outstanding:
   nothing still waiting to be given, and no missed dose that has
-  not been followed by a given one. A patient with no medications
-  has no orders outstanding, so they are complete by default.
+  not been followed by a given one; and no lab result still pending.
+  A patient with no medications and no labs has no orders
+  outstanding, so they are complete by default.
 
-"Orders" here means medication orders: the only orders a patient
-carries in this simulator. A planned discharge order does not block
-readiness — a patient whose discharge is already ordered is exactly
-the patient this flag is for. The flag is advisory only: this is a
-test tool, not a clinical judgement.
+"Orders" here means medication orders and lab results: the only
+orders a patient carries in this simulator. A planned discharge order
+does not block readiness — a patient whose discharge is already ordered
+is exactly the patient this flag is for. The flag is advisory only:
+this is a test tool, not a clinical judgement.
 
 With ``auto_order`` on, the ward acts on the flag: the first tick a
 bed is discharge-ready, the ward raises a discharge-planning order

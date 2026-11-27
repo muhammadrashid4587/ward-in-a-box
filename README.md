@@ -11,8 +11,9 @@ A chaos engine injects the failures real ward software has to survive:
 device dropout, alarm storms, stale readings, network partitions
 between the ward and the server, network outages that cut the
 link to the central station while the monitors keep recording
-locally, pharmacy stockouts, and infusion pump failures that stop
-a patient's drug mid-infusion. An HTTP endpoint streams the vitals as
+locally, pharmacy stockouts, infusion pump failures that stop
+a patient's drug mid-infusion, and lab results that come back late
+and hold up a discharge. An HTTP endpoint streams the vitals as
 JSON lines so real health software can be tested against it, and a small
 CLI runs a scenario file.
 
@@ -285,6 +286,12 @@ python3 -m ward.cli scenarios/pump-failure.json --seed 42
 # endpoint is logged, never fatal)
 python3 -m ward.cli scenarios/pump-failure-hooks.json --seed 42
 
+# Lab-result delay: the lab is slow from 5 s, so bed 0's bloods
+# due at 30 land 120 s late at 150 — overdue from 30 to 150,
+# holding its discharge until 155 — while bed 1's bloods land on
+# time at 30 and it flags ready then
+python3 -m ward.cli scenarios/lab-delay.json --seed 42
+
 # Reproducible run
 python3 -m ward.cli scenarios/example.json --seed 42
 ```
@@ -375,6 +382,13 @@ python3 -m ward.cli scenarios/example.json --seed 42
   for want of the infusion, plus ward totals, the pump-failure
   event history, and the pump-failure hook totals, as JSON
   (503 while partitioned)
+- `GET /lab-delay` — per-bed lab-result state: every ordered
+  result, when it was due, when it is now expected to land,
+  when it landed, how much it has been delayed, and when its
+  overdue alarm raised and cleared, plus ward totals — how many
+  beds are waiting, how many have a result past due, and how
+  many results have landed, been delayed, and gone overdue —
+  as JSON (503 while partitioned)
 
 A reading looks like:
 
@@ -414,7 +428,7 @@ summary from `/news2`, and the sensor-drift summary from
 `/power-outage`, the network-outage summary from
 `/network-outage`, and the medication-stockout summary from
 `/medication-stockout`, and the pump-failure summary from
-`/pump-failure`, so a client gets bed occupancy, vitals, alarms, staffing,
+`/pump-failure`, and the lab-delay summary from `/lab-delay`, so a client gets bed occupancy, vitals, alarms, staffing,
 medication, and the intake queue in one message. Ping frames are answered with pong, close frames
 are echoed and the connection is then closed; text frames from the
 client are accepted and ignored — the ward pushes ticks, it takes no
@@ -587,6 +601,18 @@ Chaos types:
   with no infusion running has no pump to fail and is
   untouched. Once the pump restarts the drift recovers at
   `recovery_rate` per second. See Pump failure below.
+- `lab_delay` — the lab is running slow for `duration`
+  seconds; needs `\"lab\"`, a map with `\"name\"` (the lab
+  result that comes back late, required) and `\"delay_s\"` (how
+  many seconds late it lands, required). A result due inside
+  the window lands `delay_s` seconds late instead of on time;
+  while a result is past its due time and still not back, a
+  `lab_overdue` alarm raises until it lands, and a result still
+  pending is an outstanding order, so the patient is not
+  discharge-ready until every result is back. A result due
+  outside the window lands on time, one that has already landed
+  cannot be delayed, and a bed with no result of that name
+  ordered is untouched. See Lab-result delay below.
 
 `bed` targets one bed, `beds` targets several, neither targets all beds
 (`partition` is always ward-wide). Times are elapsed seconds from start.
@@ -1290,6 +1316,62 @@ over a seeded 70-tick run the same ward as
 restarts it at 60 s — POSTed to the configured webhook, with
 2 hook deliveries invoked and 0 failed against a stub server.
 
+## Lab-result delay
+
+A `lab_delay` chaos event makes the lab run slow for a window —
+a backed-up analyser, a porter queue, a lost sample — so a
+result due inside the window lands late instead of on time:
+
+```json
+{"type": "lab_delay", "bed": 0, "at": 5, "duration": 60,
+ "lab": {"name": "bloods", "delay_s": 120}}
+```
+
+Each patient can have lab results they are waiting on, set per
+patient in the scenario — `"labs": [{"name": "bloods",
+"due_at": 30}]` — the test or panel the result is for, and the
+elapsed seconds it is expected. A result lands at its due time
+unless a delay event covers it: a result due inside the event's
+window lands `delay_s` seconds late, once per event — a long
+window does not keep pushing the same result out tick after
+tick — and overlapping events for the same result add up. The
+delay is applied on the first tick of the event, to every result
+due inside its window, so a result due late in the window is
+pushed out as soon as the event starts, not when its due time
+arrives — the pushed landing time is visible in the summary
+from the start of the window. A result due outside the window
+lands on time, a result that has already landed cannot be
+delayed, and a bed with no result of that name ordered is
+untouched. While a result is past its due time and still not
+back, the bed raises a `lab_overdue` alarm, which clears the
+tick the result lands. A result still pending is an outstanding
+order: the patient is not discharge-ready until every result is
+back — a ward does not send a patient home while their bloods
+are still in the lab — so a late result holds the discharge,
+and the overdue alarm restarting the stability clock when it
+clears holds it a little longer. The lab is a property of the
+patient, not the monitor: the result lands whether or not the
+monitor is online — the lab does not care if the bedside
+monitor is dark — but the overdue alarm only shows in a reading
+the monitor actually emits. A new admission starts waiting on
+no results unless the scenario orders some for them. Every
+reading carries its bed's pending results (`"labs_pending"`),
+every snapshot carries a `"lab_delay"` object with the per-bed
+lab state — every ordered result, when it was due, when it is
+now expected to land, when it landed, how much it has been
+delayed, and when its overdue alarm raised and cleared — and
+ward totals (how many beds are waiting, how many have a result
+past due, how many results have landed, been delayed, and gone
+overdue), served on its own by `GET /lab-delay` and carried in
+every WebSocket frame, and the run summary (`--summary`)
+reports the same totals from the last tick. See
+`scenarios/lab-delay.json` for a runnable example: over a
+seeded 160-tick run bed 0's bloods due at 30 land 120 s late
+at 150, overdue from 30 to 150, and the bed flags ready at 155
+once its vitals have been quiet for 5 s after the alarm
+cleared, while bed 1's bloods land on time at 30 and it flags
+ready then.
+
 ## Medication-stockout hooks
 
 A medication stockout is the moment a ward most needs the outside
@@ -1869,9 +1951,10 @@ stable for a configurable window and all their orders are
 complete. Stable means no alarm raised in the window, measured from
 the last time their alarms cleared (or from admission, if they
 never alarmed) — an alarm storm restarts the clock. Orders means
-medication orders: no dose still waiting to be given, and no missed
-dose that has not been followed by a given one; a patient with no
-medications has nothing outstanding. A planned discharge order does
+medication orders and lab results: no dose still waiting to be
+given, no missed dose that has not been followed by a given one,
+and no lab result still pending; a patient with no medications
+and no labs has nothing outstanding. A planned discharge order does
 not block readiness — a patient whose discharge is already ordered
 is exactly the patient this flag is for. The flag is advisory only:
 this is a test tool, not a clinical judgement.
@@ -3531,3 +3614,13 @@ the hook totals.
   frame, a `GET /pump-failure` endpoint, and the run summary;
   off by default, configured per ward with `pump_failure_hooks`
   in the scenario) — done in v0.59.0
+- Lab-result delay (a `lab_delay` chaos event makes the lab run
+  slow for a window, so a result due inside it lands `delay_s`
+  seconds late — a `lab_overdue` alarm raises while a result is
+  past due and clears when it lands, and a result still pending
+  is an outstanding order, so the patient is not discharge-ready
+  until every result is back; the delay is applied once per
+  event, overlapping events add up, and the lab state rides in
+  every reading, a `"lab_delay"` object in every snapshot,
+  WebSocket frame, a `GET /lab-delay` endpoint, and the run
+  summary) — done in v0.60.0

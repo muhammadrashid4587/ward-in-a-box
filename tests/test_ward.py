@@ -38,6 +38,7 @@ from ward.alert_hooks import (
 from ward.chaos import ChaosEvent
 from ward.cli import build_ward, load_scenario, main
 from ward.discharge import DischargePlanner
+from ward.labs import LabSchedule, validate_lab
 from ward.escalation import (
     StaffingEscalation,
     validate_news2_staffing_escalation,
@@ -13077,6 +13078,454 @@ class TestPumpFailure(unittest.TestCase):
         # Seeded, so a second run reproduces every tick.
         ward2 = build_ward(cfg, seed=42)
         snaps2 = [ward2.tick() for _ in range(130)]
+        self.assertEqual(snaps, snaps2)
+
+
+class TestLabDelay(unittest.TestCase):
+    # A lab-result delay: bed 0's bloods are due at t=30, but the
+    # lab is slow from t=5 for 60 s, so they land 120 s late, at
+    # t=150 — overdue from 30 to 150, holding the discharge — while
+    # bed 1's bloods land on time at t=30 and it flags ready then.
+    LAB = {"name": "bloods", "delay_s": 120}
+
+    def _lab_ward(self):
+        return Ward(
+            beds=2,
+            profiles=["stable", "stable"],
+            labs=[
+                [{"name": "bloods", "due_at": 30}],
+                [{"name": "bloods", "due_at": 30}],
+            ],
+            chaos=[
+                ChaosEvent(
+                    "lab_delay",
+                    at=5,
+                    duration=60,
+                    bed=0,
+                    lab=self.LAB,
+                )
+            ],
+            discharge_readiness={"stable_window_s": 5},
+            seed=42,
+        )
+
+    def test_lab_config_validation(self):
+        # A lab result needs a name and a due time.
+        with self.assertRaises(ValueError):
+            validate_lab(None)
+        with self.assertRaises(ValueError):
+            validate_lab({"name": "", "due_at": 30})
+        with self.assertRaises(ValueError):
+            validate_lab({"name": "bloods"})
+        with self.assertRaises(ValueError):
+            validate_lab({"name": "bloods", "due_at": -1})
+        with self.assertRaises(ValueError):
+            validate_lab({"name": "bloods", "due_at": "soon"})
+        self.assertEqual(
+            validate_lab({"name": "Bloods", "due_at": 30}),
+            {"name": "Bloods", "due_at": 30.0},
+        )
+        # One result per name: a patient cannot wait on the same
+        # result twice.
+        with self.assertRaises(ValueError):
+            LabSchedule(
+                0,
+                [
+                    {"name": "bloods", "due_at": 30},
+                    {"name": "Bloods", "due_at": 60},
+                ],
+            )
+        # A lab-delay event needs a lab config with a name and a
+        # positive delay.
+        with self.assertRaises(ValueError):
+            ChaosEvent("lab_delay", at=0, duration=10, bed=0)
+        with self.assertRaises(ValueError):
+            ChaosEvent(
+                "lab_delay", at=0, duration=10, bed=0, lab="bloods"
+            )
+        with self.assertRaises(ValueError):
+            ChaosEvent(
+                "lab_delay",
+                at=0,
+                duration=10,
+                bed=0,
+                lab={"name": "bloods"},
+            )
+        with self.assertRaises(ValueError):
+            ChaosEvent(
+                "lab_delay",
+                at=0,
+                duration=10,
+                bed=0,
+                lab={"name": "bloods", "delay_s": 0},
+            )
+        ev = ChaosEvent(
+            "lab_delay",
+            at=0,
+            duration=10,
+            bed=0,
+            lab={"name": "Bloods", "delay_s": 120},
+        )
+        self.assertEqual(
+            ev.lab, {"name": "bloods", "delay_s": 120.0}
+        )
+
+    def test_lab_lands_on_time_without_delay(self):
+        ward = Ward(
+            beds=1,
+            profiles=["stable"],
+            labs=[[{"name": "bloods", "due_at": 30}]],
+            discharge_readiness={"stable_window_s": 5},
+            seed=42,
+        )
+        snaps = [ward.tick() for _ in range(40)]
+        # Pending until t=30, lands on time, never overdue.
+        self.assertEqual(
+            snaps[28]["beds"][0]["labs_pending"], ["bloods"]
+        )
+        self.assertNotIn("lab_overdue", snaps[28]["beds"][0]["alarms"])
+        self.assertEqual(snaps[29]["beds"][0]["labs_pending"], [])
+        self.assertNotIn("lab_overdue", snaps[29]["beds"][0]["alarms"])
+        # Ready the tick the result lands: vitals stable since
+        # admission, orders complete once the bloods are back.
+        self.assertTrue(snaps[29]["beds"][0]["discharge_ready"])
+        self.assertEqual(
+            snaps[29]["lab_delay"]["beds"][0]["labs"][0]["result_t"],
+            30.0,
+        )
+        self.assertEqual(snaps[29]["lab_delay"]["labs_landed"], 1)
+        self.assertEqual(snaps[29]["lab_delay"]["overdue_raised"], 0)
+        self.assertEqual(list(ward.monitors[0].alarm_history), [])
+
+    def test_lab_delayed_result_and_overdue_alarm(self):
+        ward = self._lab_ward()
+        snaps = [ward.tick() for _ in range(160)]
+        # Nothing is delayed before the event starts at t=5.
+        self.assertEqual(
+            snaps[3]["lab_delay"]["beds"][0]["labs"][0]["land_t"],
+            30.0,
+        )
+        # The delay lands on the first tick inside the window:
+        # the bloods due at 30 are now expected at 150.
+        self.assertEqual(
+            snaps[4]["lab_delay"]["beds"][0]["labs"][0]["land_t"],
+            150.0,
+        )
+        self.assertEqual(
+            snaps[4]["lab_delay"]["beds"][0]["labs"][0]["delayed_s"],
+            120.0,
+        )
+        # Still waiting at t=29, overdue from t=30, back at t=150.
+        self.assertEqual(
+            snaps[28]["beds"][0]["labs_pending"], ["bloods"]
+        )
+        self.assertNotIn("lab_overdue", snaps[28]["beds"][0]["alarms"])
+        self.assertEqual(
+            snaps[29]["beds"][0]["labs_pending"], ["bloods"]
+        )
+        self.assertIn("lab_overdue", snaps[29]["beds"][0]["alarms"])
+        self.assertIn("lab_overdue", snaps[148]["beds"][0]["alarms"])
+        self.assertNotIn("lab_overdue", snaps[149]["beds"][0]["alarms"])
+        self.assertEqual(snaps[149]["beds"][0]["labs_pending"], [])
+        # The alarm history records the wait exactly.
+        self.assertEqual(
+            list(ward.monitors[0].alarm_history),
+            [{"alarm": "lab_overdue", "raised_t": 30.0,
+              "cleared_t": 150.0}],
+        )
+        # The control bed's bloods land on time and never alarm.
+        self.assertEqual(snaps[29]["beds"][1]["labs_pending"], [])
+        self.assertTrue(
+            all(
+                "lab_overdue" not in s["beds"][1]["alarms"]
+                for s in snaps
+            )
+        )
+        # The per-bed detail and the ward totals at t=40.
+        detail = snaps[39]["lab_delay"]["beds"][0]
+        self.assertEqual(detail["labs"][0]["land_t"], 150.0)
+        self.assertEqual(detail["pending"], ["bloods"])
+        self.assertEqual(detail["overdue"], ["bloods"])
+        self.assertEqual(detail["delayed"], 1)
+        self.assertEqual(detail["total_delayed_s"], 120.0)
+        self.assertEqual(detail["overdue_raised"], 1)
+        summary = snaps[39]["lab_delay"]
+        self.assertEqual(summary["beds_pending"], 1)
+        self.assertEqual(summary["beds_overdue"], 1)
+        self.assertEqual(summary["labs_pending"], 1)
+        self.assertEqual(summary["labs_overdue"], 1)
+        self.assertEqual(summary["labs_landed"], 1)
+        self.assertEqual(summary["labs_delayed"], 1)
+        self.assertEqual(summary["total_delayed_s"], 120.0)
+        self.assertEqual(summary["overdue_raised"], 1)
+
+    def test_delay_only_for_results_due_in_window(self):
+        ward = Ward(
+            beds=3,
+            profiles=["stable", "stable", "stable"],
+            labs=[
+                [{"name": "bloods", "due_at": 30}],
+                [{"name": "troponin", "due_at": 30}],
+                [{"name": "bloods", "due_at": 100}],
+            ],
+            chaos=[
+                ChaosEvent(
+                    "lab_delay",
+                    at=5,
+                    duration=60,
+                    lab=self.LAB,
+                )
+            ],
+            seed=42,
+        )
+        snaps = [ward.tick() for _ in range(110)]
+        # Bed 0's bloods are due inside the window, so they are
+        # delayed to 150; bed 1's troponin is a different result,
+        # so it lands on time at 30; bed 2's bloods are due at
+        # 100, outside the window, so they land on time too.
+        self.assertEqual(
+            snaps[39]["lab_delay"]["beds"][0]["labs"][0]["land_t"],
+            150.0,
+        )
+        self.assertEqual(
+            snaps[39]["lab_delay"]["beds"][1]["labs"][0]["result_t"],
+            30.0,
+        )
+        self.assertEqual(
+            snaps[39]["lab_delay"]["beds"][2]["labs"][0]["land_t"],
+            100.0,
+        )
+        self.assertEqual(
+            snaps[99]["lab_delay"]["beds"][2]["labs"][0]["result_t"],
+            100.0,
+        )
+        self.assertEqual(snaps[109]["lab_delay"]["labs_delayed"], 1)
+        # The window runs to t=65, but the delay is applied once:
+        # the landing time stays 150 all the way through it.
+        self.assertTrue(
+            all(
+                s["lab_delay"]["beds"][0]["labs"][0]["land_t"] == 150.0
+                for s in snaps[4:65]
+            )
+        )
+
+    def test_overlapping_delays_add_up(self):
+        # Two slow windows over the same result: each delays it
+        # once, so the bloods due at 30 land 180 s late, at 210.
+        ward = Ward(
+            beds=1,
+            profiles=["stable"],
+            labs=[[{"name": "bloods", "due_at": 30}]],
+            chaos=[
+                ChaosEvent(
+                    "lab_delay",
+                    at=5,
+                    duration=60,
+                    bed=0,
+                    lab=self.LAB,
+                ),
+                ChaosEvent(
+                    "lab_delay",
+                    at=5,
+                    duration=60,
+                    bed=0,
+                    lab={"name": "bloods", "delay_s": 60},
+                ),
+            ],
+            seed=42,
+        )
+        snaps = [ward.tick() for _ in range(40)]
+        self.assertEqual(
+            snaps[39]["lab_delay"]["beds"][0]["labs"][0]["land_t"],
+            210.0,
+        )
+        self.assertEqual(
+            snaps[39]["lab_delay"]["beds"][0]["labs"][0]["delayed_s"],
+            180.0,
+        )
+        self.assertEqual(
+            snaps[39]["lab_delay"]["total_delayed_s"], 180.0
+        )
+
+    def test_pending_lab_blocks_readiness(self):
+        ward = self._lab_ward()
+        snaps = [ward.tick() for _ in range(160)]
+        # Bed 1 (no delay): ready the tick its bloods land, t=30.
+        self.assertFalse(snaps[28]["beds"][1]["discharge_ready"])
+        self.assertTrue(snaps[29]["beds"][1]["discharge_ready"])
+        # Bed 0: the bloods are late, so it waits — and the
+        # overdue alarm restarting the stability clock when it
+        # clears at t=150 means it flags ready 5 s later, at
+        # t=155, not the tick the result lands.
+        self.assertFalse(snaps[149]["beds"][0]["discharge_ready"])
+        self.assertFalse(snaps[153]["beds"][0]["discharge_ready"])
+        self.assertTrue(snaps[154]["beds"][0]["discharge_ready"])
+
+    def test_labs_clear_on_new_admission(self):
+        ward = Ward(
+            beds=2,
+            profiles=["stable", "stable"],
+            labs=[[{"name": "bloods", "due_at": 30}], []],
+            chaos=[
+                ChaosEvent(
+                    "lab_delay",
+                    at=5,
+                    duration=60,
+                    bed=0,
+                    lab=self.LAB,
+                )
+            ],
+            seed=42,
+            cleaning_s=1.0,
+        )
+        for _ in range(30):
+            ward.tick()
+        m = ward.monitors[0]
+        self.assertEqual(m.labs.pending, ["bloods"])
+        self.assertEqual(m.labs.overdue, ["bloods"])
+        # Discharged, cleaned, and re-admitted — the new patient
+        # waits on no results, even though the lab is still slow.
+        ward.discharge(0)
+        ward.tick()
+        ward.admit(0, profile="stable")
+        self.assertEqual(m.labs.pending, [])
+        self.assertEqual(m.labs.overdue, [])
+        self.assertEqual(m.labs.summary(31.0)["labs"], [])
+
+    def test_lab_delay_summary_and_endpoint(self):
+        ward = self._lab_ward()
+        snaps = [ward.tick() for _ in range(40)]
+        summary = snaps[39]["lab_delay"]
+        self.assertEqual(summary["beds_pending"], 1)
+        self.assertEqual(summary["beds_overdue"], 1)
+        self.assertEqual(summary["labs_delayed"], 1)
+        self.assertEqual(summary["total_delayed_s"], 120.0)
+        server, port = serve_in_thread(ward)
+        try:
+            status, body = get(port, "/lab-delay")
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                json.loads(body)["beds"][0]["labs"][0]["land_t"],
+                150.0,
+            )
+            self.assertEqual(
+                json.loads(body)["beds"][0]["overdue"], ["bloods"]
+            )
+            self.assertEqual(json.loads(body)["labs_overdue"], 1)
+        finally:
+            server.shutdown()
+            server.server_close()
+        # 503 while partitioned, like the other live endpoints.
+        partitioned = Ward(
+            beds=2,
+            chaos=[ChaosEvent("partition", at=1, duration=5)],
+            seed=4,
+        )
+        partitioned.tick()  # t=1: partitioned
+        server, port = serve_in_thread(partitioned)
+        try:
+            status, body = get(port, "/lab-delay")
+            self.assertEqual(status, 503)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_summary_reports_lab_delay(self):
+        ward = self._lab_ward()
+        path = os.path.join(tempfile.mkdtemp(), "run.jsonl")
+        with Recorder(path, ward.beds, ward.rate_hz, seed=42) as rec:
+            ward.recorder = rec
+            for _ in range(40):
+                ward.tick()
+        summary = summarize(path)
+        self.assertEqual(
+            summary["lab_delay"],
+            {
+                "beds_pending": 1,
+                "beds_overdue": 1,
+                "labs_pending": 1,
+                "labs_overdue": 1,
+                "labs_landed": 1,
+                "labs_delayed": 1,
+                "total_delayed_s": 120.0,
+                "overdue_raised": 1,
+                "beds": {
+                    "0": {
+                        "pending": ["bloods"],
+                        "overdue": ["bloods"],
+                    }
+                },
+            },
+        )
+
+    def test_websocket_carries_lab_delay(self):
+        ward = self._lab_ward()
+        for _ in range(10):
+            ward.tick()  # t=10: the bloods are delayed to 150
+        server, port = serve_in_thread(ward)
+        try:
+            ws = WsClient(port)
+            try:
+                msg = json.loads(ws.read_until_opcode(1))
+                # The frame is the next tick, t=11, so both beds
+                # are still waiting on their bloods.
+                self.assertEqual(
+                    msg["lab_delay"]["beds_pending"], 2
+                )
+                self.assertEqual(
+                    msg["lab_delay"]["labs_pending"], 2
+                )
+                self.assertEqual(
+                    msg["lab_delay"]["beds"][0]["labs"][0]["land_t"],
+                    150.0,
+                )
+                self.assertEqual(
+                    msg["beds"][0]["labs_pending"], ["bloods"]
+                )
+            finally:
+                ws.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_scenario_file_loads_and_runs(self):
+        cfg = load_scenario("scenarios/lab-delay.json")
+        self.assertEqual(len(cfg["chaos"]), 1)
+        self.assertEqual(cfg["chaos"][0].type, "lab_delay")
+        self.assertEqual(cfg["chaos"][0].lab, self.LAB)
+        self.assertEqual(
+            cfg["labs"],
+            [
+                [{"name": "bloods", "due_at": 30.0}],
+                [{"name": "bloods", "due_at": 30.0}],
+            ],
+        )
+        ward = build_ward(cfg, seed=42)
+        snaps = [ward.tick() for _ in range(160)]
+        # Bed 0's bloods are due at 30 but the lab is slow from
+        # 5 s: they land 120 s late, at 150, overdue from 30 to
+        # 150, and the bed flags ready at 155 once its vitals have
+        # been quiet for 5 s after the alarm cleared — while bed 1,
+        # whose bloods land on time, is ready at 30.
+        self.assertEqual(
+            snaps[58]["lab_delay"]["beds"][0]["labs"][0]["land_t"],
+            150.0,
+        )
+        self.assertEqual(
+            list(ward.monitors[0].alarm_history),
+            [{"alarm": "lab_overdue", "raised_t": 30.0,
+              "cleared_t": 150.0}],
+        )
+        self.assertTrue(snaps[29]["beds"][1]["discharge_ready"])
+        self.assertTrue(snaps[154]["beds"][0]["discharge_ready"])
+        self.assertEqual(snaps[159]["lab_delay"]["labs_landed"], 2)
+        self.assertEqual(snaps[159]["lab_delay"]["labs_delayed"], 1)
+        self.assertEqual(
+            snaps[159]["lab_delay"]["total_delayed_s"], 120.0
+        )
+        # Seeded, so a second run reproduces every tick.
+        ward2 = build_ward(cfg, seed=42)
+        snaps2 = [ward2.tick() for _ in range(160)]
         self.assertEqual(snaps, snaps2)
 
 

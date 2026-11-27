@@ -23,6 +23,7 @@ from .alert_hooks import (
 from .chaos import ChaosEvent
 from .discharge import DischargePlanner
 from .escalation import validate_news2_staffing_escalation
+from .labs import validate_lab
 from .news2 import (
     validate_consciousness,
     validate_consciousness_dynamics,
@@ -54,6 +55,7 @@ def load_scenario(path):
     consciousness = []
     consciousness_dynamics = []
     meds = []
+    labs = []
     for i, p in enumerate(data.get("patients", [])):
         profile = p.get("profile", "stable") if isinstance(p, dict) else p
         if profile not in PROFILES:
@@ -108,6 +110,16 @@ def load_scenario(path):
         names = [m["name"].lower() for m in meds[-1]]
         if len(set(names)) != len(names):
             raise ValueError("patient %d: duplicate medication names" % i)
+        bed_labs = p.get("labs", []) if isinstance(p, dict) else []
+        if not isinstance(bed_labs, list):
+            raise ValueError("patient %d: labs must be a list" % i)
+        try:
+            labs.append([validate_lab(l) for l in bed_labs])
+        except ValueError as e:
+            raise ValueError("patient %d: %s" % (i, e))
+        lab_names = [l["name"].lower() for l in labs[-1]]
+        if len(set(lab_names)) != len(lab_names):
+            raise ValueError("patient %d: duplicate lab names" % i)
     chaos = []
     for i, ev in enumerate(data.get("chaos", [])):
         if not isinstance(ev, dict):
@@ -129,6 +141,7 @@ def load_scenario(path):
                     network=ev.get("network"),
                     medication=ev.get("medication"),
                     pump=ev.get("pump"),
+                    lab=ev.get("lab"),
                 )
             )
         except KeyError as e:
@@ -371,6 +384,7 @@ def load_scenario(path):
         "consciousness": consciousness,
         "consciousness_dynamics": consciousness_dynamics,
         "meds": meds,
+        "labs": labs,
         "chaos": chaos,
         "timeline": timeline,
         "staffing": staffing,
@@ -411,6 +425,7 @@ def build_ward(cfg, seed=None, recorder=None):
         consciousness=cfg.get("consciousness"),
         consciousness_dynamics=cfg.get("consciousness_dynamics"),
         meds=cfg.get("meds"),
+        labs=cfg.get("labs"),
         chaos=cfg["chaos"],
         seed=seed,
         timeline=cfg.get("timeline"),

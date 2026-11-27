@@ -1,12 +1,12 @@
 """Chaos events: device dropout, alarm storms, stale readings, partitions,
 discharges, pharmacy stockouts, slow sensor drift, staff shortages, bed
 blockers, oxygen outages, power outages, network outages, medication
-stockouts, infusion pump failures."""
+stockouts, infusion pump failures, lab-result delays."""
 
 from .staffing import ROLES
 from .vitals import NORMAL, PLAUSIBLE
 
-VALID_TYPES = ("dropout", "alarm_storm", "stale", "partition", "discharge", "stockout", "sensor_drift", "staff_shortage", "bed_blocker", "oxygen_outage", "power_outage", "network_outage", "medication_stockout", "pump_failure")
+VALID_TYPES = ("dropout", "alarm_storm", "stale", "partition", "discharge", "stockout", "sensor_drift", "staff_shortage", "bed_blocker", "oxygen_outage", "power_outage", "network_outage", "medication_stockout", "pump_failure", "lab_delay")
 
 # Default readings a monitor buffers locally while the network is
 # down, per bed, before the oldest drops off — ten minutes at
@@ -17,6 +17,46 @@ DEFAULT_NETWORK_BACKLOG_CAP = 300
 # an isolation clean after an infectious patient, or an equipment
 # fault on the bed itself.
 BLOCK_REASONS = ("porter", "isolation_clean", "equipment_fault")
+
+
+def validate_lab_delay(lab):
+    """A lab-delay config: ``{"name": ..., "delay_s": ...}``.
+
+    ``name`` is required: the lab result that comes back late —
+    a non-empty string, matched case-insensitively against the
+    patients' ordered results. ``delay_s`` is required: how many
+    seconds late the result lands — a positive finite number. A
+    config with no name or no delay does nothing at all, so it
+    is rejected. Which results are delayed is not part of the
+    timing: a result due inside the event's window is delayed,
+    one due outside it is not, and a result that has already
+    landed cannot be delayed at all.
+    """
+    if not isinstance(lab, dict):
+        raise ValueError(
+            "lab_delay needs a lab config, got %r" % (lab,)
+        )
+    name = lab.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError(
+            "lab_delay needs a lab name, got %r" % (name,)
+        )
+    delay_s = lab.get("delay_s")
+    if (
+        not isinstance(delay_s, (int, float))
+        or isinstance(delay_s, bool)
+        or delay_s != delay_s
+        or delay_s in (float("inf"), float("-inf"))
+        or delay_s <= 0
+    ):
+        raise ValueError(
+            "lab_delay: delay_s must be a positive finite number, "
+            "got %r" % (delay_s,)
+        )
+    return {
+        "name": name.strip().lower(),
+        "delay_s": float(delay_s),
+    }
 
 
 def validate_medication_stockout(medication):
@@ -442,9 +482,23 @@ class ChaosEvent:
     part of the event. Once the pump is running again the
     drift shrinks back toward zero at ``recovery_rate`` per
     second.
+    ``lab_delay`` needs ``lab`` (see
+    :func:`validate_lab_delay`): the lab is running slow for
+    the window — a backed-up analyser, a porter queue, a lost
+    sample — so a result due inside the window lands
+    ``delay_s`` seconds late instead of on time. While a result
+    is past its due time and still not back, the bed raises a
+    ``lab_overdue`` alarm, which clears the tick the result
+    lands, and a result still pending is an outstanding order,
+    so the patient is not discharge-ready until every result
+    is back. A result due outside the window lands on time,
+    a result that has already landed cannot be delayed, and a
+    bed with no result of that name ordered is untouched.
+    One event delays a result once, however long its window
+    runs, and overlapping events for the same result add up.
     """
 
-    def __init__(self, type, at, duration=None, bed=None, beds=None, med=None, drift=None, shortage=None, reason=None, oxygen=None, power=None, network=None, medication=None, pump=None):
+    def __init__(self, type, at, duration=None, bed=None, beds=None, med=None, drift=None, shortage=None, reason=None, oxygen=None, power=None, network=None, medication=None, pump=None, lab=None):
         if type not in VALID_TYPES:
             raise ValueError("unknown chaos type: %r" % type)
         if type == "stockout":
@@ -455,6 +509,8 @@ class ChaosEvent:
             med = medication["med"]
         if type == "pump_failure":
             pump = validate_pump(pump)
+        if type == "lab_delay":
+            lab = validate_lab_delay(lab)
         if type == "sensor_drift":
             drift = validate_drift(drift)
         if type == "staff_shortage":
@@ -489,6 +545,7 @@ class ChaosEvent:
         self.network = network
         self.medication = medication
         self.pump = pump
+        self.lab = lab
 
     @property
     def end(self):
@@ -841,6 +898,20 @@ class ChaosEngine:
                     m = ward.monitors[b]
                     m.pump_failure_until = ev.end
                     m.pump_failure_cfg = ev.pump
+            elif ev.type == "lab_delay":
+                # The lab is running slow for the window. A
+                # result due inside it lands late instead of on
+                # time; the monitor's schedule holds the pushed
+                # landing time (see LabSchedule.apply_delay),
+                # gated on the bed actually having a result of
+                # that name due inside the window, so a bed with
+                # no such result is untouched. The delay is
+                # applied once per event — the schedule
+                # remembers which events already delayed each
+                # result — so a long window does not keep
+                # pushing the same result out tick after tick.
+                for b in ev.targets(ward):
+                    ward.monitors[b].apply_lab_delay(ev)
             elif ev.type == "dropout":
                 for b in ev.targets(ward):
                     ward.monitors[b].offline_until = ev.end

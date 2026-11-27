@@ -10,6 +10,7 @@ from .alert_hooks import (
     validate_trend_alert_hooks,
 )
 from .chaos import DEFAULT_NETWORK_BACKLOG_CAP
+from .labs import LabSchedule
 from .meds import MedSchedule
 from .news2 import (
     ACVPU_LEVELS,
@@ -51,7 +52,7 @@ class Monitor:
     seconds); the monitor clears each one when its time passes.
     """
 
-    def __init__(self, bed_id, profile="stable", rng=None, acuity=3, meds=None, on_oxygen=False, infusion=None, consciousness="alert", consciousness_dynamics=None, news2_trend=None, trend_alert_hooks=None, escalation_hooks=None, missed_dose_hooks=None, discharge_readiness_hooks=None):
+    def __init__(self, bed_id, profile="stable", rng=None, acuity=3, meds=None, on_oxygen=False, infusion=None, consciousness="alert", consciousness_dynamics=None, news2_trend=None, trend_alert_hooks=None, escalation_hooks=None, missed_dose_hooks=None, discharge_readiness_hooks=None, labs=None):
         self.bed_id = bed_id
         self.profile = profile
         self.acuity = validate_acuity(acuity)
@@ -104,6 +105,14 @@ class Monitor:
         self.meds = MedSchedule(
             bed_id, meds, missed_dose_hooks=self.missed_dose_hooks
         )
+        # Lab results: the results this patient is waiting on, each
+        # expected at its due time and landing then unless a
+        # lab_delay event pushes it out (see ward.labs). A result
+        # still pending is an outstanding order, so the patient is
+        # not discharge-ready until every result is back — and a
+        # result past its due time raises a lab_overdue alarm
+        # until it lands.
+        self.labs = LabSchedule(bed_id, labs)
         self.rng = rng if rng is not None else random.Random()
         self.signs = initial_signs(profile, self.rng, self.acuity)
         # Slow sensor drift: the accumulated bias per vital, in the
@@ -658,6 +667,32 @@ class Monitor:
             "drifting": bool(self.pump_failure_drift),
         }
 
+    def apply_lab_delay(self, event):
+        """Push out the lab results a lab-delay event covers.
+
+        Called by the chaos engine once per tick while the event
+        is active; the schedule delays each result due inside
+        the event's window once (see :meth:`ward.labs.LabSchedule.apply_delay`),
+        so a long window does not keep pushing the same result
+        out tick after tick.
+        """
+        self.labs.apply_delay(event)
+
+    def lab_delay_detail(self, now):
+        """Per-bed lab-delay state as plain JSON data.
+
+        ``labs`` lists every ordered result — when it was due,
+        when it is now expected to land, when it landed, how
+        much it has been delayed, and when its overdue alarm
+        raised and cleared — ``pending`` / ``overdue`` name the
+        results still waiting and the ones past due, and the
+        counts say how many have landed, been delayed, and gone
+        overdue this stay.
+        """
+        detail = self.labs.summary(now)
+        detail["admitted"] = self.admitted
+        return detail
+
     def bed_blocker_detail(self, now):
         """Per-bed bed-blocker state as plain JSON data.
 
@@ -779,12 +814,13 @@ class Monitor:
         # so the run totals still count this stay's flips.
         self._ready = False
         self.meds.reset()
+        self.labs.reset()
         self.admitted = False
         self.cleaning_until = round(now + cleaning_s, 3)
         self.turnovers += 1
         self.total_cleaning_s = round(self.total_cleaning_s + cleaning_s, 3)
 
-    def admit(self, now, profile=None, acuity=None, on_oxygen=None, infusion=None, consciousness=None):
+    def admit(self, now, profile=None, acuity=None, on_oxygen=None, infusion=None, consciousness=None, labs=None):
         """Admit a new patient to an available bed.
 
         Raises ValueError if the bed is occupied, still cleaning,
@@ -797,6 +833,9 @@ class Monitor:
         the previous patient's infusion never carries over — and
         is Alert unless ``consciousness`` says otherwise: the
         previous patient's consciousness never carries over either.
+        The new patient waits on no lab results unless ``labs``
+        orders some: the previous patient's results — landed or
+        still pending — never carry over.
         """
         state = self.state(now)
         if state == "occupied":
@@ -876,6 +915,7 @@ class Monitor:
         self.admitted = True
         self._stable_since = round(now, 3)
         self.meds.reset()
+        self.labs.reset(labs)
 
     def meds_tick(self, now, load_factor, stockout_meds=()):
         """Advance the medication schedule (no-op while unadmitted)."""
@@ -1136,6 +1176,12 @@ class Monitor:
             self.blocked_reason = None
         if not self.admitted:
             return None
+        # Lab results land whether or not the monitor is online:
+        # the lab does not care if the bedside monitor is dark,
+        # offline, or stale — so a result lands on time and goes
+        # overdue on schedule, and only the overdue alarm itself
+        # waits for a reading the monitor actually emits.
+        self.labs.tick(now)
         # A power outage runs the monitor on battery until the
         # battery dies, then the monitor goes dark: no readings,
         # alarms neither raise nor clear, exactly like a dropout
@@ -1250,9 +1296,15 @@ class Monitor:
             "oxygen_deficit": self.oxygen_deficit,
             "med_stockout_drift": dict(self.med_stockout_drift),
             "pump_failure_drift": dict(self.pump_failure_drift),
+            "labs_pending": self.labs.pending,
             **reported,
         }
         reading["alarms"] = alarms_for(reported)
+        if self.labs.overdue:
+            # A result past its due time and still not back raises
+            # an alarm until it lands — the lab is keeping the
+            # ward waiting, and the discharge decision with it.
+            reading["alarms"] = reading["alarms"] + ["lab_overdue"]
         if self.meds.missed_active:
             # A missed dose raises an alarm until that medication's
             # next dose is given.
@@ -1742,7 +1794,7 @@ class Monitor:
             "ready": ready,
             "ready_t": now,
             "stable_s": self.stable_s(now) if self.admitted else 0.0,
-            "orders_complete": self.meds.orders_complete(),
+            "orders_complete": self.orders_complete(),
             "news2": dict(news2) if news2 is not None else None,
         }
         self.readiness_history.append(event)
@@ -1753,15 +1805,26 @@ class Monitor:
         event["hook_invoked"] = result["invoked"]
         event["hook_errors"] = result["errors"]
 
+    def orders_complete(self):
+        """True when no order is outstanding: no medication dose
+        still waiting to be given and no missed dose that has not
+        been followed by a given one — and no lab result still
+        pending. A patient with no medications and no labs has
+        nothing outstanding, so they are complete by default."""
+        return (
+            self.meds.orders_complete()
+            and self.labs.orders_complete()
+        )
+
     def discharge_ready(self, now, stable_window_s):
         """True when the patient is discharge-ready: admitted, vitals
         stable for at least ``stable_window_s`` seconds, and all
-        medication orders complete."""
+        orders complete — medication orders and lab results both."""
         if not self.admitted:
             return False
         return (
             self.stable_s(now) >= stable_window_s
-            and self.meds.orders_complete()
+            and self.orders_complete()
         )
 
     def readiness_detail(self, now, stable_window_s, auto_ordered=False):
@@ -1788,7 +1851,7 @@ class Monitor:
             "admitted": self.admitted,
             "stable_s": self.stable_s(now) if self.admitted else 0.0,
             "stable_window_s": float(stable_window_s),
-            "orders_complete": self.meds.orders_complete(),
+            "orders_complete": self.orders_complete(),
             "auto_ordered": bool(auto_ordered),
             "news2": dict(news2) if news2 is not None else None,
             "readiness_events": [dict(e) for e in self.readiness_history],
