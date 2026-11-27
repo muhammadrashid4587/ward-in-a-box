@@ -155,6 +155,11 @@ def make_handler(ward):
                     self._send_json(503, {"error": "partitioned"})
                     return
                 self._send_json(200, ward.medication_stockout_summary())
+            elif path == "/pump-failure":
+                if ward.partitioned:
+                    self._send_json(503, {"error": "partitioned"})
+                    return
+                self._send_json(200, ward.pump_failure_summary())
             elif path == "/stream":
                 if ward.partitioned:
                     self._send_json(503, {"error": "partitioned"})
@@ -264,6 +269,7 @@ def make_handler(ward):
                         "medication_stockout": (
                             ward.medication_stockout_summary()
                         ),
+                        "pump_failure": ward.pump_failure_summary(),
                     }
                     send(OP_TEXT, json.dumps(msg))
                     stop.wait(1.0 / ward.rate_hz)

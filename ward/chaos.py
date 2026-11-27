@@ -1,12 +1,12 @@
 """Chaos events: device dropout, alarm storms, stale readings, partitions,
 discharges, pharmacy stockouts, slow sensor drift, staff shortages, bed
 blockers, oxygen outages, power outages, network outages, medication
-stockouts."""
+stockouts, infusion pump failures."""
 
 from .staffing import ROLES
 from .vitals import NORMAL, PLAUSIBLE
 
-VALID_TYPES = ("dropout", "alarm_storm", "stale", "partition", "discharge", "stockout", "sensor_drift", "staff_shortage", "bed_blocker", "oxygen_outage", "power_outage", "network_outage", "medication_stockout")
+VALID_TYPES = ("dropout", "alarm_storm", "stale", "partition", "discharge", "stockout", "sensor_drift", "staff_shortage", "bed_blocker", "oxygen_outage", "power_outage", "network_outage", "medication_stockout", "pump_failure")
 
 # Default readings a monitor buffers locally while the network is
 # down, per bed, before the oldest drops off — ten minutes at
@@ -64,6 +64,50 @@ def validate_medication_stockout(medication):
         )
     return {
         "med": med.strip().lower(),
+        "drift": drift,
+        "recovery_rate": float(recovery_rate),
+    }
+
+
+def validate_pump(pump):
+    """An infusion-pump-failure config: ``{"drift": ..., "recovery_rate": ...}``.
+
+    ``drift`` is required: a map of vital to drift rate per
+    second (see :func:`validate_drift`) — how fast the
+    patient's true vitals move once their infusion has
+    stopped, because the drug is no longer holding them where
+    it was: a stalled insulin infusion lets the heart rate
+    climb, a stalled noradrenaline infusion lets the pressure
+    fall. ``recovery_rate`` is how fast each vital's drift
+    shrinks back toward zero per second once the pump is
+    running again (default the largest absolute drift rate) —
+    a positive finite number. A config with no drift does
+    nothing at all, so it is rejected. Which drug stops is
+    not part of the config: it is the patient's own infusion
+    (see ``Monitor.infusion``) — the pump delivers whatever
+    the patient is on, and a bed with no infusion running has
+    no pump to fail.
+    """
+    if not isinstance(pump, dict):
+        raise ValueError(
+            "pump_failure needs a pump config, got %r" % (pump,)
+        )
+    drift = validate_drift(pump.get("drift"))
+    recovery_rate = pump.get(
+        "recovery_rate", max(abs(r) for r in drift.values())
+    )
+    if (
+        not isinstance(recovery_rate, (int, float))
+        or isinstance(recovery_rate, bool)
+        or recovery_rate != recovery_rate
+        or recovery_rate in (float("inf"), float("-inf"))
+        or recovery_rate <= 0
+    ):
+        raise ValueError(
+            "pump_failure: recovery_rate must be a positive "
+            "finite number, got %r" % (recovery_rate,)
+        )
+    return {
         "drift": drift,
         "recovery_rate": float(recovery_rate),
     }
@@ -382,10 +426,25 @@ class ChaosEvent:
     starts recovering when the stock comes back, not when the
     dose is finally given. Without ``bed``/``beds`` it applies
     to every bed that has the medication prescribed, like
-    ``stockout``.
+    ``stockout``. ``pump_failure`` needs ``pump`` (see
+    :func:`validate_pump`): a bedside infusion pump fails for
+    the window — an occlusion, a dead battery, a door left
+    open — so the infusion it was delivering stops and the
+    patient on that bed drifts off their drug: their true
+    vitals move by the configured ``drift`` rates per second
+    while the pump is down, so the alarms, the NEWS2 score,
+    trend alerts, and escalations all respond exactly as they
+    would to a patient genuinely deteriorating off their
+    infusion, and a ``pump_failure`` alarm raises while the
+    pump is down. Only a bed with an infusion running is
+    affected — a bed with no infusion has no pump to fail —
+    and which drug stops is the patient's own infusion, not
+    part of the event. Once the pump is running again the
+    drift shrinks back toward zero at ``recovery_rate`` per
+    second.
     """
 
-    def __init__(self, type, at, duration=None, bed=None, beds=None, med=None, drift=None, shortage=None, reason=None, oxygen=None, power=None, network=None, medication=None):
+    def __init__(self, type, at, duration=None, bed=None, beds=None, med=None, drift=None, shortage=None, reason=None, oxygen=None, power=None, network=None, medication=None, pump=None):
         if type not in VALID_TYPES:
             raise ValueError("unknown chaos type: %r" % type)
         if type == "stockout":
@@ -394,6 +453,8 @@ class ChaosEvent:
         if type == "medication_stockout":
             medication = validate_medication_stockout(medication)
             med = medication["med"]
+        if type == "pump_failure":
+            pump = validate_pump(pump)
         if type == "sensor_drift":
             drift = validate_drift(drift)
         if type == "staff_shortage":
@@ -427,6 +488,7 @@ class ChaosEvent:
         self.power = power
         self.network = network
         self.medication = medication
+        self.pump = pump
 
     @property
     def end(self):
@@ -740,6 +802,21 @@ class ChaosEngine:
                     m = ward.monitors[b]
                     m.med_stockout_until = ev.end
                     m.med_stockout_cfg = ev.medication
+            elif ev.type == "pump_failure":
+                # The bedside infusion pump has failed for the
+                # window. The monitor holds the failure end and
+                # the config; the drift itself grows and recovers
+                # in the monitor tick (see
+                # Monitor._step_pump_failure), gated on the bed
+                # actually having an infusion running, so a bed
+                # with no infusion never drifts. An overlapping
+                # event only extends the window and refreshes
+                # the config, like the medication stockout
+                # above.
+                for b in ev.targets(ward):
+                    m = ward.monitors[b]
+                    m.pump_failure_until = ev.end
+                    m.pump_failure_cfg = ev.pump
             elif ev.type == "dropout":
                 for b in ev.targets(ward):
                     ward.monitors[b].offline_until = ev.end

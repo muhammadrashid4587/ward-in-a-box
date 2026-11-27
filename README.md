@@ -9,9 +9,10 @@ default, each with a virtual monitor emitting vitals (heart rate, SpO2,
 blood pressure, temperature, respiratory rate) at a configurable rate.
 A chaos engine injects the failures real ward software has to survive:
 device dropout, alarm storms, stale readings, network partitions
-between the ward and the server, and network outages that cut the
+between the ward and the server, network outages that cut the
 link to the central station while the monitors keep recording
-locally. An HTTP endpoint streams the vitals as
+locally, pharmacy stockouts, and infusion pump failures that stop
+a patient's drug mid-infusion. An HTTP endpoint streams the vitals as
 JSON lines so real health software can be tested against it, and a small
 CLI runs a scenario file.
 
@@ -271,6 +272,13 @@ python3 -m ward.cli scenarios/medication-stockout.json --seed 42
 # endpoint; a dead endpoint is logged, never fatal)
 python3 -m ward.cli scenarios/medication-stockout-hooks.json --seed 42
 
+# Infusion pump failure: bed 0's insulin pump stops from 5 s to
+# 60 s — a pump_failure alarm raises at 5 s and the patient's
+# heart rate climbs 0.5 bpm a tick to +27.5 by 59 s, then recovers
+# 1.0 bpm a tick once the pump restarts and is back to zero at
+# 87 s, while bed 1, with no infusion running, is untouched
+python3 -m ward.cli scenarios/pump-failure.json --seed 42
+
 # Reproducible run
 python3 -m ward.cli scenarios/example.json --seed 42
 ```
@@ -355,6 +363,11 @@ python3 -m ward.cli scenarios/example.json --seed 42
   of the drug, plus ward totals, the stockout event history, and
   the medication-stockout hook totals, as JSON
   (503 while partitioned)
+- `GET /pump-failure` — per-bed infusion-pump-failure state:
+  whether each pump is down, which infusion it was delivering,
+  when it is running again, and how far each vital has drifted
+  for want of the infusion, plus ward totals, as JSON
+  (503 while partitioned)
 
 A reading looks like:
 
@@ -393,7 +406,8 @@ summary from `/news2`, and the sensor-drift summary from
 `/oxygen-outage`, the power-outage summary from
 `/power-outage`, the network-outage summary from
 `/network-outage`, and the medication-stockout summary from
-`/medication-stockout`, so a client gets bed occupancy, vitals, alarms, staffing,
+`/medication-stockout`, and the pump-failure summary from
+`/pump-failure`, so a client gets bed occupancy, vitals, alarms, staffing,
 medication, and the intake queue in one message. Ping frames are answered with pong, close frames
 are echoed and the connection is then closed; text frames from the
 client are accepted and ignored — the ward pushes ticks, it takes no
@@ -552,6 +566,20 @@ Chaos types:
   inside the window misses nothing and never drifts. Once the
   stock returns the drift recovers at `recovery_rate` per
   second. See Medication stockout below.
+- `pump_failure` — a bedside infusion pump fails for `duration`
+  seconds; needs `\"pump\"`, a map with `\"drift\"` (a map of
+  vital to drift rate per second, required — for example
+  `{\"heart_rate\": 0.5}`), and `\"recovery_rate\"` (how fast each
+  vital's drift shrinks back per second once the pump is running
+  again, default the largest absolute drift rate). While it is
+  down the infusion it was delivering stops, so a patient with
+  an infusion running drifts: their true vitals move by the
+  configured rates per second, the alarms, the NEWS2 score,
+  trend alerts, and escalations all respond, and a
+  `pump_failure` alarm raises until the pump restarts. A bed
+  with no infusion running has no pump to fail and is
+  untouched. Once the pump restarts the drift recovers at
+  `recovery_rate` per second. See Pump failure below.
 
 `bed` targets one bed, `beds` targets several, neither targets all beds
 (`partition` is always ward-wide). Times are elapsed seconds from start.
@@ -1148,6 +1176,63 @@ the first missed dose to +25.0 at 59 s — reading 100.36 with
 the NEWS2 heart-rate component at 1 — then recovers 1.0 bpm a
 tick once the stock returns and is back to zero at 84 s, while
 the control bed, with no metoprolol prescribed, never drifts.
+
+## Pump failure
+
+A `pump_failure` chaos event stops a bedside infusion pump for
+a window — an occlusion, a dead battery, a door left open — so
+the patient on that bed stops getting their infusion and drifts
+off their drug:
+
+```json
+{"type": "pump_failure", "at": 5, "duration": 55,
+ "pump": {"drift": {"heart_rate": 0.5},
+          "recovery_rate": 1.0}}
+```
+
+A patient runs an infusion when their scenario entry names one
+(`"infusion": "insulin"`), the drug the pump is delivering —
+the event itself names no drug, because the pump delivers
+whatever its patient is on. While the pump is down, a patient
+with an infusion running has their true vitals move by the
+configured `drift` rates per second — a stalled insulin infusion
+lets the heart rate climb, a stalled noradrenaline infusion lets
+the pressure fall — so the low or high alarms, the NEWS2 score,
+trend alerts, and escalations all respond exactly as they would
+to a patient genuinely deteriorating off their infusion, and a
+`pump_failure` alarm raises the tick the pump fails and clears
+the tick it restarts. It is a real change, not a sensor error:
+the drift is added to the patient's walked vitals, like the
+medication-stockout drift, and the reported reading is still
+clamped inside the plausible envelope. A bed with no infusion
+running has no pump to fail: its pump is down in the summary but
+its vitals never move and it never alarms. Once the pump is
+running again the drift shrinks back toward zero at
+`recovery_rate` per second. The drift is cleared on a new
+admission, like the oxygen deficit — and the new patient starts
+with no infusion unless one is named for them. Every reading
+carries its drift (`"pump_failure_drift"`) and its infusion
+(`"infusion"`), every snapshot carries a `"pump_failure"` object
+with the per-bed pump state — whether the pump is down, which
+infusion it was delivering, when it restarts, and how far each
+vital has drifted — and ward totals (how many beds are affected,
+how many are drifting, which infusions are stopped, and the
+largest drift per vital), served on its own by `GET /pump-failure`
+and carried in every WebSocket frame, and the run summary
+(`--summary`) reports the same totals from the last tick. One
+honest limitation, shared with the medication stockout: the drift
+has no cap of its own — a very long failure keeps drifting the
+patient until the pump restarts, and only the plausible-envelope
+clamp on the reported reading bounds it, so a scenario with a
+long window should use a modest rate. See
+`scenarios/pump-failure.json` for a runnable example: over a
+seeded 130-tick run the pump is down from 5 s to 60 s, the
+`pump_failure` alarm raises at 5 s and clears at 60 s, and the
+patient's heart rate climbs 0.5 bpm a tick to +27.5 at 59 s —
+reading 102.86 with the NEWS2 heart-rate component at 1 — then
+recovers 1.0 bpm a tick once the pump restarts and is back to
+zero at 87 s, while the control bed, with no infusion running,
+never drifts.
 
 ## Medication-stockout hooks
 
@@ -2610,7 +2695,17 @@ window, the drift clearing on a new admission, the
 `/medication-stockout` endpoint (503 while partitioned), the run
 summary, the WebSocket frame, and the
 `medication-stockout.json` scenario skipping 2 metoprolol doses
-and giving 2 over a seeded run. Triage tests cover a patient waiting while the ward is
+and giving 2 over a seeded run. Pump-failure tests cover config
+validation and the recovery-rate default, infusion validation,
+the heart-rate drift ramping exactly 0.5 bpm a tick from the
+pump failing to +27.5 and recovering 1.0 bpm a tick once the
+pump restarts, the `pump_failure` alarm raising at 5 s and
+clearing at 60 s, no drift for a bed with no infusion running,
+the drift clearing on a new admission, the `/pump-failure`
+endpoint (503 while partitioned), the run summary, the WebSocket
+frame, and the `pump-failure.json` scenario with a ward-wide
+failure drifting only the bed on an infusion over a seeded run.
+Triage tests cover a patient waiting while the ward is
 full, admission with fresh vitals when a bed frees up, a critical
 patient jumping the queue, FIFO order within one acuity, diversion
 when the queue is full, wait metrics (mean, max, longest current
@@ -3347,3 +3442,16 @@ the hook totals.
   frame, a `GET /medication-stockout` endpoint, and the run
   summary; off by default, configured per ward with
   `medication_stockout_hooks` in the scenario) — done in v0.57.0
+- Pump failure (a `pump_failure` chaos event stops a bedside
+  infusion pump for a window — an occlusion, a dead battery, a
+  door left open — so a patient with an infusion running drifts
+  off their drug: their true vitals move by the configured
+  `drift` rates per second while the pump is down, so the alarms,
+  the NEWS2 score, trend alerts, and escalations all respond, and
+  a `pump_failure` alarm raises until the pump restarts; a bed
+  with no infusion running has no pump to fail and is untouched;
+  once the pump restarts the drift recovers at `recovery_rate`
+  per second; the drift rides in every reading, a
+  `"pump_failure"` object in every snapshot, WebSocket frame, a
+  `GET /pump-failure` endpoint, and the run summary) — done in
+  v0.58.0

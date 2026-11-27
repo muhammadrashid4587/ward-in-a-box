@@ -154,6 +154,7 @@ def summarize(path):
     last_power_outage = None
     last_network_outage = None
     last_medication_stockout = None
+    last_pump_failure = None
     with open(path) as f:
         for line in f:
             line = line.strip()
@@ -225,6 +226,8 @@ def summarize(path):
                 last_network_outage = obj["network_outage"]
             if isinstance(obj.get("medication_stockout"), dict):
                 last_medication_stockout = obj["medication_stockout"]
+            if isinstance(obj.get("pump_failure"), dict):
+                last_pump_failure = obj["pump_failure"]
             for bed in obj["beds"]:
                 b = bed["bed"]
                 if not bed.get("online", True):
@@ -782,6 +785,27 @@ def summarize(path):
                 ),
             }
             if last_medication_stockout is not None
+            else None
+        ),
+        # Pump-failure totals from the last tick: how many beds
+        # have their pump down, how many are drifting off their
+        # infusion, which infusions are stopped, the largest
+        # drift per vital, and each drifting bed's drift — so a
+        # run's failed pumps and their clinical cost are visible
+        # without replaying every tick.
+        "pump_failure": (
+            {
+                "beds_affected": last_pump_failure["beds_affected"],
+                "beds_drifting": last_pump_failure["beds_drifting"],
+                "infusions": last_pump_failure["infusions"],
+                "max_drift": last_pump_failure["max_drift"],
+                "beds": {
+                    str(b["bed"]): b["drift"]
+                    for b in last_pump_failure["beds"]
+                    if b["drifting"]
+                },
+            }
+            if last_pump_failure is not None
             else None
         ),
     }

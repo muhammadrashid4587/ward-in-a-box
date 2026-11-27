@@ -51,11 +51,12 @@ class Monitor:
     seconds); the monitor clears each one when its time passes.
     """
 
-    def __init__(self, bed_id, profile="stable", rng=None, acuity=3, meds=None, on_oxygen=False, consciousness="alert", consciousness_dynamics=None, news2_trend=None, trend_alert_hooks=None, escalation_hooks=None, missed_dose_hooks=None, discharge_readiness_hooks=None):
+    def __init__(self, bed_id, profile="stable", rng=None, acuity=3, meds=None, on_oxygen=False, infusion=None, consciousness="alert", consciousness_dynamics=None, news2_trend=None, trend_alert_hooks=None, escalation_hooks=None, missed_dose_hooks=None, discharge_readiness_hooks=None):
         self.bed_id = bed_id
         self.profile = profile
         self.acuity = validate_acuity(acuity)
         self.on_oxygen = self._validate_on_oxygen(on_oxygen)
+        self.infusion = self._validate_infusion(infusion)
         self.consciousness = validate_consciousness(consciousness)
         self.consciousness_dynamics = validate_consciousness_dynamics(
             consciousness_dynamics
@@ -223,6 +224,26 @@ class Monitor:
         self.med_stockout_until = None
         self.med_stockout_cfg = None
         self.med_stockout_drift = {}
+        # Infusion pump failure: the bedside pump has failed
+        # until ``pump_failure_until`` (elapsed seconds), with
+        # ``pump_failure_cfg`` carrying the drift rates and the
+        # recovery rate. While the pump is down and this bed has
+        # an infusion running (``self.infusion`` — the medication
+        # name, lower-cased, or None), the patient's true vitals
+        # drift by the configured rates — a real deterioration
+        # off their drug, not a sensor error — held in
+        # ``pump_failure_drift`` per vital, in that vital's own
+        # units. Once the pump is running again the drift shrinks
+        # back toward zero at the recovery rate. Only vitals with
+        # a non-zero drift are listed. The drift is a property of
+        # the patient, not the sensor: it feeds the alarms and
+        # the NEWS2 score exactly like the medication-stockout
+        # drift does, and it is cleared on a new admission, like
+        # the deficit. A bed with no infusion running never
+        # drifts — it has no pump to fail.
+        self.pump_failure_until = None
+        self.pump_failure_cfg = None
+        self.pump_failure_drift = {}
         self.seq = 0
         # False until the ward admits this bed (scenario timeline); an
         # unadmitted bed emits no readings at all.
@@ -305,6 +326,21 @@ class Monitor:
                 "on_oxygen must be a bool, got %r" % (on_oxygen,)
             )
         return on_oxygen
+
+    @staticmethod
+    def _validate_infusion(infusion):
+        """A running infusion: the medication name, lower-cased,
+        or None for a bed with no infusion running. A non-string
+        or blank name is rejected — an infusion that names no
+        drug is a scenario error, not a bed with no infusion."""
+        if infusion is None:
+            return None
+        if not isinstance(infusion, str) or not infusion.strip():
+            raise ValueError(
+                "infusion must be a medication name or None, got %r"
+                % (infusion,)
+            )
+        return infusion.strip().lower()
 
     def is_blocked(self, now):
         """True while a bed-blocker event holds this bed: it cannot
@@ -593,6 +629,35 @@ class Monitor:
             "drifting": bool(self.med_stockout_drift),
         }
 
+    def pump_failure_detail(self, now):
+        """Per-bed infusion-pump-failure state as plain JSON data.
+
+        ``failure_active`` is True while a pump-failure event
+        holds this bed's pump down, with when it is running
+        again; ``infusion`` is the medication the pump was
+        delivering (None for a bed with no infusion running,
+        which has no pump to fail); ``drift`` is how far each
+        vital has moved from the patient's walked vitals for
+        want of the infusion, and ``drifting`` is True while
+        any vital is off — including after the pump restarts,
+        while the patient is still recovering.
+        """
+        active = (
+            self.pump_failure_until is not None
+            and now < self.pump_failure_until
+        )
+        return {
+            "bed": self.bed_id,
+            "admitted": self.admitted,
+            "infusion": self.infusion,
+            "failure_active": active,
+            "failure_until": (
+                self.pump_failure_until if active else None
+            ),
+            "drift": dict(self.pump_failure_drift),
+            "drifting": bool(self.pump_failure_drift),
+        }
+
     def bed_blocker_detail(self, now):
         """Per-bed bed-blocker state as plain JSON data.
 
@@ -719,7 +784,7 @@ class Monitor:
         self.turnovers += 1
         self.total_cleaning_s = round(self.total_cleaning_s + cleaning_s, 3)
 
-    def admit(self, now, profile=None, acuity=None, on_oxygen=None, consciousness=None):
+    def admit(self, now, profile=None, acuity=None, on_oxygen=None, infusion=None, consciousness=None):
         """Admit a new patient to an available bed.
 
         Raises ValueError if the bed is occupied, still cleaning,
@@ -728,6 +793,8 @@ class Monitor:
         patient's readings and alarms do not carry over. The new
         patient is not on oxygen unless ``on_oxygen`` says so —
         the previous patient's oxygen flag never carries over — and
+        has no infusion running unless ``infusion`` names one:
+        the previous patient's infusion never carries over — and
         is Alert unless ``consciousness`` says otherwise: the
         previous patient's consciousness never carries over either.
         """
@@ -750,6 +817,7 @@ class Monitor:
         self.on_oxygen = self._validate_on_oxygen(
             False if on_oxygen is None else on_oxygen
         )
+        self.infusion = self._validate_infusion(infusion)
         self.consciousness = validate_consciousness(
             "alert" if consciousness is None else consciousness
         )
@@ -771,7 +839,11 @@ class Monitor:
         # The medication-stockout drift goes the same way: the
         # new patient starts on their own drug levels, and a
         # stockout still running starts drifting them again
-        # from zero on their first missed dose.
+        # from zero on their first missed dose. The
+        # pump-failure drift goes the same way: the new patient
+        # starts on their own infusion, and a pump failure still
+        # running starts drifting them again from zero — if they
+        # have an infusion at all.
         # A power outage goes the same way for the dark flag:
         # the new patient starts with a live monitor, and an
         # outage still running starts draining the battery
@@ -782,6 +854,7 @@ class Monitor:
         self.oxygen_deficit = 0.0
         self.oxygen_floor_hit = False
         self.med_stockout_drift = {}
+        self.pump_failure_drift = {}
         self.power_went_dark = False
         self.power_dark_ticks = 0
         # A new admission starts with an empty network backlog:
@@ -932,6 +1005,51 @@ class Monitor:
                         drift + step, 3
                     )
 
+    def _step_pump_failure(self, now, dt=1.0):
+        """Grow or recover the infusion-pump-failure drift for
+        this tick.
+
+        Only a bed with an infusion running is affected: while
+        the pump is down, each configured vital drifts by its
+        rate per second — a real deterioration, not a sensor
+        error, so the alarms and the NEWS2 score see it exactly
+        like a patient coming off their infusion would. Once
+        the pump is running again the drift shrinks by the
+        event's ``recovery_rate`` per second until the patient
+        is back to their walked vitals. The drift is pure
+        arithmetic on dt — no RNG — so a seeded run reproduces
+        it exactly. A bed with no infusion running never drifts;
+        a pump failure on it is recorded in the summary but
+        changes no vitals.
+        """
+        if self.pump_failure_cfg is None or self.infusion is None:
+            return
+        cfg = self.pump_failure_cfg
+        active = (
+            self.pump_failure_until is not None
+            and now < self.pump_failure_until
+        )
+        if active:
+            for vital, rate in cfg["drift"].items():
+                self.pump_failure_drift[vital] = round(
+                    self.pump_failure_drift.get(vital, 0.0)
+                    + rate * dt,
+                    3,
+                )
+        elif self.pump_failure_drift:
+            step = cfg["recovery_rate"] * dt
+            for vital in list(self.pump_failure_drift):
+                drift = self.pump_failure_drift[vital]
+                if abs(drift) <= step:
+                    self.pump_failure_drift.pop(vital, None)
+                elif drift > 0:
+                    self.pump_failure_drift[vital] = round(
+                        drift - step, 3
+                    )
+                else:
+                    self.pump_failure_drift[vital] = round(
+                        drift + step, 3
+                    )
 
     def reported_signs(self):
         """The vitals as the sensor reports them: true vitals
@@ -947,12 +1065,15 @@ class Monitor:
         patient drifting off a stocked-out medication reports
         the walked vitals plus the medication drift — also a
         real change, so the alarms and the NEWS2 score see it
-        exactly like the oxygen deficit."""
+        exactly like the oxygen deficit. A patient drifting off
+        a failed infusion pump reports the walked vitals plus
+        the pump drift the same way."""
         out = {}
         for key, value in self.signs.items():
             lo, hi = PLAUSIBLE[key]
             v = value + self.sensor_drift.get(key, 0.0)
             v += self.med_stockout_drift.get(key, 0.0)
+            v += self.pump_failure_drift.get(key, 0.0)
             if key == "spo2" and self.oxygen_deficit > 0:
                 floor = (
                     self.oxygen_outage_cfg["floor"]
@@ -1089,6 +1210,14 @@ class Monitor:
         # patient with no dose due inside the window never drifts.
         self._step_med_stockout(now, dt)
 
+        # An infusion pump failure drifts a patient whose
+        # infusion has stopped before the reading is built, so
+        # this tick's reading, alarms, and NEWS2 score already
+        # carry the drift — and a patient recovering after the
+        # pump restarts climbs back just as fast. A bed with no
+        # infusion running never drifts.
+        self._step_pump_failure(now, dt)
+
         # Consciousness moves before the reading is built, so this
         # tick's reading, score, and snapshot already carry the new
         # level — a change is visible in the same tick it happens.
@@ -1113,12 +1242,14 @@ class Monitor:
             "profile": self.profile,
             "acuity": self.acuity,
             "on_oxygen": self.on_oxygen,
+            "infusion": self.infusion,
             "consciousness": self.consciousness,
             "stale": False,
             "on_battery": on_battery,
             "sensor_drift": dict(self.sensor_drift),
             "oxygen_deficit": self.oxygen_deficit,
             "med_stockout_drift": dict(self.med_stockout_drift),
+            "pump_failure_drift": dict(self.pump_failure_drift),
             **reported,
         }
         reading["alarms"] = alarms_for(reported)
@@ -1126,6 +1257,15 @@ class Monitor:
             # A missed dose raises an alarm until that medication's
             # next dose is given.
             reading["alarms"] = reading["alarms"] + ["missed_dose"]
+        if (
+            self.infusion is not None
+            and self.pump_failure_until is not None
+            and now < self.pump_failure_until
+        ):
+            # A failed infusion pump raises an alarm until the
+            # pump is running again — the device fault itself,
+            # not the drift it causes.
+            reading["alarms"] = reading["alarms"] + ["pump_failure"]
         # NEWS2 early-warning score for this tick's vitals. The
         # score is a parallel track to the alarm list: it never
         # adds or removes an alarm, so alarm counts and readiness

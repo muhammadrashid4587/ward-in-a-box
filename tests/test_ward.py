@@ -12694,6 +12694,383 @@ class TestMedicationStockout(unittest.TestCase):
         self.assertEqual(snaps, snaps2)
 
 
+class TestPumpFailure(unittest.TestCase):
+    # An infusion pump failure: bed 0's insulin pump stops from
+    # t=5 for 55 s, so the patient drifts off their infusion —
+    # their heart rate climbs 0.5 bpm a tick while the pump is
+    # down, then recovers 1.0 bpm a tick once it restarts — and
+    # a pump_failure alarm raises until the pump is running
+    # again. Bed 1, with no infusion running, has no pump to
+    # fail and never drifts.
+    PUMP = {
+        "drift": {"heart_rate": 0.5},
+        "recovery_rate": 1.0,
+    }
+
+    def _pump_ward(self):
+        return Ward(
+            beds=2,
+            profiles=["stable", "stable"],
+            infusions=["insulin", None],
+            chaos=[
+                ChaosEvent(
+                    "pump_failure",
+                    at=5,
+                    duration=55,
+                    bed=0,
+                    pump=self.PUMP,
+                )
+            ],
+            seed=42,
+        )
+
+    def test_pump_config_validation(self):
+        # A pump-failure event needs a pump config.
+        with self.assertRaises(ValueError):
+            ChaosEvent("pump_failure", at=0, duration=10, bed=0)
+        with self.assertRaises(ValueError):
+            ChaosEvent(
+                "pump_failure",
+                at=0,
+                duration=10,
+                bed=0,
+                pump="insulin",
+            )
+        # The drift map is required: unknown vitals and all-zero
+        # rates are rejected, like a sensor drift.
+        for bad_drift in (None, {}, {"heart_rate": 0}, {"wbc": 0.5}):
+            with self.assertRaises(ValueError):
+                ChaosEvent(
+                    "pump_failure",
+                    at=0,
+                    duration=10,
+                    bed=0,
+                    pump={"drift": bad_drift},
+                )
+        # The recovery rate must be positive too.
+        with self.assertRaises(ValueError):
+            ChaosEvent(
+                "pump_failure",
+                at=0,
+                duration=10,
+                bed=0,
+                pump={"drift": {"heart_rate": 0.5}, "recovery_rate": 0},
+            )
+        # Defaults: the recovery rate is the largest absolute
+        # drift rate unless told otherwise.
+        ev = ChaosEvent(
+            "pump_failure",
+            at=0,
+            duration=10,
+            bed=0,
+            pump={"drift": {"heart_rate": 0.5, "systolic": -1.0}},
+        )
+        self.assertEqual(
+            ev.pump,
+            {
+                "drift": {"heart_rate": 0.5, "systolic": -1.0},
+                "recovery_rate": 1.0,
+            },
+        )
+        ev = ChaosEvent(
+            "pump_failure",
+            at=0,
+            duration=10,
+            bed=0,
+            pump=self.PUMP,
+        )
+        self.assertEqual(ev.pump, self.PUMP)
+
+    def test_infusion_validation(self):
+        # An infusion is a medication name or nothing at all.
+        with self.assertRaises(ValueError):
+            Monitor(0, infusion="")
+        with self.assertRaises(ValueError):
+            Monitor(0, infusion=42)
+        self.assertEqual(Monitor(0, infusion="Insulin").infusion, "insulin")
+        self.assertIsNone(Monitor(0).infusion)
+
+    def test_vitals_drift_while_pump_down(self):
+        ward = self._pump_ward()
+        snaps = [ward.tick() for _ in range(60)]
+        # Nothing drifts before the pump fails at t=5.
+        self.assertEqual(
+            snaps[3]["beds"][0]["pump_failure_drift"], {}
+        )
+        # The drift ramps exactly: 0.5 bpm a tick from t=5,
+        # so 27.5 bpm by t=59 — and the reported heart rate
+        # carries it, while the control bed never drifts.
+        self.assertEqual(
+            snaps[4]["beds"][0]["pump_failure_drift"],
+            {"heart_rate": 0.5},
+        )
+        self.assertEqual(
+            snaps[58]["beds"][0]["pump_failure_drift"],
+            {"heart_rate": 27.5},
+        )
+        self.assertEqual(snaps[58]["beds"][0]["heart_rate"], 102.86)
+        self.assertTrue(
+            all(
+                s["beds"][1]["pump_failure_drift"] == {}
+                for s in snaps
+            )
+        )
+        # The drift is a real deterioration: the heart-rate
+        # component of the NEWS2 score climbs with it.
+        self.assertEqual(
+            snaps[58]["beds"][0]["news2"]["components"]["heart_rate"],
+            1,
+        )
+        self.assertEqual(snaps[58]["beds"][0]["news2"]["score"], 1)
+        # The per-bed detail: the failure window and the drift.
+        detail = snaps[29]["pump_failure"]["beds"][0]
+        self.assertTrue(detail["failure_active"])
+        self.assertEqual(detail["failure_until"], 60.0)
+        self.assertEqual(detail["infusion"], "insulin")
+        self.assertEqual(detail["drift"], {"heart_rate": 13.0})
+        self.assertTrue(detail["drifting"])
+        summary = snaps[29]["pump_failure"]
+        self.assertEqual(summary["beds_affected"], 1)
+        self.assertEqual(summary["beds_drifting"], 1)
+        self.assertEqual(summary["infusions"], ["insulin"])
+        self.assertEqual(
+            summary["max_drift"], {"heart_rate": 13.0}
+        )
+
+    def test_pump_failure_alarm(self):
+        ward = self._pump_ward()
+        snaps = [ward.tick() for _ in range(70)]
+        # The alarm raises the tick the pump fails and clears
+        # the tick it restarts — the control bed never alarms.
+        self.assertNotIn("pump_failure", snaps[3]["beds"][0]["alarms"])
+        self.assertIn("pump_failure", snaps[4]["beds"][0]["alarms"])
+        self.assertIn("pump_failure", snaps[58]["beds"][0]["alarms"])
+        self.assertNotIn("pump_failure", snaps[59]["beds"][0]["alarms"])
+        self.assertTrue(
+            all(
+                "pump_failure" not in s["beds"][1]["alarms"]
+                for s in snaps
+            )
+        )
+        self.assertEqual(
+            list(ward.monitors[0].alarm_history),
+            [{"alarm": "pump_failure", "raised_t": 5.0,
+              "cleared_t": 60.0}],
+        )
+
+    def test_drift_recovers_after_pump_restarts(self):
+        ward = self._pump_ward()
+        snaps = [ward.tick() for _ in range(90)]
+        # The pump restarts at t=60: the drift shrinks 1.0 bpm
+        # a tick from 27.5, so 26.5 at t=60 and back to zero —
+        # and out of the map — at t=87.
+        self.assertEqual(
+            snaps[59]["beds"][0]["pump_failure_drift"],
+            {"heart_rate": 26.5},
+        )
+        self.assertEqual(
+            snaps[85]["beds"][0]["pump_failure_drift"],
+            {"heart_rate": 0.5},
+        )
+        self.assertEqual(
+            snaps[86]["beds"][0]["pump_failure_drift"], {}
+        )
+        self.assertFalse(
+            snaps[89]["pump_failure"]["beds"][0]["drifting"]
+        )
+        self.assertEqual(
+            snaps[89]["pump_failure"]["beds_drifting"], 0
+        )
+        self.assertEqual(
+            snaps[89]["pump_failure"]["max_drift"], {}
+        )
+
+    def test_no_drift_without_infusion(self):
+        # A ward-wide pump failure with no infusion running
+        # anywhere: the pumps are down, but nothing drifts and
+        # no alarm raises, because there is no infusion to stop.
+        ward = Ward(
+            beds=2,
+            profiles=["stable", "stable"],
+            chaos=[
+                ChaosEvent(
+                    "pump_failure",
+                    at=5,
+                    duration=55,
+                    pump=self.PUMP,
+                )
+            ],
+            seed=42,
+        )
+        snaps = [ward.tick() for _ in range(70)]
+        self.assertTrue(
+            all(
+                s["beds"][0]["pump_failure_drift"] == {}
+                for s in snaps
+            )
+        )
+        # Both pumps are down inside the window, but neither
+        # bed is drifting and no infusion is stopped.
+        self.assertEqual(snaps[29]["pump_failure"]["beds_affected"], 2)
+        self.assertEqual(snaps[29]["pump_failure"]["beds_drifting"], 0)
+        self.assertEqual(snaps[29]["pump_failure"]["infusions"], [])
+        self.assertNotIn("pump_failure", snaps[69]["beds"][0]["alarms"])
+
+    def test_drift_clears_on_new_admission(self):
+        ward = Ward(
+            beds=2,
+            profiles=["stable", "stable"],
+            infusions=["insulin", None],
+            chaos=[
+                ChaosEvent(
+                    "pump_failure",
+                    at=5,
+                    duration=55,
+                    bed=0,
+                    pump=self.PUMP,
+                )
+            ],
+            seed=42,
+            cleaning_s=1.0,
+        )
+        for _ in range(30):
+            ward.tick()
+        m = ward.monitors[0]
+        self.assertEqual(m.pump_failure_drift, {"heart_rate": 13.0})
+        # Discharged, cleaned, and re-admitted — the new patient
+        # starts with no drift and no infusion, even though the
+        # pump is still down.
+        ward.discharge(0)
+        ward.tick()
+        ward.admit(0, profile="stable")
+        self.assertEqual(m.pump_failure_drift, {})
+        self.assertIsNone(m.infusion)
+
+    def test_pump_failure_summary_and_endpoint(self):
+        ward = self._pump_ward()
+        snaps = [ward.tick() for _ in range(40)]
+        summary = snaps[39]["pump_failure"]
+        self.assertEqual(summary["beds_affected"], 1)
+        self.assertEqual(summary["beds_drifting"], 1)
+        self.assertEqual(summary["infusions"], ["insulin"])
+        self.assertEqual(summary["max_drift"], {"heart_rate": 18.0})
+        server, port = serve_in_thread(ward)
+        try:
+            status, body = get(port, "/pump-failure")
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                json.loads(body)["beds"][0]["drift"],
+                {"heart_rate": 18.0},
+            )
+            self.assertEqual(json.loads(body)["infusions"], ["insulin"])
+        finally:
+            server.shutdown()
+            server.server_close()
+        # 503 while partitioned, like the other live endpoints.
+        partitioned = Ward(
+            beds=2,
+            chaos=[ChaosEvent("partition", at=1, duration=5)],
+            seed=4,
+        )
+        partitioned.tick()  # t=1: partitioned
+        server, port = serve_in_thread(partitioned)
+        try:
+            status, body = get(port, "/pump-failure")
+            self.assertEqual(status, 503)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_summary_reports_pump_failure(self):
+        ward = self._pump_ward()
+        path = os.path.join(tempfile.mkdtemp(), "run.jsonl")
+        with Recorder(path, ward.beds, ward.rate_hz, seed=42) as rec:
+            ward.recorder = rec
+            for _ in range(40):
+                ward.tick()
+        summary = summarize(path)
+        self.assertEqual(
+            summary["pump_failure"],
+            {
+                "beds_affected": 1,
+                "beds_drifting": 1,
+                "infusions": ["insulin"],
+                "max_drift": {"heart_rate": 18.0},
+                "beds": {"0": {"heart_rate": 18.0}},
+            },
+        )
+
+    def test_websocket_carries_pump_failure(self):
+        ward = self._pump_ward()
+        for _ in range(10):
+            ward.tick()  # t=10: the drift is 3.0
+        server, port = serve_in_thread(ward)
+        try:
+            ws = WsClient(port)
+            try:
+                msg = json.loads(ws.read_until_opcode(1))
+                # The frame is the next tick, t=11, so the drift
+                # has grown one more step past the t=10 tick.
+                self.assertEqual(
+                    msg["pump_failure"]["beds_affected"], 1
+                )
+                self.assertTrue(
+                    msg["pump_failure"]["beds"][0][
+                        "failure_active"
+                    ]
+                )
+                self.assertEqual(
+                    msg["pump_failure"]["beds"][0]["drift"],
+                    {"heart_rate": 3.5},
+                )
+                self.assertEqual(
+                    msg["beds"][0]["pump_failure_drift"],
+                    {"heart_rate": 3.5},
+                )
+            finally:
+                ws.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_scenario_file_loads_and_runs(self):
+        cfg = load_scenario("scenarios/pump-failure.json")
+        self.assertEqual(len(cfg["chaos"]), 1)
+        self.assertEqual(cfg["chaos"][0].type, "pump_failure")
+        self.assertEqual(cfg["chaos"][0].pump, self.PUMP)
+        self.assertEqual(cfg["infusions"], ["insulin", None])
+        ward = build_ward(cfg, seed=42)
+        snaps = [ward.tick() for _ in range(130)]
+        # Ward-wide, so both beds' pumps are down from t=5 to
+        # t=60 — but only the bed on an insulin infusion drifts,
+        # 0.5 bpm a tick from t=5 to 27.5 at t=59, then back to
+        # zero by t=87 once the pump restarts.
+        self.assertEqual(
+            snaps[58]["pump_failure"]["beds_affected"], 2
+        )
+        self.assertEqual(
+            snaps[58]["pump_failure"]["beds_drifting"], 1
+        )
+        self.assertEqual(
+            snaps[58]["beds"][0]["pump_failure_drift"],
+            {"heart_rate": 27.5},
+        )
+        self.assertEqual(
+            snaps[86]["beds"][0]["pump_failure_drift"], {}
+        )
+        # The pump_failure alarm raises at 5 s and clears at
+        # 60 s, when the pump restarts.
+        self.assertEqual(
+            list(ward.monitors[0].alarm_history),
+            [{"alarm": "pump_failure", "raised_t": 5.0,
+              "cleared_t": 60.0}],
+        )
+        # Seeded, so a second run reproduces every tick.
+        ward2 = build_ward(cfg, seed=42)
+        snaps2 = [ward2.tick() for _ in range(130)]
+        self.assertEqual(snaps, snaps2)
+
+
 class TestMedicationStockoutHooks(unittest.TestCase):
     # Medication-stockout hooks: a stockout starting or ending
     # fires the ward's medication_stockout_hooks — the same
