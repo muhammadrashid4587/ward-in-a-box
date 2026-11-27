@@ -26,6 +26,7 @@ from ward.alert_hooks import (
     validate_discharge_readiness_hooks,
     validate_escalation_hooks,
     validate_lab_delay_hooks,
+    validate_lab_overdue_hooks,
     validate_medication_stockout_hooks,
     validate_missed_dose_hooks,
     validate_network_outage_hooks,
@@ -13467,6 +13468,18 @@ class TestLabDelay(unittest.TestCase):
                     "retries": 0,
                     "delivered": 0,
                 },
+                # One overdue hook event so far too — bed 0's
+                # bloods went overdue at 30 s; they do not land
+                # until 150 s, past this 40-tick run — and no
+                # overdue hooks are configured either.
+                "lab_overdue_event_count": 1,
+                "lab_overdue_hooks": {
+                    "configured": False,
+                    "invoked": 0,
+                    "failed": 0,
+                    "retries": 0,
+                    "delivered": 0,
+                },
             },
         )
 
@@ -14496,6 +14509,355 @@ class TestLabDelayHooks(unittest.TestCase):
             )
             self.assertEqual(
                 run["lab_delay"]["lab_delay_hooks"][
+                    "invoked"
+                ],
+                2,
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+class TestLabOverdueHooks(unittest.TestCase):
+    # Lab-overdue hooks: a result going overdue — past its due
+    # time and still not back — or landing after being overdue
+    # fires the ward's lab_overdue_hooks — the same
+    # webhook/callback machinery as the NEWS2 hooks — so
+    # something outside the ward hears a result is already
+    # late and when it finally lands. A callback can use the
+    # start to chase the lab: the patient on that bed is waiting
+    # on a result that should have been back, and the discharge
+    # planner is holding their bed until it lands.
+    LAB = {"name": "bloods", "delay_s": 120}
+
+    def _lab_ward(self, hooks=None):
+        return Ward(
+            beds=2,
+            profiles=["stable", "stable"],
+            labs=[
+                [{"name": "bloods", "due_at": 30}],
+                [{"name": "bloods", "due_at": 30}],
+            ],
+            chaos=[
+                ChaosEvent(
+                    "lab_delay",
+                    at=5,
+                    duration=60,
+                    bed=0,
+                    lab=self.LAB,
+                )
+            ],
+            discharge_readiness={"stable_window_s": 5},
+            seed=42,
+            lab_overdue_hooks=hooks,
+        )
+
+    def test_validate_lab_overdue_hooks(self):
+        hooks = validate_lab_overdue_hooks(None)
+        self.assertIsInstance(hooks, TrendAlertHooks)
+        self.assertFalse(hooks.configured)
+        self.assertEqual(hooks.kind, "lab-overdue")
+        custom = validate_lab_overdue_hooks(
+            {"webhook_url": "https://example.invalid/hooks", "timeout_s": 2}
+        )
+        self.assertTrue(custom.configured)
+        self.assertEqual(custom.kind, "lab-overdue")
+        self.assertEqual(custom.timeout_s, 2.0)
+        seen = []
+        append = seen.append
+        cb = validate_lab_overdue_hooks({"callback": append})
+        self.assertTrue(cb.configured)
+        self.assertIs(cb.callback, append)
+        with self.assertRaises(ValueError):
+            validate_lab_overdue_hooks(
+                {"webhook_url": "ftp://x/hooks"}
+            )
+        with self.assertRaises(ValueError):
+            validate_lab_overdue_hooks({"callback": "not callable"})
+        with self.assertRaises(ValueError):
+            validate_lab_overdue_hooks({"timeout_s": 0})
+        with self.assertRaises(ValueError):
+            validate_lab_overdue_hooks({"url": "http://x/hooks"})
+        with self.assertRaises(ValueError):
+            validate_lab_overdue_hooks("http://x/hooks")
+
+    def test_hooks_off_by_default(self):
+        # No hooks configured: the result still goes overdue
+        # at 30 s and lands 120 s late at 150 s, and each
+        # transition is recorded with no hook invoked.
+        ward = self._lab_ward()
+        self.assertFalse(ward.lab_overdue_hooks.configured)
+        for _ in range(160):
+            ward.tick()
+        summary = ward.lab_delay_summary()
+        self.assertEqual(summary["lab_overdue_event_count"], 2)
+        self.assertEqual(
+            [
+                (e["event"], e["t"])
+                for e in summary["lab_overdue_events"]
+            ],
+            [
+                ("lab_overdue_started", 30.0),
+                ("lab_overdue_ended", 150.0),
+            ],
+        )
+        for event in summary["lab_overdue_events"]:
+            self.assertFalse(event["hook_invoked"])
+            self.assertEqual(event["hook_errors"], [])
+            self.assertEqual(event["hook_retries"], 0)
+            self.assertEqual(
+                event["hook_final_status"], "not_invoked"
+            )
+        self.assertEqual(
+            summary["lab_overdue_hooks"],
+            {"configured": False, "invoked": 0, "failed": 0, "retries": 0, "delivered": 0},
+        )
+        self.assertEqual(
+            ward.snapshot()["lab_delay"]["lab_overdue_event_count"],
+            2,
+        )
+
+    def test_callback_hook_fires_for_start_and_end(self):
+        seen = []
+        ward = self._lab_ward({"callback": seen.append})
+        self.assertTrue(ward.lab_overdue_hooks.configured)
+        for _ in range(160):
+            ward.tick()
+        # Two events over the run: bed 0's bloods go overdue
+        # at 30 s and land at 150 s. The result stays overdue
+        # in between, but the episode fires once on going
+        # overdue and once on landing, not once a tick.
+        self.assertEqual(
+            [(p["event"], p["t"]) for p in seen],
+            [
+                ("lab_overdue_started", 30.0),
+                ("lab_overdue_ended", 150.0),
+            ],
+        )
+        start, end = seen
+        self.assertEqual(
+            {k: v for k, v in start.items() if k != "hook_retries"
+             and k != "hook_final_status"},
+            {
+                "event": "lab_overdue_started",
+                "t": 30.0,
+                "bed": 0,
+                "name": "bloods",
+                "due_at": 30.0,
+                "land_t": 150.0,
+                "delayed_s": 120.0,
+                "result_t": None,
+                "overdue_raised_t": 30.0,
+                "overdue_cleared_t": None,
+            },
+        )
+        self.assertEqual(
+            {k: v for k, v in end.items() if k != "hook_retries"
+             and k != "hook_final_status"},
+            {
+                "event": "lab_overdue_ended",
+                "t": 150.0,
+                "bed": 0,
+                "name": "bloods",
+                "due_at": 30.0,
+                "land_t": 150.0,
+                "delayed_s": 120.0,
+                "result_t": 150.0,
+                "overdue_raised_t": 30.0,
+                "overdue_cleared_t": 150.0,
+            },
+        )
+        # Every event records the invocation.
+        summary = ward.lab_delay_summary()
+        self.assertEqual(summary["lab_overdue_event_count"], 2)
+        for event in summary["lab_overdue_events"]:
+            self.assertTrue(event["hook_invoked"])
+            self.assertEqual(event["hook_errors"], [])
+            self.assertEqual(event["hook_final_status"], "delivered")
+        self.assertEqual(
+            summary["lab_overdue_hooks"],
+            {"configured": True, "invoked": 2, "failed": 0, "retries": 0, "delivered": 2},
+        )
+
+    def test_start_and_end_fire_again_for_a_second_overdue(self):
+        # Two results on the same bed go overdue: the start
+        # and the end fire once per result — the transitions
+        # are per result, so the second result fires again
+        # even while the first is still overdue.
+        seen = []
+        ward = Ward(
+            beds=1,
+            profiles=["stable"],
+            labs=[
+                [
+                    {"name": "bloods", "due_at": 30},
+                    {"name": "troponin", "due_at": 60},
+                ]
+            ],
+            chaos=[
+                ChaosEvent(
+                    "lab_delay",
+                    at=5,
+                    duration=60,
+                    bed=0,
+                    lab=self.LAB,
+                ),
+                ChaosEvent(
+                    "lab_delay",
+                    at=5,
+                    duration=60,
+                    bed=0,
+                    lab={"name": "troponin", "delay_s": 30},
+                ),
+            ],
+            seed=42,
+            lab_overdue_hooks={"callback": seen.append},
+        )
+        for _ in range(160):
+            ward.tick()
+        self.assertEqual(
+            [(p["event"], p["t"], p["name"]) for p in seen],
+            [
+                ("lab_overdue_started", 30.0, "bloods"),
+                ("lab_overdue_started", 60.0, "troponin"),
+                ("lab_overdue_ended", 90.0, "troponin"),
+                ("lab_overdue_ended", 150.0, "bloods"),
+            ],
+        )
+        self.assertEqual(
+            ward.lab_delay_summary()[
+                "lab_overdue_hooks"
+            ],
+            {"configured": True, "invoked": 4, "failed": 0, "retries": 0, "delivered": 4},
+        )
+
+    def test_callback_failure_is_not_fatal(self):
+        def boom(payload):
+            raise ValueError("pager is down")
+
+        ward = self._lab_ward({"callback": boom})
+        for _ in range(30):
+            ward.tick()  # t=30: bloods go overdue, hook raises
+        snap = ward.tick()  # t=31: the tick still completes
+        self.assertTrue(snap["beds"][0]["online"])
+        event = ward.lab_delay_summary()["lab_overdue_events"][0]
+        self.assertEqual(event["event"], "lab_overdue_started")
+        self.assertTrue(event["hook_invoked"])
+        self.assertEqual(event["hook_errors"], ["pager is down"])
+        self.assertEqual(event["hook_final_status"], "failed")
+        summary = ward.lab_delay_summary()[
+            "lab_overdue_hooks"
+        ]
+        self.assertEqual(summary["invoked"], 1)
+        self.assertEqual(summary["failed"], 1)
+
+    def test_webhook_posts_to_stub_server(self):
+        server, port, received = capture_server()
+        try:
+            ward = self._lab_ward(
+                {"webhook_url": "http://127.0.0.1:%d/hooks" % port}
+            )
+            for _ in range(160):
+                ward.tick()
+            self.assertTrue(ward.lab_overdue_hooks.wait(timeout=5))
+            self.assertEqual(len(received), 2)
+            payloads = sorted(
+                (json.loads(r[2]) for r in received),
+                key=lambda p: p["t"],
+            )
+            self.assertEqual(
+                [(p["event"], p["t"]) for p in payloads],
+                [
+                    ("lab_overdue_started", 30.0),
+                    ("lab_overdue_ended", 150.0),
+                ],
+            )
+            path, content_type, body = received[0]
+            self.assertEqual(path, "/hooks")
+            self.assertEqual(content_type, "application/json")
+            start = [p for p in payloads if p["event"] == "lab_overdue_started"][0]
+            self.assertEqual(start["bed"], 0)
+            self.assertEqual(start["name"], "bloods")
+            self.assertEqual(start["due_at"], 30.0)
+            self.assertEqual(start["land_t"], 150.0)
+            summary = ward.lab_delay_summary()
+            self.assertEqual(
+                summary["lab_overdue_hooks"],
+                {"configured": True, "invoked": 2, "failed": 0, "retries": 0, "delivered": 2},
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_scenario_lab_overdue_hooks(self):
+        cfg = load_scenario(
+            os.path.join(
+                HERE, "..", "scenarios", "lab-overdue-hooks.json"
+            )
+        )
+        self.assertTrue(cfg["lab_overdue_hooks"].configured)
+        server, port, received = capture_server()
+        path = os.path.join(tempfile.mkdtemp(), "run.jsonl")
+        try:
+            # The scenario's URL is a placeholder; point it at
+            # the stub server for this run.
+            cfg["lab_overdue_hooks"] = (
+                validate_lab_overdue_hooks(
+                    {"webhook_url": "http://127.0.0.1:%d/hooks" % port}
+                )
+            )
+            ward = build_ward(cfg, seed=42)
+            with Recorder(path, ward.beds, ward.rate_hz, seed=42) as rec:
+                ward.recorder = rec
+                for _ in range(160):
+                    snap = ward.tick()
+            self.assertTrue(ward.lab_overdue_hooks.wait(timeout=5))
+            # Two events over the run: bed 0's bloods go
+            # overdue at 30 s and land at 150 s. The deliveries
+            # run in separate daemon threads, so their arrival
+            # order at the stub is not guaranteed — sort by
+            # event time before asserting.
+            self.assertEqual(len(received), 2)
+            payloads = sorted(
+                (json.loads(r[2]) for r in received),
+                key=lambda p: p["t"],
+            )
+            self.assertEqual(
+                [
+                    (p["event"], p["t"], p.get("bed"))
+                    for p in payloads
+                ],
+                [
+                    ("lab_overdue_started", 30.0, 0),
+                    ("lab_overdue_ended", 150.0, 0),
+                ],
+            )
+            # Every event records that its hook was invoked.
+            for event in snap["lab_delay"]["lab_overdue_events"]:
+                self.assertTrue(event["hook_invoked"])
+            summary = ward.lab_delay_summary()
+            self.assertEqual(summary["lab_overdue_event_count"], 2)
+            self.assertEqual(
+                summary["lab_overdue_hooks"],
+                {"configured": True, "invoked": 2, "failed": 0, "retries": 0, "delivered": 2},
+            )
+            # The run summary carries the overdue event count
+            # and the hook totals from the last tick — but only
+            # as of that tick: the snapshot in the file was
+            # recorded before the last delivery settled, so
+            # delivered is read from the live summary above,
+            # not from here.
+            run = summarize(path)
+            self.assertEqual(
+                run["lab_delay"]["lab_overdue_event_count"], 2
+            )
+            self.assertTrue(
+                run["lab_delay"]["lab_overdue_hooks"][
+                    "configured"
+                ]
+            )
+            self.assertEqual(
+                run["lab_delay"]["lab_overdue_hooks"][
                     "invoked"
                 ],
                 2,

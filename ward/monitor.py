@@ -113,6 +113,11 @@ class Monitor:
         # result past its due time raises a lab_overdue alarm
         # until it lands.
         self.labs = LabSchedule(bed_id, labs)
+        # Overdue transitions the lab schedule reported on the
+        # last tick (see :meth:`tick`): the ward drains them
+        # after the monitor loop and fires the lab-overdue
+        # hooks on them.
+        self.lab_overdue_transitions = []
         self.rng = rng if rng is not None else random.Random()
         self.signs = initial_signs(profile, self.rng, self.acuity)
         # Slow sensor drift: the accumulated bias per vital, in the
@@ -678,6 +683,20 @@ class Monitor:
         """
         self.labs.apply_delay(event)
 
+    def drain_lab_overdue_transitions(self):
+        """Take this tick's lab-overdue transitions, clearing them.
+
+        The ward calls this after the monitor loop and fires
+        the lab-overdue hooks on what it gets, so each
+        transition fires once even though the tick that
+        produced it is long past by then.
+        """
+        transitions, self.lab_overdue_transitions = (
+            self.lab_overdue_transitions,
+            [],
+        )
+        return transitions
+
     def lab_delay_detail(self, now):
         """Per-bed lab-delay state as plain JSON data.
 
@@ -1180,8 +1199,11 @@ class Monitor:
         # the lab does not care if the bedside monitor is dark,
         # offline, or stale — so a result lands on time and goes
         # overdue on schedule, and only the overdue alarm itself
-        # waits for a reading the monitor actually emits.
-        self.labs.tick(now)
+        # waits for a reading the monitor actually emits. The
+        # transitions this tick (a result going overdue, or
+        # landing after being overdue) are kept for the ward to
+        # fire the lab-overdue hooks on.
+        self.lab_overdue_transitions = self.labs.tick(now)
         # A power outage runs the monitor on battery until the
         # battery dies, then the monitor goes dark: no readings,
         # alarms neither raise nor clear, exactly like a dropout

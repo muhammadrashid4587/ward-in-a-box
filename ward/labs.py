@@ -64,7 +64,9 @@ class LabSchedule:
     ``tick(now)`` advances the schedule: a result whose landing
     time has arrived lands — recorded with when it landed, and
     clearing its overdue alarm if one had raised — and a result
-    still waiting past its due time goes overdue. ``apply_delay``
+    still waiting past its due time goes overdue, returning the
+    overdue transitions this tick so the ward can fire its
+    lab-overdue hooks on them. ``apply_delay``
     pushes a result's landing time out when a ``lab_delay`` event
     covers it. ``overdue`` holds the names of the results
     currently overdue, so the monitor can turn them into a
@@ -144,15 +146,38 @@ class LabSchedule:
         overdue — and then any result still waiting past its due
         time goes overdue. Landing and going overdue are both
         recorded with the tick time, so a seeded run reproduces
-        them exactly.
+        them exactly. Returns the overdue transitions this tick
+        — one dict per result that went overdue or landed after
+        being overdue — so the ward can fire its lab-overdue
+        hooks on them: a result goes overdue once, not once a
+        tick while it waits, and landing after being overdue
+        ends the episode, so a later result going overdue fires
+        again (the transitions are per result, not per run).
         """
         now = round(now, 3)
+        transitions = []
         for lab in self.labs:
             if lab["result_t"] is None and lab["land_t"] <= now:
                 lab["result_t"] = now
                 if lab["name"] in self._overdue:
                     self._overdue.discard(lab["name"])
                     lab["overdue_cleared_t"] = now
+                    transitions.append(
+                        {
+                            "event": "lab_overdue_ended",
+                            "name": lab["name"],
+                            "due_at": lab["due_at"],
+                            "land_t": lab["land_t"],
+                            "delayed_s": lab["delayed_s"],
+                            "result_t": lab["result_t"],
+                            "overdue_raised_t": lab[
+                                "overdue_raised_t"
+                            ],
+                            "overdue_cleared_t": lab[
+                                "overdue_cleared_t"
+                            ],
+                        }
+                    )
         for lab in self.labs:
             if (
                 lab["result_t"] is None
@@ -162,6 +187,21 @@ class LabSchedule:
                 lab["overdue_raised_t"] = now
                 self._overdue.add(lab["name"])
                 self.overdue_raised += 1
+                transitions.append(
+                    {
+                        "event": "lab_overdue_started",
+                        "name": lab["name"],
+                        "due_at": lab["due_at"],
+                        "land_t": lab["land_t"],
+                        "delayed_s": lab["delayed_s"],
+                        "result_t": None,
+                        "overdue_raised_t": lab[
+                            "overdue_raised_t"
+                        ],
+                        "overdue_cleared_t": None,
+                    }
+                )
+        return transitions
 
     def apply_delay(self, event):
         """Push out the results a lab-delay event covers.

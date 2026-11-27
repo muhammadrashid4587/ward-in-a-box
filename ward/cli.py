@@ -11,6 +11,7 @@ from .alert_hooks import (
     validate_discharge_readiness_hooks,
     validate_escalation_hooks,
     validate_lab_delay_hooks,
+    validate_lab_overdue_hooks,
     validate_medication_stockout_hooks,
     validate_missed_dose_hooks,
     validate_network_outage_hooks,
@@ -385,6 +386,16 @@ def load_scenario(path):
             )
         except ValueError as e:
             raise ValueError("lab_delay_hooks: %s" % e)
+    lab_overdue_hooks = None
+    if "lab_overdue_hooks" in data:
+        if not isinstance(data["lab_overdue_hooks"], dict):
+            raise ValueError("lab_overdue_hooks must be an object")
+        try:
+            lab_overdue_hooks = validate_lab_overdue_hooks(
+                data["lab_overdue_hooks"]
+            )
+        except ValueError as e:
+            raise ValueError("lab_overdue_hooks: %s" % e)
     return {
         "beds": beds,
         "rate_hz": rate,
@@ -420,6 +431,7 @@ def load_scenario(path):
         "medication_stockout_hooks": medication_stockout_hooks,
         "pump_failure_hooks": pump_failure_hooks,
         "lab_delay_hooks": lab_delay_hooks,
+        "lab_overdue_hooks": lab_overdue_hooks,
         "triage": triage,
         "host": data.get("host", "127.0.0.1"),
         "port": data.get("port", 8080),
@@ -463,6 +475,7 @@ def build_ward(cfg, seed=None, recorder=None):
         medication_stockout_hooks=cfg.get("medication_stockout_hooks"),
         pump_failure_hooks=cfg.get("pump_failure_hooks"),
         lab_delay_hooks=cfg.get("lab_delay_hooks"),
+        lab_overdue_hooks=cfg.get("lab_overdue_hooks"),
         triage=cfg.get("triage"),
         recorder=recorder,
     )

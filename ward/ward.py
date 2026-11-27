@@ -13,6 +13,7 @@ from .alert_hooks import (
     validate_medication_stockout_hooks,
     validate_missed_dose_hooks,
     validate_lab_delay_hooks,
+    validate_lab_overdue_hooks,
     validate_network_outage_hooks,
     validate_oxygen_outage_hooks,
     validate_power_outage_hooks,
@@ -54,7 +55,7 @@ class Ward:
     snapshot to a JSONL file.
     """
 
-    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None, cleaning_s=30.0, meds=None, triage=None, discharge_planning=None, cleaning_capacity=None, discharge_readiness=None, oxygen=None, infusions=None, consciousness=None, consciousness_dynamics=None, news2_trend=None, trend_alert_hooks=None, escalation_hooks=None, boarding_full_hooks=None, wait_time_hooks=None, missed_dose_hooks=None, discharge_readiness_hooks=None, discharge_priority_hooks=None, oxygen_outage_hooks=None, power_outage_hooks=None, sensor_drift_hooks=None, bed_blocker_hooks=None, network_outage_hooks=None, medication_stockout_hooks=None, pump_failure_hooks=None, lab_delay_hooks=None, news2_staffing_escalation=None, labs=None):
+    def __init__(self, beds=12, rate_hz=1.0, profiles=None, chaos=None, seed=None, timeline=None, recorder=None, acuities=None, staffing=None, cleaning_s=30.0, meds=None, triage=None, discharge_planning=None, cleaning_capacity=None, discharge_readiness=None, oxygen=None, infusions=None, consciousness=None, consciousness_dynamics=None, news2_trend=None, trend_alert_hooks=None, escalation_hooks=None, boarding_full_hooks=None, wait_time_hooks=None, missed_dose_hooks=None, discharge_readiness_hooks=None, discharge_priority_hooks=None, oxygen_outage_hooks=None, power_outage_hooks=None, sensor_drift_hooks=None, bed_blocker_hooks=None, network_outage_hooks=None, medication_stockout_hooks=None, pump_failure_hooks=None, lab_delay_hooks=None, lab_overdue_hooks=None, news2_staffing_escalation=None, labs=None):
         if not 1 <= beds <= 64:
             raise ValueError("beds must be 1..64")
         if rate_hz <= 0:
@@ -242,6 +243,18 @@ class Ward:
         # Every lab-delay hook event this run — the audit
         # trail for the lab-delay hooks.
         self.lab_delay_events = []
+        # Lab-overdue hooks: one shared object for the whole
+        # ward (a webhook URL and/or an in-process callback),
+        # invoked when a lab result goes overdue or lands
+        # after being overdue. Off by default. The ward owns
+        # the object: an overdue result is a ward-level event,
+        # not a per-bed one.
+        self.lab_overdue_hooks = validate_lab_overdue_hooks(
+            lab_overdue_hooks
+        )
+        # Every lab-overdue hook event this run — the audit
+        # trail for the lab-overdue hooks.
+        self.lab_overdue_events = []
         # The priority order last sent to the hooks (empty
         # before the first ready bed), and every order change
         # this run — the audit trail for the priority hooks.
@@ -478,6 +491,11 @@ class Ward:
         # tick the floor is reached — after the monitor loop, so
         # this tick's deficit is already in.
         self._check_oxygen_floor_hits()
+        # Lab-overdue transitions: a result going overdue, or
+        # landing after being overdue, fires one hook event —
+        # after the monitor loop, so this tick's lab state is
+        # already in.
+        self._check_lab_overdue_transitions()
         # NEWS2-driven staffing escalation: with this tick's
         # scores in, count the deterioration episodes open at
         # high risk — at the threshold the ward calls in extra
@@ -922,6 +940,62 @@ class Ward:
         payload["hook_invoked"] = result["invoked"]
         payload["hook_errors"] = result["errors"]
 
+    def _fire_lab_overdue_event(self, kind, bed_id, transition, now):
+        """Fire one ward-level lab-overdue hook event.
+
+        The payload carries the event kind, the tick, the bed,
+        and the result — its name, when it was due, when it is
+        now expected to land, how much it has been delayed, when
+        its overdue alarm raised, and when it landed and the
+        alarm cleared (null while it is still overdue) — so a
+        hook can tell which result is late, how late it already
+        is, and whether it has come back. The event is recorded
+        on the audit trail with whether the hook was invoked
+        for it, any synchronous error, and the retries and
+        final delivery outcome.
+        """
+        payload = {
+            "event": kind,
+            "t": now,
+            "bed": bed_id,
+            "name": transition["name"],
+            "due_at": transition["due_at"],
+            "land_t": transition["land_t"],
+            "delayed_s": transition["delayed_s"],
+            "result_t": transition["result_t"],
+            "overdue_raised_t": transition["overdue_raised_t"],
+            "overdue_cleared_t": transition["overdue_cleared_t"],
+        }
+        self.lab_overdue_events.append(payload)
+        result = self.lab_overdue_hooks.fire(
+            dict(payload),
+            record=payload,
+        )
+        payload["hook_invoked"] = result["invoked"]
+        payload["hook_errors"] = result["errors"]
+
+    def _check_lab_overdue_transitions(self):
+        """Fire the lab-overdue hooks for this tick's transitions.
+
+        Called after the monitor loop, so this tick's lab
+        state is already in: each monitor's overdue
+        transitions — a result going overdue, or landing
+        after being overdue — fire one hook event each, in
+        the tick they happen. A result that stays overdue
+        for twenty ticks fires once, not twenty times, and
+        a second result going overdue fires again — the
+        transitions are per result, not per run, so the
+        hooks re-arm on their own.
+        """
+        for m in self.monitors:
+            for transition in m.drain_lab_overdue_transitions():
+                self._fire_lab_overdue_event(
+                    transition["event"],
+                    m.bed_id,
+                    transition,
+                    self.elapsed,
+                )
+
     def _oxygen_outage_started(self, event, now):
         """Fire the start hook for one oxygen-outage event.
 
@@ -1328,6 +1402,15 @@ class Ward:
         any hook is configured, how many hook deliveries were
         invoked, how many failed, how many retries were spent,
         and how many deliveries eventually landed.
+        ``lab_overdue_event_count`` counts every lab-overdue
+        hook event this run — results going overdue and landing
+        after being overdue — and ``lab_overdue_events`` lists
+        them, each with the tick, the bed, and the result, and
+        whether the ward's hooks were invoked for it
+        (``hook_invoked``) and the retries and final delivery
+        outcome (``hook_retries``, ``hook_final_status``);
+        ``lab_overdue_hooks`` carries the hook totals for the
+        overdue hooks, on the same terms.
         """
         beds = [m.lab_delay_detail(self.elapsed) for m in self.monitors]
         return {
@@ -1357,6 +1440,13 @@ class Ward:
             "events": [dict(e) for e in self.lab_delay_events],
             "lab_delay_hooks": (
                 self.lab_delay_hooks.summary()
+            ),
+            "lab_overdue_event_count": len(self.lab_overdue_events),
+            "lab_overdue_events": [
+                dict(e) for e in self.lab_overdue_events
+            ],
+            "lab_overdue_hooks": (
+                self.lab_overdue_hooks.summary()
             ),
         }
 

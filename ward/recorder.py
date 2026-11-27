@@ -840,7 +840,10 @@ def summarize(path):
         # without replaying every tick — plus how many lab-delay
         # hook events fired this run, and whether the lab-delay
         # hooks are configured and how many hook deliveries were
-        # invoked, failed, retried, and delivered.
+        # invoked, failed, retried, and delivered — and the same
+        # for the lab-overdue hook events, which fire when a
+        # result goes overdue and when it lands after being
+        # overdue.
         "lab_delay": (
             {
                 "beds_pending": last_lab_delay["beds_pending"],
@@ -865,6 +868,21 @@ def summarize(path):
                 "lab_delay_hooks": (
                     last_lab_delay.get(
                         "lab_delay_hooks",
+                        {
+                            "configured": False,
+                            "invoked": 0,
+                            "failed": 0,
+                            "retries": 0,
+                            "delivered": 0,
+                        },
+                    )
+                ),
+                "lab_overdue_event_count": last_lab_delay.get(
+                    "lab_overdue_event_count", 0
+                ),
+                "lab_overdue_hooks": (
+                    last_lab_delay.get(
+                        "lab_overdue_hooks",
                         {
                             "configured": False,
                             "invoked": 0,

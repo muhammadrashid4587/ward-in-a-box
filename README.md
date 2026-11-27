@@ -298,6 +298,12 @@ python3 -m ward.cli scenarios/lab-delay.json --seed 42
 # endpoint is logged, never fatal)
 python3 -m ward.cli scenarios/lab-delay-hooks.json --seed 42
 
+# Lab-overdue hooks: the same ward, with bed 0's bloods going
+# overdue at 30 s and landing 120 s late at 150 s also POSTed to
+# a webhook (here a placeholder URL — point it at your own
+# endpoint; a dead endpoint is logged, never fatal)
+python3 -m ward.cli scenarios/lab-overdue-hooks.json --seed 42
+
 # Reproducible run
 python3 -m ward.cli scenarios/example.json --seed 42
 ```
@@ -395,7 +401,8 @@ python3 -m ward.cli scenarios/example.json --seed 42
   beds are waiting, how many have a result past due, and how
   many results have landed, been delayed, and gone overdue —
   plus the lab-delay event history and the lab-delay hook
-  totals, as JSON (503 while partitioned)
+  totals, plus the lab-overdue event history and the
+  lab-overdue hook totals, as JSON (503 while partitioned)
 
 A reading looks like:
 
@@ -1427,6 +1434,59 @@ exactly as before. See `scenarios/lab-delay-hooks.json` for
 a runnable example: over a seeded 70-tick run the same ward
 as `lab-delay.json` runs slow from 5 s and is back to normal
 at 65 s — POSTed to the configured webhook, with 2 hook
+deliveries invoked and 0 failed against a stub server.
+
+## Lab-overdue hooks
+
+A result going overdue is the moment a ward most needs the
+outside world to hear about it — the result the ward is
+waiting on is already late, the patient waiting on it cannot
+be discharged until it lands, and the discharge planner is
+holding a bed it thought was freeing up — so the hook makes
+sure something outside the ward hears about it. A ward that
+wants the outside world to hear about that moment — a
+dashboard, a pager, a discharge planner — configures
+lab-overdue hooks, the same channels as the NEWS2 hooks
+(webhook and/or in-process callback), on the same best-effort,
+never-fatal terms:
+
+```json
+{"lab_overdue_hooks": {"webhook_url": "http://127.0.0.1:18099/hooks"}}
+```
+
+Two events fire. `lab_overdue_started` fires once, in the
+tick a result goes past its due time and is still not back,
+with the bed, the result name, when it was due, when it is
+now expected to land, and how much it has been delayed.
+`lab_overdue_ended` fires once, in the tick the result lands
+after being overdue, with the same result — plus when it
+landed and when its overdue alarm raised and cleared. A
+result that stays overdue for a hundred and twenty ticks
+fires once, not a hundred and twenty times, and a second
+result going overdue fires again — the start and end are
+per result, not per run. An in-process callback gets the
+same payloads in the tick the event fires (Python API only
+— a scenario file cannot hold a callable), so scenario code
+can log or escalate on a result going overdue directly.
+Each event records whether the hook was invoked
+(`"hook_invoked"`, False with no hooks) and any synchronous
+error (`"hook_errors"`), and the lab-delay summary carries
+the event totals (`"lab_overdue_event_count"`, the full
+`"lab_overdue_events"` history) and the ward lab-overdue-hook
+totals (`"lab_overdue_hooks"`: whether any hook is
+configured, how many deliveries were invoked, how many
+failed, how many retries were spent, and how many deliveries
+eventually landed) — in `GET /lab-delay`, every snapshot and
+WebSocket frame, and the run summary (`--summary`). The same
+retry rules as the NEWS2 hooks apply — a failed webhook POST
+is retried with backoff up to `"max_retries"` times, and the
+event records `"hook_retries"` and `"hook_final_status"`
+alongside `"hook_invoked"`. Hooks are off by default, so a
+ward with none configured behaves exactly as before. See
+`scenarios/lab-overdue-hooks.json` for a runnable example:
+over a seeded 160-tick run the same ward as
+`lab-delay-hooks.json` goes overdue at 30 s and lands 120 s
+late at 150 s — POSTed to the configured webhook, with 2 hook
 deliveries invoked and 0 failed against a stub server.
 
 ## Medication-stockout hooks
@@ -3695,3 +3755,17 @@ the hook totals.
   endpoint, and the run summary; off by default, configured
   per ward with `lab_delay_hooks` in the scenario) — done in
   v0.61.0
+- Lab-overdue hooks (when a lab result goes overdue or lands
+  after being overdue — a configured webhook URL gets a
+  `lab_overdue_started` / `lab_overdue_ended` event payload
+  POSTed to it, or an in-process callback is called with the
+  same payload in the firing tick, so a hook can escalate on a
+  result already late and on it finally landing; one start and
+  one end per overdue result, re-armed for a second result
+  going overdue; reusing the NEWS2 hook machinery, best effort
+  and never fatal; each event records whether the hook was
+  invoked, and the lab-delay summary carries the event history
+  and the lab-overdue-hook totals, in every snapshot, WebSocket
+  frame, a `GET /lab-delay` endpoint, and the run summary; off
+  by default, configured per ward with `lab_overdue_hooks` in
+  the scenario) — done in v0.62.0
