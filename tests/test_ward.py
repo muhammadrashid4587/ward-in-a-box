@@ -25,6 +25,7 @@ from ward.alert_hooks import (
     validate_discharge_priority_hooks,
     validate_discharge_readiness_hooks,
     validate_escalation_hooks,
+    validate_lab_delay_hooks,
     validate_medication_stockout_hooks,
     validate_missed_dose_hooks,
     validate_network_outage_hooks,
@@ -13455,6 +13456,17 @@ class TestLabDelay(unittest.TestCase):
                         "overdue": ["bloods"],
                     }
                 },
+                # One hook event so far — the delay started at
+                # 5 s; it does not end until 65 s, past this
+                # 40-tick run — and no hooks are configured.
+                "event_count": 1,
+                "lab_delay_hooks": {
+                    "configured": False,
+                    "invoked": 0,
+                    "failed": 0,
+                    "retries": 0,
+                    "delivered": 0,
+                },
             },
         )
 
@@ -14162,6 +14174,328 @@ class TestPumpFailureHooks(unittest.TestCase):
             )
             self.assertEqual(
                 run["pump_failure"]["pump_failure_hooks"][
+                    "invoked"
+                ],
+                2,
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+class TestLabDelayHooks(unittest.TestCase):
+    # Lab-delay hooks: the lab running slow or returning to
+    # normal fires the ward's lab_delay_hooks — the same
+    # webhook/callback machinery as the NEWS2 hooks — so
+    # something outside the ward hears the results are going
+    # to be late and when the lab is back to normal. A
+    # callback can use the start to warn the discharge
+    # planner: the patient on that bed is about to wait on a
+    # result that will not be back for hours.
+    LAB = {"name": "bloods", "delay_s": 120}
+
+    def _lab_ward(self, hooks=None):
+        return Ward(
+            beds=2,
+            profiles=["stable", "stable"],
+            labs=[
+                [{"name": "bloods", "due_at": 30}],
+                [{"name": "bloods", "due_at": 30}],
+            ],
+            chaos=[
+                ChaosEvent(
+                    "lab_delay",
+                    at=5,
+                    duration=60,
+                    bed=0,
+                    lab=self.LAB,
+                )
+            ],
+            discharge_readiness={"stable_window_s": 5},
+            seed=42,
+            lab_delay_hooks=hooks,
+        )
+
+    def test_validate_lab_delay_hooks(self):
+        hooks = validate_lab_delay_hooks(None)
+        self.assertIsInstance(hooks, TrendAlertHooks)
+        self.assertFalse(hooks.configured)
+        self.assertEqual(hooks.kind, "lab-delay")
+        custom = validate_lab_delay_hooks(
+            {"webhook_url": "https://example.invalid/hooks", "timeout_s": 2}
+        )
+        self.assertTrue(custom.configured)
+        self.assertEqual(custom.kind, "lab-delay")
+        self.assertEqual(custom.timeout_s, 2.0)
+        seen = []
+        append = seen.append
+        cb = validate_lab_delay_hooks({"callback": append})
+        self.assertTrue(cb.configured)
+        self.assertIs(cb.callback, append)
+        with self.assertRaises(ValueError):
+            validate_lab_delay_hooks(
+                {"webhook_url": "ftp://x/hooks"}
+            )
+        with self.assertRaises(ValueError):
+            validate_lab_delay_hooks({"callback": "not callable"})
+        with self.assertRaises(ValueError):
+            validate_lab_delay_hooks({"timeout_s": 0})
+        with self.assertRaises(ValueError):
+            validate_lab_delay_hooks({"url": "http://x/hooks"})
+        with self.assertRaises(ValueError):
+            validate_lab_delay_hooks("http://x/hooks")
+
+    def test_hooks_off_by_default(self):
+        # No hooks configured: the lab still runs slow and
+        # returns to normal, and each event is recorded with
+        # no hook invoked.
+        ward = self._lab_ward()
+        self.assertFalse(ward.lab_delay_hooks.configured)
+        for _ in range(70):
+            ward.tick()
+        summary = ward.lab_delay_summary()
+        self.assertEqual(summary["event_count"], 2)
+        self.assertEqual(
+            [
+                (e["event"], e["t"])
+                for e in summary["events"]
+            ],
+            [
+                ("lab_delay_started", 5.0),
+                ("lab_delay_ended", 65.0),
+            ],
+        )
+        for event in summary["events"]:
+            self.assertFalse(event["hook_invoked"])
+            self.assertEqual(event["hook_errors"], [])
+            self.assertEqual(event["hook_retries"], 0)
+            self.assertEqual(
+                event["hook_final_status"], "not_invoked"
+            )
+        self.assertEqual(
+            summary["lab_delay_hooks"],
+            {"configured": False, "invoked": 0, "failed": 0, "retries": 0, "delivered": 0},
+        )
+        self.assertEqual(
+            ward.snapshot()["lab_delay"]["event_count"], 2
+        )
+
+    def test_callback_hook_fires_for_start_and_end(self):
+        seen = []
+        ward = self._lab_ward({"callback": seen.append})
+        self.assertTrue(ward.lab_delay_hooks.configured)
+        for _ in range(70):
+            ward.tick()
+        # Two events over the run: the lab runs slow from 5 s
+        # and is back to normal at 65 s. The result stays
+        # delayed in between, but the delay itself fires once
+        # on start and once on end, not once a tick.
+        self.assertEqual(
+            [(p["event"], p["t"]) for p in seen],
+            [
+                ("lab_delay_started", 5.0),
+                ("lab_delay_ended", 65.0),
+            ],
+        )
+        start, end = seen
+        self.assertEqual(
+            {k: v for k, v in start.items() if k != "hook_retries"
+             and k != "hook_final_status"},
+            {
+                "event": "lab_delay_started",
+                "t": 5.0,
+                "at": 5.0,
+                "ends": 65.0,
+                "duration": 60,
+                "beds": [0],
+                "lab": {"name": "bloods", "delay_s": 120.0},
+            },
+        )
+        self.assertEqual(end["event"], "lab_delay_ended")
+        self.assertEqual(end["t"], 65.0)
+        self.assertEqual(end["beds"], [0])
+        # Every event records the invocation.
+        summary = ward.lab_delay_summary()
+        self.assertEqual(summary["event_count"], 2)
+        for event in summary["events"]:
+            self.assertTrue(event["hook_invoked"])
+            self.assertEqual(event["hook_errors"], [])
+            self.assertEqual(event["hook_final_status"], "delivered")
+        self.assertEqual(
+            summary["lab_delay_hooks"],
+            {"configured": True, "invoked": 2, "failed": 0, "retries": 0, "delivered": 2},
+        )
+
+    def test_start_and_end_fire_again_for_a_second_delay(self):
+        # Two lab delays on the same bed: the start and the
+        # end fire once per delay — the engine tracks each
+        # event separately, so the second delay fires again.
+        seen = []
+        ward = Ward(
+            beds=1,
+            profiles=["stable"],
+            labs=[[{"name": "bloods", "due_at": 30}]],
+            chaos=[
+                ChaosEvent(
+                    "lab_delay",
+                    at=5,
+                    duration=10,
+                    bed=0,
+                    lab=self.LAB,
+                ),
+                ChaosEvent(
+                    "lab_delay",
+                    at=40,
+                    duration=10,
+                    bed=0,
+                    lab=self.LAB,
+                ),
+            ],
+            seed=42,
+            lab_delay_hooks={"callback": seen.append},
+        )
+        for _ in range(55):
+            ward.tick()
+        self.assertEqual(
+            [(p["event"], p["t"]) for p in seen],
+            [
+                ("lab_delay_started", 5.0),
+                ("lab_delay_ended", 15.0),
+                ("lab_delay_started", 40.0),
+                ("lab_delay_ended", 50.0),
+            ],
+        )
+        self.assertEqual(
+            ward.lab_delay_summary()[
+                "lab_delay_hooks"
+            ],
+            {"configured": True, "invoked": 4, "failed": 0, "retries": 0, "delivered": 4},
+        )
+
+    def test_callback_failure_is_not_fatal(self):
+        def boom(payload):
+            raise ValueError("pager is down")
+
+        ward = self._lab_ward({"callback": boom})
+        for _ in range(5):
+            ward.tick()  # t=5: lab runs slow, hook raises
+        snap = ward.tick()  # t=6: the tick still completes
+        self.assertTrue(snap["beds"][0]["online"])
+        event = ward.lab_delay_summary()["events"][0]
+        self.assertEqual(event["event"], "lab_delay_started")
+        self.assertTrue(event["hook_invoked"])
+        self.assertEqual(event["hook_errors"], ["pager is down"])
+        self.assertEqual(event["hook_final_status"], "failed")
+        summary = ward.lab_delay_summary()[
+            "lab_delay_hooks"
+        ]
+        self.assertEqual(summary["invoked"], 1)
+        self.assertEqual(summary["failed"], 1)
+
+    def test_webhook_posts_to_stub_server(self):
+        server, port, received = capture_server()
+        try:
+            ward = self._lab_ward(
+                {"webhook_url": "http://127.0.0.1:%d/hooks" % port}
+            )
+            for _ in range(70):
+                ward.tick()
+            self.assertTrue(ward.lab_delay_hooks.wait(timeout=5))
+            self.assertEqual(len(received), 2)
+            payloads = sorted(
+                (json.loads(r[2]) for r in received),
+                key=lambda p: p["t"],
+            )
+            self.assertEqual(
+                [(p["event"], p["t"]) for p in payloads],
+                [
+                    ("lab_delay_started", 5.0),
+                    ("lab_delay_ended", 65.0),
+                ],
+            )
+            path, content_type, body = received[0]
+            self.assertEqual(path, "/hooks")
+            self.assertEqual(content_type, "application/json")
+            start = [p for p in payloads if p["event"] == "lab_delay_started"][0]
+            self.assertEqual(
+                start["lab"], {"name": "bloods", "delay_s": 120.0}
+            )
+            self.assertEqual(start["beds"], [0])
+            summary = ward.lab_delay_summary()
+            self.assertEqual(
+                summary["lab_delay_hooks"],
+                {"configured": True, "invoked": 2, "failed": 0, "retries": 0, "delivered": 2},
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_scenario_lab_delay_hooks(self):
+        cfg = load_scenario(
+            os.path.join(
+                HERE, "..", "scenarios", "lab-delay-hooks.json"
+            )
+        )
+        self.assertTrue(cfg["lab_delay_hooks"].configured)
+        server, port, received = capture_server()
+        path = os.path.join(tempfile.mkdtemp(), "run.jsonl")
+        try:
+            # The scenario's URL is a placeholder; point it at
+            # the stub server for this run.
+            cfg["lab_delay_hooks"] = (
+                validate_lab_delay_hooks(
+                    {"webhook_url": "http://127.0.0.1:%d/hooks" % port}
+                )
+            )
+            ward = build_ward(cfg, seed=42)
+            with Recorder(path, ward.beds, ward.rate_hz, seed=42) as rec:
+                ward.recorder = rec
+                for _ in range(70):
+                    snap = ward.tick()
+            self.assertTrue(ward.lab_delay_hooks.wait(timeout=5))
+            # Two events over the run: the lab runs slow from
+            # 5 s and is back to normal at 65 s. The deliveries
+            # run in separate daemon threads, so their arrival
+            # order at the stub is not guaranteed — sort by
+            # event time before asserting.
+            self.assertEqual(len(received), 2)
+            payloads = sorted(
+                (json.loads(r[2]) for r in received),
+                key=lambda p: p["t"],
+            )
+            self.assertEqual(
+                [
+                    (p["event"], p["t"], p.get("bed"))
+                    for p in payloads
+                ],
+                [
+                    ("lab_delay_started", 5.0, None),
+                    ("lab_delay_ended", 65.0, None),
+                ],
+            )
+            # Every event records that its hook was invoked.
+            for event in snap["lab_delay"]["events"]:
+                self.assertTrue(event["hook_invoked"])
+            summary = ward.lab_delay_summary()
+            self.assertEqual(summary["event_count"], 2)
+            self.assertEqual(
+                summary["lab_delay_hooks"],
+                {"configured": True, "invoked": 2, "failed": 0, "retries": 0, "delivered": 2},
+            )
+            # The run summary carries the event count and the
+            # hook totals from the last tick — but only as of
+            # that tick: the snapshot in the file was recorded
+            # before the last delivery settled, so delivered is
+            # read from the live summary above, not from here.
+            run = summarize(path)
+            self.assertEqual(run["lab_delay"]["event_count"], 2)
+            self.assertTrue(
+                run["lab_delay"]["lab_delay_hooks"][
+                    "configured"
+                ]
+            )
+            self.assertEqual(
+                run["lab_delay"]["lab_delay_hooks"][
                     "invoked"
                 ],
                 2,

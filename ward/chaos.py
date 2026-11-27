@@ -611,6 +611,12 @@ class ChaosEngine:
         # same beds is a new event, so it fires again.
         self._pump_failure_started = set()
         self._pump_failure_ended = set()
+        # Lab-delay events fire their start hook once, on the
+        # first tick inside the window, and their end hook once,
+        # on the first tick after it — a second slow lab on the
+        # same beds is a new event, so it fires again.
+        self._lab_delay_started = set()
+        self._lab_delay_ended = set()
 
     def stockouts(self, ward, now):
         """Active pharmacy stockouts: ``{bed_id: {med, ...}}``.
@@ -795,6 +801,25 @@ class ChaosEngine:
                 ):
                     self._pump_failure_ended.add(id(ev))
                     ward._pump_failure_ended(ev, now)
+            # Lab delay: the start hook fires once, on the
+            # first tick inside the window, and the end hook
+            # once, on the first tick after it — so scenario
+            # code hears the lab run slow and return to normal
+            # exactly once per event, even across a run that
+            # ticks past the end. The check runs before the
+            # active gate below, so an end is caught on the
+            # tick the window closes.
+            if ev.type == "lab_delay":
+                if ev.active(now):
+                    if id(ev) not in self._lab_delay_started:
+                        self._lab_delay_started.add(id(ev))
+                        ward._lab_delay_started(ev, now)
+                elif (
+                    id(ev) in self._lab_delay_started
+                    and id(ev) not in self._lab_delay_ended
+                ):
+                    self._lab_delay_ended.add(id(ev))
+                    ward._lab_delay_ended(ev, now)
             if not ev.active(now):
                 continue
             if ev.type == "sensor_drift":

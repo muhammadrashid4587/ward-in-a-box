@@ -39,8 +39,9 @@ event starting or ending fires the ward's
 the ward's ``network_outage_hooks``; a medication stockout
 starting or ending fires the ward's
 ``medication_stockout_hooks``; an infusion pump failing or
-restarting fires the ward's ``pump_failure_hooks``. All
-fourteen share
+restarting fires the ward's ``pump_failure_hooks``; a lab
+running slow starting or returning to normal fires the ward's
+``lab_delay_hooks``. All fifteen share
 the same ``AlertHooks`` machinery — the same webhook and
 callback channels, the same best-effort delivery — just a
 different event payload.
@@ -299,6 +300,19 @@ def validate_pump_failure_hooks(value):
     )
 
 
+def validate_lab_delay_hooks(value):
+    """Normalize a lab-delay hook config (see
+    :func:`_validate_hooks`).
+
+    Fires when a lab delay starts or ends — when the lab
+    starts running slow and when it is back to normal —
+    rather than when a NEWS2 event fires.
+    """
+    return _validate_hooks(
+        value, "lab-delay", "lab_delay_hooks"
+    )
+
+
 class AlertHooks:
     """The configured hooks for one ward event, shared by its monitors.
 
@@ -307,8 +321,8 @@ class AlertHooks:
     ``"missed-dose"``, ``"discharge-readiness"``,
     ``"discharge-priority"``, ``"oxygen-outage"``,
     ``"power-outage"``, ``"sensor-drift"``, ``"bed-blocker"``, or
-    ``"network-outage"``, ``"medication-stockout"``, or
-    ``"pump-failure"``); it changes
+    ``"network-outage"``, ``"medication-stockout"``,
+    ``"pump-failure"``, or ``"lab-delay"``); it changes
     nothing about delivery.
     """
 

@@ -837,7 +837,10 @@ def summarize(path):
         # many overdue alarms raised — plus each bed still
         # waiting, with the results it is waiting on — so a run's
         # late results and the discharges they held up are visible
-        # without replaying every tick.
+        # without replaying every tick — plus how many lab-delay
+        # hook events fired this run, and whether the lab-delay
+        # hooks are configured and how many hook deliveries were
+        # invoked, failed, retried, and delivered.
         "lab_delay": (
             {
                 "beds_pending": last_lab_delay["beds_pending"],
@@ -856,6 +859,21 @@ def summarize(path):
                     for b in last_lab_delay["beds"]
                     if b["pending"] or b["overdue"]
                 },
+                "event_count": last_lab_delay.get(
+                    "event_count", 0
+                ),
+                "lab_delay_hooks": (
+                    last_lab_delay.get(
+                        "lab_delay_hooks",
+                        {
+                            "configured": False,
+                            "invoked": 0,
+                            "failed": 0,
+                            "retries": 0,
+                            "delivered": 0,
+                        },
+                    )
+                ),
             }
             if last_lab_delay is not None
             else None
