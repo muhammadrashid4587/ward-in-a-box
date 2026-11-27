@@ -548,6 +548,12 @@ class ChaosEngine:
         # on the same beds is a new event, so it fires again.
         self._medication_stockout_started = set()
         self._medication_stockout_ended = set()
+        # Pump-failure events fire their start hook once, on the
+        # first tick inside the window, and their end hook once,
+        # on the first tick after it — a second failure on the
+        # same beds is a new event, so it fires again.
+        self._pump_failure_started = set()
+        self._pump_failure_ended = set()
 
     def stockouts(self, ward, now):
         """Active pharmacy stockouts: ``{bed_id: {med, ...}}``.
@@ -714,6 +720,24 @@ class ChaosEngine:
                 ):
                     self._medication_stockout_ended.add(id(ev))
                     ward._medication_stockout_ended(ev, now)
+            # Pump failure: the start hook fires once, on the
+            # first tick inside the window, and the end hook
+            # once, on the first tick after it — so scenario
+            # code hears the pump fail and restart exactly once
+            # per event, even across a run that ticks past the
+            # end. The check runs before the active gate below,
+            # so an end is caught on the tick the window closes.
+            if ev.type == "pump_failure":
+                if ev.active(now):
+                    if id(ev) not in self._pump_failure_started:
+                        self._pump_failure_started.add(id(ev))
+                        ward._pump_failure_started(ev, now)
+                elif (
+                    id(ev) in self._pump_failure_started
+                    and id(ev) not in self._pump_failure_ended
+                ):
+                    self._pump_failure_ended.add(id(ev))
+                    ward._pump_failure_ended(ev, now)
             if not ev.active(now):
                 continue
             if ev.type == "sensor_drift":

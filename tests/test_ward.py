@@ -30,6 +30,7 @@ from ward.alert_hooks import (
     validate_network_outage_hooks,
     validate_oxygen_outage_hooks,
     validate_power_outage_hooks,
+    validate_pump_failure_hooks,
     validate_sensor_drift_hooks,
     validate_trend_alert_hooks,
     validate_wait_time_hooks,
@@ -12997,6 +12998,14 @@ class TestPumpFailure(unittest.TestCase):
                 "infusions": ["insulin"],
                 "max_drift": {"heart_rate": 18.0},
                 "beds": {"0": {"heart_rate": 18.0}},
+                "event_count": 1,
+                "pump_failure_hooks": {
+                    "configured": False,
+                    "invoked": 0,
+                    "failed": 0,
+                    "retries": 0,
+                    "delivered": 0,
+                },
             },
         )
 
@@ -13386,6 +13395,324 @@ class TestMedicationStockoutHooks(unittest.TestCase):
             )
             self.assertEqual(
                 run["medication_stockout"]["medication_stockout_hooks"][
+                    "invoked"
+                ],
+                2,
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+class TestPumpFailureHooks(unittest.TestCase):
+    # Pump-failure hooks: a pump failing or restarting fires
+    # the ward's pump_failure_hooks — the same webhook/callback
+    # machinery as the NEWS2 hooks — so something outside the
+    # ward hears the infusion stop and start again. A callback
+    # can use the start to escalate: the patient on that bed is
+    # about to drift off their infusion, and the drug will not
+    # flow again until the pump restarts.
+    PUMP = {
+        "drift": {"heart_rate": 0.5},
+        "recovery_rate": 1.0,
+    }
+
+    def _pump_ward(self, hooks=None):
+        return Ward(
+            beds=2,
+            profiles=["stable", "stable"],
+            infusions=["insulin", None],
+            chaos=[
+                ChaosEvent(
+                    "pump_failure",
+                    at=5,
+                    duration=55,
+                    bed=0,
+                    pump=self.PUMP,
+                )
+            ],
+            seed=42,
+            pump_failure_hooks=hooks,
+        )
+
+    def test_validate_pump_failure_hooks(self):
+        hooks = validate_pump_failure_hooks(None)
+        self.assertIsInstance(hooks, TrendAlertHooks)
+        self.assertFalse(hooks.configured)
+        self.assertEqual(hooks.kind, "pump-failure")
+        custom = validate_pump_failure_hooks(
+            {"webhook_url": "https://example.invalid/hooks", "timeout_s": 2}
+        )
+        self.assertTrue(custom.configured)
+        self.assertEqual(custom.kind, "pump-failure")
+        self.assertEqual(custom.timeout_s, 2.0)
+        seen = []
+        append = seen.append
+        cb = validate_pump_failure_hooks({"callback": append})
+        self.assertTrue(cb.configured)
+        self.assertIs(cb.callback, append)
+        with self.assertRaises(ValueError):
+            validate_pump_failure_hooks(
+                {"webhook_url": "ftp://x/hooks"}
+            )
+        with self.assertRaises(ValueError):
+            validate_pump_failure_hooks({"callback": "not callable"})
+        with self.assertRaises(ValueError):
+            validate_pump_failure_hooks({"timeout_s": 0})
+        with self.assertRaises(ValueError):
+            validate_pump_failure_hooks({"url": "http://x/hooks"})
+        with self.assertRaises(ValueError):
+            validate_pump_failure_hooks("http://x/hooks")
+
+    def test_hooks_off_by_default(self):
+        # No hooks configured: the pump still fails and
+        # restarts, and each event is recorded with no hook
+        # invoked.
+        ward = self._pump_ward()
+        self.assertFalse(ward.pump_failure_hooks.configured)
+        for _ in range(70):
+            ward.tick()
+        summary = ward.pump_failure_summary()
+        self.assertEqual(summary["event_count"], 2)
+        self.assertEqual(
+            [
+                (e["event"], e["t"])
+                for e in summary["events"]
+            ],
+            [
+                ("pump_failure_started", 5.0),
+                ("pump_failure_ended", 60.0),
+            ],
+        )
+        for event in summary["events"]:
+            self.assertFalse(event["hook_invoked"])
+            self.assertEqual(event["hook_errors"], [])
+            self.assertEqual(event["hook_retries"], 0)
+            self.assertEqual(
+                event["hook_final_status"], "not_invoked"
+            )
+        self.assertEqual(
+            summary["pump_failure_hooks"],
+            {"configured": False, "invoked": 0, "failed": 0, "retries": 0, "delivered": 0},
+        )
+        self.assertEqual(
+            ward.snapshot()["pump_failure"]["event_count"], 2
+        )
+
+    def test_callback_hook_fires_for_start_and_end(self):
+        seen = []
+        ward = self._pump_ward({"callback": seen.append})
+        self.assertTrue(ward.pump_failure_hooks.configured)
+        for _ in range(70):
+            ward.tick()
+        # Two events over the run: the pump fails at 5 s and
+        # restarts at 60 s. The patient drifts in between, but
+        # the failure itself fires once on start and once on
+        # end, not once a tick.
+        self.assertEqual(
+            [(p["event"], p["t"]) for p in seen],
+            [
+                ("pump_failure_started", 5.0),
+                ("pump_failure_ended", 60.0),
+            ],
+        )
+        start, end = seen
+        self.assertEqual(
+            {k: v for k, v in start.items() if k != "hook_retries"
+             and k != "hook_final_status"},
+            {
+                "event": "pump_failure_started",
+                "t": 5.0,
+                "at": 5.0,
+                "ends": 60.0,
+                "duration": 55,
+                "beds": [0],
+                "pump": self.PUMP,
+            },
+        )
+        self.assertEqual(end["event"], "pump_failure_ended")
+        self.assertEqual(end["t"], 60.0)
+        self.assertEqual(end["beds"], [0])
+        # Every event records the invocation.
+        summary = ward.pump_failure_summary()
+        self.assertEqual(summary["event_count"], 2)
+        for event in summary["events"]:
+            self.assertTrue(event["hook_invoked"])
+            self.assertEqual(event["hook_errors"], [])
+            self.assertEqual(event["hook_final_status"], "delivered")
+        self.assertEqual(
+            summary["pump_failure_hooks"],
+            {"configured": True, "invoked": 2, "failed": 0, "retries": 0, "delivered": 2},
+        )
+
+    def test_start_and_end_fire_again_for_a_second_failure(self):
+        # Two pump failures on the same bed: the start and the
+        # end fire once per failure — the engine tracks each
+        # event separately, so the second failure fires again.
+        seen = []
+        ward = Ward(
+            beds=1,
+            profiles=["stable"],
+            infusions=["insulin"],
+            chaos=[
+                ChaosEvent(
+                    "pump_failure",
+                    at=5,
+                    duration=10,
+                    bed=0,
+                    pump=self.PUMP,
+                ),
+                ChaosEvent(
+                    "pump_failure",
+                    at=30,
+                    duration=10,
+                    bed=0,
+                    pump=self.PUMP,
+                ),
+            ],
+            seed=42,
+            pump_failure_hooks={"callback": seen.append},
+        )
+        for _ in range(45):
+            ward.tick()
+        self.assertEqual(
+            [(p["event"], p["t"]) for p in seen],
+            [
+                ("pump_failure_started", 5.0),
+                ("pump_failure_ended", 15.0),
+                ("pump_failure_started", 30.0),
+                ("pump_failure_ended", 40.0),
+            ],
+        )
+        self.assertEqual(
+            ward.pump_failure_summary()[
+                "pump_failure_hooks"
+            ],
+            {"configured": True, "invoked": 4, "failed": 0, "retries": 0, "delivered": 4},
+        )
+
+    def test_callback_failure_is_not_fatal(self):
+        def boom(payload):
+            raise ValueError("pager is down")
+
+        ward = self._pump_ward({"callback": boom})
+        for _ in range(5):
+            ward.tick()  # t=5: pump fails, hook raises
+        snap = ward.tick()  # t=6: the tick still completes
+        self.assertTrue(snap["beds"][0]["online"])
+        event = ward.pump_failure_summary()["events"][0]
+        self.assertEqual(event["event"], "pump_failure_started")
+        self.assertTrue(event["hook_invoked"])
+        self.assertEqual(event["hook_errors"], ["pager is down"])
+        self.assertEqual(event["hook_final_status"], "failed")
+        summary = ward.pump_failure_summary()[
+            "pump_failure_hooks"
+        ]
+        self.assertEqual(summary["invoked"], 1)
+        self.assertEqual(summary["failed"], 1)
+
+    def test_webhook_posts_to_stub_server(self):
+        server, port, received = capture_server()
+        try:
+            ward = self._pump_ward(
+                {"webhook_url": "http://127.0.0.1:%d/hooks" % port}
+            )
+            for _ in range(70):
+                ward.tick()
+            self.assertTrue(ward.pump_failure_hooks.wait(timeout=5))
+            self.assertEqual(len(received), 2)
+            payloads = sorted(
+                (json.loads(r[2]) for r in received),
+                key=lambda p: p["t"],
+            )
+            self.assertEqual(
+                [(p["event"], p["t"]) for p in payloads],
+                [
+                    ("pump_failure_started", 5.0),
+                    ("pump_failure_ended", 60.0),
+                ],
+            )
+            path, content_type, body = received[0]
+            self.assertEqual(path, "/hooks")
+            self.assertEqual(content_type, "application/json")
+            start = [p for p in payloads if p["event"] == "pump_failure_started"][0]
+            self.assertEqual(start["pump"], self.PUMP)
+            self.assertEqual(start["beds"], [0])
+            summary = ward.pump_failure_summary()
+            self.assertEqual(
+                summary["pump_failure_hooks"],
+                {"configured": True, "invoked": 2, "failed": 0, "retries": 0, "delivered": 2},
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_scenario_pump_failure_hooks(self):
+        cfg = load_scenario(
+            os.path.join(
+                HERE, "..", "scenarios", "pump-failure-hooks.json"
+            )
+        )
+        self.assertTrue(cfg["pump_failure_hooks"].configured)
+        server, port, received = capture_server()
+        path = os.path.join(tempfile.mkdtemp(), "run.jsonl")
+        try:
+            # The scenario's URL is a placeholder; point it at
+            # the stub server for this run.
+            cfg["pump_failure_hooks"] = (
+                validate_pump_failure_hooks(
+                    {"webhook_url": "http://127.0.0.1:%d/hooks" % port}
+                )
+            )
+            ward = build_ward(cfg, seed=42)
+            with Recorder(path, ward.beds, ward.rate_hz, seed=42) as rec:
+                ward.recorder = rec
+                for _ in range(70):
+                    snap = ward.tick()
+            self.assertTrue(ward.pump_failure_hooks.wait(timeout=5))
+            # Two events over the run: the pump fails at 5 s
+            # and restarts at 60 s. The deliveries run in
+            # separate daemon threads, so their arrival order
+            # at the stub is not guaranteed — sort by event
+            # time before asserting.
+            self.assertEqual(len(received), 2)
+            payloads = sorted(
+                (json.loads(r[2]) for r in received),
+                key=lambda p: p["t"],
+            )
+            self.assertEqual(
+                [
+                    (p["event"], p["t"], p.get("bed"))
+                    for p in payloads
+                ],
+                [
+                    ("pump_failure_started", 5.0, None),
+                    ("pump_failure_ended", 60.0, None),
+                ],
+            )
+            # Every event records that its hook was invoked.
+            for event in snap["pump_failure"]["events"]:
+                self.assertTrue(event["hook_invoked"])
+            summary = ward.pump_failure_summary()
+            self.assertEqual(summary["event_count"], 2)
+            self.assertEqual(
+                summary["pump_failure_hooks"],
+                {"configured": True, "invoked": 2, "failed": 0, "retries": 0, "delivered": 2},
+            )
+            # The run summary carries the event count and the
+            # hook totals from the last tick — but only as of
+            # that tick: the snapshot in the file was recorded
+            # before the last delivery settled, so delivered is
+            # read from the live summary above, not from here.
+            run = summarize(path)
+            self.assertEqual(run["pump_failure"]["event_count"], 2)
+            self.assertTrue(
+                run["pump_failure"]["pump_failure_hooks"][
+                    "configured"
+                ]
+            )
+            self.assertEqual(
+                run["pump_failure"]["pump_failure_hooks"][
                     "invoked"
                 ],
                 2,

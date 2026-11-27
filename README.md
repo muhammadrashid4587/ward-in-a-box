@@ -279,6 +279,12 @@ python3 -m ward.cli scenarios/medication-stockout-hooks.json --seed 42
 # 87 s, while bed 1, with no infusion running, is untouched
 python3 -m ward.cli scenarios/pump-failure.json --seed 42
 
+# Pump-failure hooks: the same ward, with the pump failing at
+# 5 s and restarting at 60 s also POSTed to a webhook (here a
+# placeholder URL — point it at your own endpoint; a dead
+# endpoint is logged, never fatal)
+python3 -m ward.cli scenarios/pump-failure-hooks.json --seed 42
+
 # Reproducible run
 python3 -m ward.cli scenarios/example.json --seed 42
 ```
@@ -366,7 +372,8 @@ python3 -m ward.cli scenarios/example.json --seed 42
 - `GET /pump-failure` — per-bed infusion-pump-failure state:
   whether each pump is down, which infusion it was delivering,
   when it is running again, and how far each vital has drifted
-  for want of the infusion, plus ward totals, as JSON
+  for want of the infusion, plus ward totals, the pump-failure
+  event history, and the pump-failure hook totals, as JSON
   (503 while partitioned)
 
 A reading looks like:
@@ -1233,6 +1240,55 @@ reading 102.86 with the NEWS2 heart-rate component at 1 — then
 recovers 1.0 bpm a tick once the pump restarts and is back to
 zero at 87 s, while the control bed, with no infusion running,
 never drifts.
+
+## Pump-failure hooks
+
+An infusion pump failing is the moment a ward most needs the
+outside world to hear about it — the drug has stopped flowing,
+the patient on that bed is about to drift off their infusion,
+and the drug will not flow again until the pump restarts — so
+the hook makes sure something outside the ward hears about it.
+A ward that wants the outside world to hear about that moment
+— a dashboard, a pager, a pharmacist — configures pump-failure
+hooks, the same channels as the NEWS2 hooks (webhook and/or
+in-process callback), on the same best-effort, never-fatal
+terms:
+
+```json
+{"pump_failure_hooks": {"webhook_url": "http://127.0.0.1:18099/hooks"}}
+```
+
+Two events fire. `pump_failure_started` fires once, in the
+tick the pump fails, with the failure window (`"at"`,
+`"ends"`, `"duration"`), the beds it targets, and the
+failure's pump config — its drift rates and its recovery
+rate. `pump_failure_ended` fires once, in the tick the pump
+restarts, with the same window. A pump that stays down for
+fifty ticks fires once, not fifty times, and a second failure
+fires again — the start and end are per event, not per run.
+An in-process callback gets the same payloads in the tick the
+event fires (Python API only — a scenario file cannot hold a
+callable), so scenario code can log or escalate on the pump
+failing directly. Each event records whether the hook was
+invoked (`"hook_invoked"`, False with no hooks) and any
+synchronous error (`"hook_errors"`), and the pump-failure
+summary carries the event totals (`"event_count"`, the full
+`"events"` history) and the ward pump-failure-hook totals
+(`"pump_failure_hooks"`: whether any hook is configured, how
+many deliveries were invoked, how many failed, how many
+retries were spent, and how many deliveries eventually landed)
+— in `GET /pump-failure`, every snapshot and WebSocket frame,
+and the run summary (`--summary`). The same retry rules as
+the NEWS2 hooks apply — a failed webhook POST is retried with
+backoff up to `"max_retries"` times, and the event records
+`"hook_retries"` and `"hook_final_status"` alongside
+`"hook_invoked"`. Hooks are off by default, so a ward with
+none configured behaves exactly as before. See
+`scenarios/pump-failure-hooks.json` for a runnable example:
+over a seeded 70-tick run the same ward as
+`pump-failure.json` stops bed 0's insulin pump at 5 s and
+restarts it at 60 s — POSTed to the configured webhook, with
+2 hook deliveries invoked and 0 failed against a stub server.
 
 ## Medication-stockout hooks
 
@@ -2629,7 +2685,7 @@ endpoints returned 503 while it lasted, the ticks did not stop.
 make test
 ```
 
-471 tests: vitals stay inside plausible ranges, dropout actually stops a
+496 tests: vitals stay inside plausible ranges, dropout actually stops a
 monitor's stream, an alarm storm produces alarms, stale readings freeze,
 a partition blocks the snapshot endpoint, the HTTP endpoints serve valid
 JSON, the stream serves JSON lines, scenario files validate, alarm
@@ -2705,6 +2761,13 @@ the drift clearing on a new admission, the `/pump-failure`
 endpoint (503 while partitioned), the run summary, the WebSocket
 frame, and the `pump-failure.json` scenario with a ward-wide
 failure drifting only the bed on an infusion over a seeded run.
+Pump-failure-hooks tests cover config validation, hooks off by
+default with both events still recorded, a callback firing once
+on the pump failing and once on it restarting with the failure
+window and pump config, a second failure firing again, a failing
+callback not killing the tick, a webhook POSTed to a stub server,
+and the `pump-failure-hooks.json` scenario with 2 hook deliveries
+invoked and 0 failed over a seeded run.
 Triage tests cover a patient waiting while the ward is
 full, admission with fresh vitals when a bed frees up, a critical
 patient jumping the queue, FIFO order within one acuity, diversion
@@ -3455,3 +3518,16 @@ the hook totals.
   `"pump_failure"` object in every snapshot, WebSocket frame, a
   `GET /pump-failure` endpoint, and the run summary) — done in
   v0.58.0
+- Pump-failure hooks (when an infusion pump fails or restarts —
+  a configured webhook URL gets a `pump_failure_started` /
+  `pump_failure_ended` event payload POSTed to it, or an
+  in-process callback is called with the same payload in the
+  firing tick, so a hook can escalate on the infusion stopping;
+  one start and one end per failure, re-armed for a second
+  failure; reusing the NEWS2 hook machinery, best effort and
+  never fatal; each event records whether the hook was invoked,
+  and the pump-failure summary carries the event history and
+  the pump-failure-hook totals, in every snapshot, WebSocket
+  frame, a `GET /pump-failure` endpoint, and the run summary;
+  off by default, configured per ward with `pump_failure_hooks`
+  in the scenario) — done in v0.59.0

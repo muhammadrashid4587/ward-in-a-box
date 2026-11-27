@@ -38,7 +38,9 @@ event starting or ending fires the ward's
 ``bed_blocker_hooks``; a network outage starting or ending fires
 the ward's ``network_outage_hooks``; a medication stockout
 starting or ending fires the ward's
-``medication_stockout_hooks``. All thirteen share
+``medication_stockout_hooks``; an infusion pump failing or
+restarting fires the ward's ``pump_failure_hooks``. All
+fourteen share
 the same ``AlertHooks`` machinery — the same webhook and
 callback channels, the same best-effort delivery — just a
 different event payload.
@@ -283,6 +285,20 @@ def validate_medication_stockout_hooks(value):
     )
 
 
+def validate_pump_failure_hooks(value):
+    """Normalize a pump-failure hook config (see
+    :func:`_validate_hooks`).
+
+    Fires when an infusion pump fails or restarts — when
+    a bedside pump stops delivering its infusion and when
+    it is running again — rather than when a NEWS2 event
+    fires.
+    """
+    return _validate_hooks(
+        value, "pump-failure", "pump_failure_hooks"
+    )
+
+
 class AlertHooks:
     """The configured hooks for one ward event, shared by its monitors.
 
@@ -291,7 +307,8 @@ class AlertHooks:
     ``"missed-dose"``, ``"discharge-readiness"``,
     ``"discharge-priority"``, ``"oxygen-outage"``,
     ``"power-outage"``, ``"sensor-drift"``, ``"bed-blocker"``, or
-    ``"network-outage"``, or ``"medication-stockout"``); it changes
+    ``"network-outage"``, ``"medication-stockout"``, or
+    ``"pump-failure"``); it changes
     nothing about delivery.
     """
 
