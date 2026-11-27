@@ -387,6 +387,14 @@ python3 -m ward.cli scenarios/alarm-storm-ack-totals.json --seed 42
 # quiet, beds 1 and 2 average 30.5 s and alert
 python3 -m ward.cli scenarios/alarm-storm-ack-slowest-bed.json --seed 42
 
+# Slowest-bed alert hooks: the same burst twice, with the
+# slowest-bed alert also POSTed to a webhook (here a
+# placeholder URL — point it at your own endpoint; a dead
+# endpoint is logged, never fatal) — beds 1 and 2 each fire
+# their slowest-bed event at 158 s, when the second storm's
+# acks push their mean to 30.5 s, past the 30.0 s threshold
+python3 -m ward.cli scenarios/alarm-storm-ack-slowest-bed-hooks.json --seed 42
+
 # Reproducible run
 python3 -m ward.cli scenarios/example.json --seed 42
 ```
@@ -525,7 +533,9 @@ python3 -m ward.cli scenarios/example.json --seed 42
   still pending, and the mean and longest time it took to
   clear a storm's alarms), the slowest-bed alert threshold
   and the beds whose mean time to ack across the storms
-  they fully cleared is above it, the storm event history,
+  they fully cleared is above it — each bed newly crossing
+  it also fires an `alarm_storm_slowest_bed` hook event in
+  the tick it crosses — the storm event history,
   and the alarm-storm-hook totals, as JSON
   (503 while partitioned)
 
@@ -1220,7 +1230,15 @@ and total raises, how many alarms were acked, when the last
 ack landed and how long that took from the storm's start,
 and the shift on duty then with how many nurses it had, so
 a hook hears not just that the ward has calmed down but
-that the nurses have actually caught up. A storm
+that the nurses have actually caught up. `alarm_storm_slowest_bed`
+fires once per bed, in the tick that bed's mean time to ack
+across the storms it fully cleared crosses the slowest-bed
+alert threshold — with the bed, its mean and longest time,
+the threshold, and how many storms it raised in and cleared
+— so a hook hears the moment a bed falls behind instead of
+having to poll the summary; a bed whose mean drops back
+below the threshold is re-armed and fires again if it
+crosses later. A storm
 that stays open for sixty ticks fires once, not sixty
 times, and a second burst fires again — the detector
 re-arms when the trailing count falls back below the
@@ -1263,7 +1281,13 @@ invoked and 0 failed against a stub server. See
 a thin roster of one nurse for twelve beds: the storm ends
 at 73 s with all 15 alarms still pending, so the
 acknowledged event fires only at 103 s, 91.0 s after the
-storm started.
+storm started. See
+`scenarios/alarm-storm-ack-slowest-bed-hooks.json` for the
+burst twice with a 30.0 s mean-ack threshold: beds 1 and 2
+average 30.5 s and each fire their slowest-bed event at
+158 s, when the second storm's acks push their mean over the
+threshold — 8 hook deliveries invoked and 0 failed against
+a stub server over a seeded 220-tick run.
 
 ## Alarm-storm acknowledgement
 
@@ -4632,6 +4656,18 @@ the hook totals.
   behind instead of having to poll the totals; off by
   default, and a bed with no fully-cleared storm never
   alerts) — done in v0.75.0
-- Next: a slowest-bed alert hook event, so a ward hears
-  about the bed falling behind the moment it crosses the
-  threshold instead of having to poll the summary
+- Slowest-bed alert hook event (an
+  `alarm_storm_slowest_bed` event fires in the tick a bed's
+  mean time to ack across the storms it fully cleared
+  crosses the threshold — with the bed, its mean and
+  longest time, the threshold, and how many storms it
+  raised in and cleared — through the same
+  `alarm_storm_hooks`, once per crossing and re-armed when
+  the bed's mean drops back below the threshold, in the
+  alarm-storm summary, every snapshot, WebSocket frame, a
+  `GET /alarm-storm` endpoint, and the run summary) — done
+  in v0.76.0
+- Next: a slowest-bed alert cleared hook event, so a ward
+  hears the moment a bed's mean time to ack drops back
+  below the threshold — when it recovers — instead of only
+  hearing when it falls behind

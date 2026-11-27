@@ -435,6 +435,12 @@ class Ward:
         # Every alarm-storm hook event this run — the audit
         # trail for the alarm-storm hooks.
         self.alarm_storm_events = []
+        # The beds whose slowest-bed alert has already fired
+        # its hook event this run — one event per crossing of
+        # the threshold, re-armed when a bed's mean drops
+        # back below it, so a bed that falls behind again
+        # pages again.
+        self._slowest_bed_alerted = set()
         # Every storm that has ended this run, in order — the
         # acknowledgement record for each: when it started and
         # ended, how many alarms it raised, how many of them
@@ -738,6 +744,13 @@ class Ward:
         # same raises feed both, and before the snapshot, so the
         # event is in it.
         self._check_alarm_storm()
+        # Slowest-bed alert hooks: with this tick's acks in — the
+        # staffing tick above has already acknowledged what the
+        # nurses got to, and the storm check above has settled
+        # this tick's storms — a bed whose mean time to ack has
+        # just crossed the threshold fires its hook event now,
+        # in this tick, not when the storm ends.
+        self._check_slowest_bed_alerts()
         # Discharge paperwork timing: a bed flagged ready starts
         # its paperwork clock, and one that stops being ready (or
         # leaves) drops it until it flags ready again — so the
@@ -1884,6 +1897,73 @@ class Ward:
             "ack_nurses": storm["ack_nurses"],
         }
 
+    def _alarm_storm_views(self):
+        """Every storm this run as plain JSON data, oldest first.
+
+        Ended storms from the history, plus the open storm if
+        any, listed last with ``ended_t`` null and its ack still
+        in progress — the same list the summary serves.
+        """
+        storms = [
+            self._alarm_storm_view(s)
+            for s in self.alarm_storm_history
+        ]
+        if self._alarm_storm_open is not None:
+            storms.append(
+                self._alarm_storm_view(self._alarm_storm_open)
+            )
+        return storms
+
+    def _check_slowest_bed_alerts(self):
+        """Fire a hook event for each bed newly crossing the slowest-bed threshold.
+
+        A bed's mean time to ack moves whenever one of its
+        storms is fully cleared — its per-bed time goes from
+        null to a number — so the check runs every tick, after
+        the staffing tick has acknowledged what the nurses got
+        to and the storm check has settled this tick's storms.
+        Each bed whose mean is above
+        ``slowest_bed_alert_threshold_s`` and has not already
+        fired gets one ``alarm_storm_slowest_bed`` event, in
+        this tick, through the same ``alarm_storm_hooks`` as
+        the started / ended / acknowledged events, with the
+        bed, its mean and longest time, the threshold, and how
+        many storms it raised in and cleared — the same entry
+        the summary lists under ``slowest_bed_alerts``. A bed
+        whose mean drops back below the threshold is re-armed:
+        it fires again if it crosses later, so a bed that
+        recovers and falls behind again pages again. With no
+        threshold configured the alert list is empty and
+        nothing fires, so a ward with the alert off behaves
+        exactly as before.
+        """
+        storms = self._alarm_storm_views()
+        totals = self._bed_ack_totals(storms)
+        alerts = self._slowest_bed_alerts(totals, storms)
+        for alert in alerts:
+            if alert["bed"] not in self._slowest_bed_alerted:
+                self._fire_alarm_storm_event(
+                    "alarm_storm_slowest_bed",
+                    self.elapsed,
+                    {
+                        "bed": alert["bed"],
+                        "mean_time_to_ack_s": (
+                            alert["mean_time_to_ack_s"]
+                        ),
+                        "max_time_to_ack_s": (
+                            alert["max_time_to_ack_s"]
+                        ),
+                        "threshold_s": alert["threshold_s"],
+                        "storms": alert["storms"],
+                        "cleared_storms": (
+                            alert["cleared_storms"]
+                        ),
+                    },
+                )
+        self._slowest_bed_alerted = {
+            alert["bed"] for alert in alerts
+        }
+
     def _fire_alarm_storm_event(self, kind, now, extra):
         """Fire one alarm-storm hook event.
 
@@ -1898,7 +1978,10 @@ class Ward:
         the last ack landed and how long that took from the
         storm's start, and the shift on duty then with how
         many nurses it had, and the per-bed acknowledgement
-        times. The event is
+        times. A slowest-bed event carries the bed whose mean
+        time to ack has just crossed the threshold, its mean
+        and longest time, the threshold, and how many storms
+        it raised in and cleared. The event is
         recorded on the audit trail with whether the hook was
         invoked for it, any synchronous error, and the retries
         and final delivery outcome.
@@ -1952,9 +2035,13 @@ class Ward:
         storms it raised in and cleared — empty while the
         threshold is off (null) or no bed's mean crosses it, so
         a dashboard hears about the bed falling behind instead
-        of having to poll the totals. ``event_count``
+        of having to poll the totals, and each bed newly
+        crossing it also fires an ``alarm_storm_slowest_bed``
+        hook event in the tick it crosses, through the same
+        ``alarm_storm_hooks``. ``event_count``
         counts every alarm-storm hook event this run — storms
-        starting, ending, and being acknowledged — and
+        starting, ending, being acknowledged, and beds
+        crossing the slowest-bed threshold — and
         ``events`` lists them, each with the tick, the storm's
         shape, and whether the
         ward's hooks were invoked for it (``hook_invoked``)
@@ -1966,12 +2053,7 @@ class Ward:
         and how many deliveries eventually landed.
         """
         open_storm = self._alarm_storm_open
-        storms = [
-            self._alarm_storm_view(s)
-            for s in self.alarm_storm_history
-        ]
-        if open_storm is not None:
-            storms.append(self._alarm_storm_view(open_storm))
+        storms = self._alarm_storm_views()
         acknowledged = [s for s in storms if s["acknowledged"]]
         times = [
             s["time_to_ack_s"]

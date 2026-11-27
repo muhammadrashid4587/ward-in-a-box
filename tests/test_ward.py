@@ -16516,6 +16516,291 @@ class TestAlarmStormHooks(unittest.TestCase):
             server.shutdown()
             server.server_close()
 
+    def test_callback_hook_fires_for_slowest_bed(self):
+        # The same burst twice, with a 30.0 s mean-ack
+        # threshold: bed 0 averages 26.0 s and stays quiet,
+        # beds 1 and 2 average 30.5 s — and the moment the
+        # second storm's acks push their mean over the
+        # threshold, in the tick the last of them is acked,
+        # each fires an alarm_storm_slowest_bed event, while
+        # the second storm is still open. The event fires
+        # once per bed, not once a tick, even though the mean
+        # stays above the threshold for the rest of the run.
+        seen = []
+        cfg = load_scenario(
+            os.path.join(
+                HERE,
+                "..",
+                "scenarios",
+                "alarm-storm-ack-slowest-bed.json",
+            )
+        )
+        cfg["alarm_storm_hooks"] = {"callback": seen.append}
+        ward = build_ward(cfg, seed=42)
+        for _ in range(220):
+            ward.tick()
+        self.assertEqual(
+            [(p["event"], p["t"]) for p in seen],
+            [
+                ("alarm_storm_started", 17.0),
+                ("alarm_storm_ended", 77.0),
+                ("alarm_storm_acknowledged", 77.0),
+                ("alarm_storm_started", 127.0),
+                ("alarm_storm_slowest_bed", 158.0),
+                ("alarm_storm_slowest_bed", 158.0),
+                ("alarm_storm_ended", 187.0),
+                ("alarm_storm_acknowledged", 187.0),
+            ],
+        )
+        slowest = [
+            p for p in seen if p["event"] == "alarm_storm_slowest_bed"
+        ]
+        self.assertEqual(
+            [
+                (
+                    p["bed"],
+                    p["mean_time_to_ack_s"],
+                    p["max_time_to_ack_s"],
+                    p["threshold_s"],
+                    p["storms"],
+                    p["cleared_storms"],
+                )
+                for p in slowest
+            ],
+            [
+                (1, 30.5, 31.0, 30.0, 2, 2),
+                (2, 30.5, 31.0, 30.0, 2, 2),
+            ],
+        )
+        # Every event records the invocation, and the hook
+        # totals count the two slowest-bed deliveries with
+        # the rest.
+        summary = ward.alarm_storm_summary()
+        self.assertEqual(summary["event_count"], 8)
+        for event in summary["events"]:
+            self.assertTrue(event["hook_invoked"])
+            self.assertEqual(event["hook_errors"], [])
+            self.assertEqual(event["hook_final_status"], "delivered")
+        self.assertEqual(
+            summary["alarm_storm_hooks"],
+            {"configured": True, "invoked": 8, "failed": 0, "retries": 0, "delivered": 8},
+        )
+
+    def test_slowest_bed_hook_fires_once_and_rearms(self):
+        # Four storms, with a 20.0 s mean-ack threshold. Bed 0
+        # clears the first storm in 26.0 s and fires at 43 s;
+        # beds 1 and 2 clear it in 30.0 s and fire at 47 s.
+        # The second storm is arranged so beds 1 and 2 raise
+        # their alarms early and the storm is only detected
+        # once beds 0 and 3 burst, long after those alarms
+        # were acked — so beds 1 and 2 time it at 0.0 s, their
+        # mean falls to 15.0 s, and they drop off the alert
+        # list. Two more ordinary storms pull the mean back
+        # over the threshold, and beds 1 and 2 fire again at
+        # 377 s — one event per crossing, re-armed by
+        # recovering, not one event per bed per run.
+        seen = []
+        ward = Ward(
+            beds=12,
+            profiles=["stable"] * 12,
+            chaos=[
+                ChaosEvent(
+                    "alarm_storm",
+                    at=10,
+                    duration=5,
+                    beds=[0],
+                ),
+                ChaosEvent(
+                    "alarm_storm",
+                    at=15,
+                    duration=5,
+                    beds=[1, 2],
+                ),
+                ChaosEvent(
+                    "alarm_storm",
+                    at=120,
+                    duration=2,
+                    beds=[1, 2],
+                ),
+                ChaosEvent(
+                    "alarm_storm",
+                    at=165,
+                    duration=5,
+                    beds=[0, 3],
+                ),
+                ChaosEvent(
+                    "alarm_storm",
+                    at=230,
+                    duration=5,
+                    beds=[0],
+                ),
+                ChaosEvent(
+                    "alarm_storm",
+                    at=235,
+                    duration=5,
+                    beds=[1, 2],
+                ),
+                ChaosEvent(
+                    "alarm_storm",
+                    at=340,
+                    duration=5,
+                    beds=[0],
+                ),
+                ChaosEvent(
+                    "alarm_storm",
+                    at=345,
+                    duration=5,
+                    beds=[1, 2],
+                ),
+            ],
+            seed=42,
+            alarm_storm={"slowest_bed_alert_threshold_s": 20.0},
+            alarm_storm_hooks={"callback": seen.append},
+        )
+        for _ in range(500):
+            ward.tick()
+        slowest = [
+            p for p in seen if p["event"] == "alarm_storm_slowest_bed"
+        ]
+        self.assertEqual(
+            [
+                (
+                    p["bed"],
+                    p["t"],
+                    p["mean_time_to_ack_s"],
+                    p["max_time_to_ack_s"],
+                    p["storms"],
+                    p["cleared_storms"],
+                )
+                for p in slowest
+            ],
+            [
+                (0, 43.0, 26.0, 26.0, 1, 1),
+                (1, 47.0, 30.0, 30.0, 1, 1),
+                (2, 47.0, 30.0, 30.0, 1, 1),
+                (3, 198.0, 31.0, 31.0, 1, 1),
+                (1, 377.0, 22.5, 30.0, 4, 4),
+                (2, 377.0, 22.5, 30.0, 4, 4),
+            ],
+        )
+        # Four storms, three events each, plus the six
+        # slowest-bed events.
+        summary = ward.alarm_storm_summary()
+        self.assertEqual(summary["event_count"], 18)
+        self.assertEqual(
+            summary["alarm_storm_hooks"],
+            {"configured": True, "invoked": 18, "failed": 0, "retries": 0, "delivered": 18},
+        )
+
+    def test_scenario_alarm_storm_slowest_bed_hooks(self):
+        cfg = load_scenario(
+            os.path.join(
+                HERE,
+                "..",
+                "scenarios",
+                "alarm-storm-ack-slowest-bed-hooks.json",
+            )
+        )
+        self.assertTrue(cfg["alarm_storm_hooks"].configured)
+        server, port, received = capture_server()
+        path = os.path.join(tempfile.mkdtemp(), "run.jsonl")
+        try:
+            # The scenario's URL is a placeholder; point it at
+            # the stub server for this run.
+            cfg["alarm_storm_hooks"] = (
+                validate_alarm_storm_hooks(
+                    {"webhook_url": "http://127.0.0.1:%d/hooks" % port}
+                )
+            )
+            ward = build_ward(cfg, seed=42)
+            with Recorder(path, ward.beds, ward.rate_hz, seed=42) as rec:
+                ward.recorder = rec
+                for _ in range(220):
+                    snap = ward.tick()
+            self.assertTrue(ward.alarm_storm_hooks.wait(timeout=5))
+            # Eight events over the run: two storms, each
+            # starting, ending, and being acknowledged — and
+            # beds 1 and 2 each firing a slowest-bed event at
+            # 158 s, when the second storm's acks push their
+            # mean over the 30.0 s threshold. The deliveries
+            # run in separate daemon threads, so their arrival
+            # order at the stub is not guaranteed — sort by
+            # event time, then by the order the ward fires
+            # them in, then by bed, before asserting.
+            self.assertEqual(len(received), 8)
+            order = {
+                "alarm_storm_started": 0,
+                "alarm_storm_slowest_bed": 1,
+                "alarm_storm_ended": 2,
+                "alarm_storm_acknowledged": 3,
+            }
+            payloads = sorted(
+                (json.loads(r[2]) for r in received),
+                key=lambda p: (
+                    p["t"],
+                    order[p["event"]],
+                    p.get("bed", -1),
+                ),
+            )
+            self.assertEqual(
+                [
+                    (p["event"], p["t"], p.get("bed"))
+                    for p in payloads
+                ],
+                [
+                    ("alarm_storm_started", 17.0, None),
+                    ("alarm_storm_ended", 77.0, None),
+                    ("alarm_storm_acknowledged", 77.0, None),
+                    ("alarm_storm_started", 127.0, None),
+                    ("alarm_storm_slowest_bed", 158.0, 1),
+                    ("alarm_storm_slowest_bed", 158.0, 2),
+                    ("alarm_storm_ended", 187.0, None),
+                    ("alarm_storm_acknowledged", 187.0, None),
+                ],
+            )
+            slowest = [
+                p
+                for p in payloads
+                if p["event"] == "alarm_storm_slowest_bed"
+            ]
+            for p in slowest:
+                self.assertEqual(p["mean_time_to_ack_s"], 30.5)
+                self.assertEqual(p["max_time_to_ack_s"], 31.0)
+                self.assertEqual(p["threshold_s"], 30.0)
+                self.assertEqual(p["storms"], 2)
+                self.assertEqual(p["cleared_storms"], 2)
+            # Every event records that its hook was invoked.
+            for event in snap["alarm_storm"]["events"]:
+                self.assertTrue(event["hook_invoked"])
+            summary = ward.alarm_storm_summary()
+            self.assertEqual(summary["event_count"], 8)
+            self.assertEqual(
+                summary["alarm_storm_hooks"],
+                {"configured": True, "invoked": 8, "failed": 0, "retries": 0, "delivered": 8},
+            )
+            # The run summary carries the event count, the
+            # hook totals, and the slowest-bed alerts from
+            # the last tick — but only as of that tick: the
+            # snapshot in the file was recorded before the
+            # last delivery settled, so delivered is read
+            # from the live summary above, not from here.
+            run = summarize(path)
+            self.assertEqual(run["alarm_storm"]["event_count"], 8)
+            self.assertEqual(
+                run["alarm_storm"]["alarm_storm_hooks"][
+                    "invoked"
+                ],
+                8,
+            )
+            self.assertEqual(
+                run["alarm_storm"]["slowest_bed_alerts"],
+                summary["slowest_bed_alerts"],
+            )
+            self.assertFalse(run["alarm_storm"]["storm_active"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
 
 class TestLabDelay(unittest.TestCase):
     # A lab-result delay: bed 0's bloods are due at t=30, but the
