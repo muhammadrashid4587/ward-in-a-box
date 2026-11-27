@@ -265,6 +265,12 @@ python3 -m ward.cli scenarios/network-outage-hooks.json --seed 42
 # once the stock returns and is back to zero at 84 s
 python3 -m ward.cli scenarios/medication-stockout.json --seed 42
 
+# Medication-stockout hooks: the same ward, with the stockout
+# starting at 5 s and the stock returning at 60 s also POSTed
+# to a webhook (here a placeholder URL — point it at your own
+# endpoint; a dead endpoint is logged, never fatal)
+python3 -m ward.cli scenarios/medication-stockout-hooks.json --seed 42
+
 # Reproducible run
 python3 -m ward.cli scenarios/example.json --seed 42
 ```
@@ -346,7 +352,8 @@ python3 -m ward.cli scenarios/example.json --seed 42
 - `GET /medication-stockout` — per-bed medication-stockout state:
   whether the pharmacy is out of a medication, which one, when
   the stock returns, and how far each vital has drifted for want
-  of the drug, plus ward totals, as JSON
+  of the drug, plus ward totals, the stockout event history, and
+  the medication-stockout hook totals, as JSON
   (503 while partitioned)
 
 A reading looks like:
@@ -1141,6 +1148,55 @@ the first missed dose to +25.0 at 59 s — reading 100.36 with
 the NEWS2 heart-rate component at 1 — then recovers 1.0 bpm a
 tick once the stock returns and is back to zero at 84 s, while
 the control bed, with no metoprolol prescribed, never drifts.
+
+## Medication-stockout hooks
+
+A medication stockout is the moment a ward most needs the outside
+world to hear about it — the pharmacy is out of a drug, the
+patients on it are about to miss doses and drift off it, and the
+doses they miss will not be given until the stock returns — so
+the hook makes sure something outside the ward hears about it. A
+ward that wants the outside world to hear about that moment — a
+dashboard, a pager, a pharmacist — configures
+medication-stockout hooks, the same channels as the NEWS2 hooks
+(webhook and/or in-process callback), on the same best-effort,
+never-fatal terms:
+
+```json
+{"medication_stockout_hooks": {"webhook_url": "http://127.0.0.1:18099/hooks"}}
+```
+
+Two events fire. `medication_stockout_started` fires once, in the
+tick the pharmacy runs out, with the stockout window (`"at"`,
+`"ends"`, `"duration"`), the beds it targets, and the stockout's
+medication config — the drug, its drift rates, and its recovery
+rate. `medication_stockout_ended` fires once, in the tick the
+stock returns, with the same window. A stockout that lasts fifty
+ticks fires once, not fifty times, and a second stockout fires
+again — the start and end are per event, not per run. An
+in-process callback gets the same payloads in the tick the event
+fires (Python API only — a scenario file cannot hold a
+callable), so scenario code can log or escalate on the stock
+running out directly. Each event records whether the hook was
+invoked (`"hook_invoked"`, False with no hooks) and any
+synchronous error (`"hook_errors"`), and the medication-stockout
+summary carries the event totals (`"event_count"`, the full
+`"events"` history) and the ward medication-stockout-hook totals
+(`"medication_stockout_hooks"`: whether any hook is configured,
+how many deliveries were invoked, how many failed, how many
+retries were spent, and how many deliveries eventually landed)
+— in `GET /medication-stockout`, every snapshot and WebSocket
+frame, and the run summary (`--summary`). The same retry rules
+as the NEWS2 hooks apply — a failed webhook POST is retried
+with backoff up to `"max_retries"` times, and the event records
+`"hook_retries"` and `"hook_final_status"` alongside
+`"hook_invoked"`. Hooks are off by default, so a ward with none
+configured behaves exactly as before. See
+`scenarios/medication-stockout-hooks.json` for a runnable
+example: over a seeded 130-tick run the same ward as
+`medication-stockout.json` runs out of metoprolol at 5 s and the
+stock returns at 60 s — POSTed to the configured webhook, with
+2 hook deliveries invoked and 0 failed against a stub server.
 
 ## Power-outage hooks
 
@@ -3277,3 +3333,17 @@ the hook totals.
   WebSocket frame, a `GET /network-outage` endpoint, and the run
   summary; off by default, configured per ward with
   `network_outage_hooks` in the scenario) — done in v0.56.0
+- Medication-stockout hooks (when a medication stockout starts
+  or ends — a configured webhook URL gets a
+  `medication_stockout_started` / `medication_stockout_ended`
+  event payload POSTed to it, or an in-process callback is
+  called with the same payload in the firing tick, so a hook can
+  escalate on the pharmacy running out of a drug; one start and
+  one end per stockout, re-armed for a second stockout; reusing
+  the NEWS2 hook machinery, best effort and never fatal; each
+  event records whether the hook was invoked, and the
+  medication-stockout summary carries the event history and the
+  medication-stockout-hook totals, in every snapshot, WebSocket
+  frame, a `GET /medication-stockout` endpoint, and the run
+  summary; off by default, configured per ward with
+  `medication_stockout_hooks` in the scenario) — done in v0.57.0

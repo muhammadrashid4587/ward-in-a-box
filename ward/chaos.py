@@ -480,6 +480,12 @@ class ChaosEngine:
         # the same beds is a new event, so it fires again.
         self._network_started = set()
         self._network_ended = set()
+        # Medication-stockout events fire their start hook once,
+        # on the first tick inside the window, and their end hook
+        # once, on the first tick after it — a second stockout
+        # on the same beds is a new event, so it fires again.
+        self._medication_stockout_started = set()
+        self._medication_stockout_ended = set()
 
     def stockouts(self, ward, now):
         """Active pharmacy stockouts: ``{bed_id: {med, ...}}``.
@@ -627,6 +633,25 @@ class ChaosEngine:
                 ):
                     self._network_ended.add(id(ev))
                     ward._network_outage_ended(ev, now)
+            # Medication stockout: the start hook fires once,
+            # on the first tick inside the window, and the end
+            # hook once, on the first tick after it — so
+            # scenario code hears the pharmacy run out of a
+            # medication and the stock return exactly once per
+            # event, even across a run that ticks past the end.
+            # The check runs before the active gate below, so
+            # an end is caught on the tick the window closes.
+            if ev.type == "medication_stockout":
+                if ev.active(now):
+                    if id(ev) not in self._medication_stockout_started:
+                        self._medication_stockout_started.add(id(ev))
+                        ward._medication_stockout_started(ev, now)
+                elif (
+                    id(ev) in self._medication_stockout_started
+                    and id(ev) not in self._medication_stockout_ended
+                ):
+                    self._medication_stockout_ended.add(id(ev))
+                    ward._medication_stockout_ended(ev, now)
             if not ev.active(now):
                 continue
             if ev.type == "sensor_drift":

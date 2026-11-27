@@ -745,7 +745,11 @@ def summarize(path):
         # drifting off their drug, which medications are out, the
         # largest drift per vital, and each drifting bed's drift
         # — so a run's missed doses and their clinical cost are
-        # visible without replaying every tick.
+        # visible without replaying every tick — plus how many
+        # medication-stockout hook events fired this run, and
+        # whether the medication-stockout hooks are configured
+        # and how many hook deliveries were invoked, failed,
+        # retried, and delivered.
         "medication_stockout": (
             {
                 "beds_affected": last_medication_stockout[
@@ -761,6 +765,21 @@ def summarize(path):
                     for b in last_medication_stockout["beds"]
                     if b["drifting"]
                 },
+                "event_count": last_medication_stockout.get(
+                    "event_count", 0
+                ),
+                "medication_stockout_hooks": (
+                    last_medication_stockout.get(
+                        "medication_stockout_hooks",
+                        {
+                            "configured": False,
+                            "invoked": 0,
+                            "failed": 0,
+                            "retries": 0,
+                            "delivered": 0,
+                        },
+                    )
+                ),
             }
             if last_medication_stockout is not None
             else None

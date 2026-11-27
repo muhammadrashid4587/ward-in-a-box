@@ -10,6 +10,7 @@ from .alert_hooks import (
     validate_discharge_priority_hooks,
     validate_discharge_readiness_hooks,
     validate_escalation_hooks,
+    validate_medication_stockout_hooks,
     validate_missed_dose_hooks,
     validate_network_outage_hooks,
     validate_oxygen_outage_hooks,
@@ -324,6 +325,18 @@ def load_scenario(path):
             )
         except ValueError as e:
             raise ValueError("network_outage_hooks: %s" % e)
+    medication_stockout_hooks = None
+    if "medication_stockout_hooks" in data:
+        if not isinstance(data["medication_stockout_hooks"], dict):
+            raise ValueError("medication_stockout_hooks must be an object")
+        try:
+            medication_stockout_hooks = (
+                validate_medication_stockout_hooks(
+                    data["medication_stockout_hooks"]
+                )
+            )
+        except ValueError as e:
+            raise ValueError("medication_stockout_hooks: %s" % e)
     return {
         "beds": beds,
         "rate_hz": rate,
@@ -354,6 +367,7 @@ def load_scenario(path):
         "sensor_drift_hooks": sensor_drift_hooks,
         "bed_blocker_hooks": bed_blocker_hooks,
         "network_outage_hooks": network_outage_hooks,
+        "medication_stockout_hooks": medication_stockout_hooks,
         "triage": triage,
         "host": data.get("host", "127.0.0.1"),
         "port": data.get("port", 8080),
@@ -392,6 +406,7 @@ def build_ward(cfg, seed=None, recorder=None):
         sensor_drift_hooks=cfg.get("sensor_drift_hooks"),
         bed_blocker_hooks=cfg.get("bed_blocker_hooks"),
         network_outage_hooks=cfg.get("network_outage_hooks"),
+        medication_stockout_hooks=cfg.get("medication_stockout_hooks"),
         triage=cfg.get("triage"),
         recorder=recorder,
     )

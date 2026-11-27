@@ -36,7 +36,9 @@ the ward's ``power_outage_hooks``; a sensor-drift event starting
 or ending fires the ward's ``sensor_drift_hooks``; a bed-blocker
 event starting or ending fires the ward's
 ``bed_blocker_hooks``; a network outage starting or ending fires
-the ward's ``network_outage_hooks``. All twelve share
+the ward's ``network_outage_hooks``; a medication stockout
+starting or ending fires the ward's
+``medication_stockout_hooks``. All thirteen share
 the same ``AlertHooks`` machinery — the same webhook and
 callback channels, the same best-effort delivery — just a
 different event payload.
@@ -268,6 +270,19 @@ def validate_network_outage_hooks(value):
     )
 
 
+def validate_medication_stockout_hooks(value):
+    """Normalize a medication-stockout hook config (see
+    :func:`_validate_hooks`).
+
+    Fires when a medication stockout starts or ends — when
+    the pharmacy runs out of a medication and when the stock
+    returns — rather than when a NEWS2 event fires.
+    """
+    return _validate_hooks(
+        value, "medication-stockout", "medication_stockout_hooks"
+    )
+
+
 class AlertHooks:
     """The configured hooks for one ward event, shared by its monitors.
 
@@ -276,7 +291,7 @@ class AlertHooks:
     ``"missed-dose"``, ``"discharge-readiness"``,
     ``"discharge-priority"``, ``"oxygen-outage"``,
     ``"power-outage"``, ``"sensor-drift"``, ``"bed-blocker"``, or
-    ``"network-outage"``); it changes
+    ``"network-outage"``, or ``"medication-stockout"``); it changes
     nothing about delivery.
     """
 

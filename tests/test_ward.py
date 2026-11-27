@@ -25,6 +25,7 @@ from ward.alert_hooks import (
     validate_discharge_priority_hooks,
     validate_discharge_readiness_hooks,
     validate_escalation_hooks,
+    validate_medication_stockout_hooks,
     validate_missed_dose_hooks,
     validate_network_outage_hooks,
     validate_oxygen_outage_hooks,
@@ -12609,6 +12610,14 @@ class TestMedicationStockout(unittest.TestCase):
                 "meds": ["metoprolol"],
                 "max_drift": {"heart_rate": 15.5},
                 "beds": {"0": {"heart_rate": 15.5}},
+                "event_count": 1,
+                "medication_stockout_hooks": {
+                    "configured": False,
+                    "invoked": 0,
+                    "failed": 0,
+                    "retries": 0,
+                    "delivered": 0,
+                },
             },
         )
 
@@ -12683,6 +12692,330 @@ class TestMedicationStockout(unittest.TestCase):
         ward2 = build_ward(cfg, seed=42)
         snaps2 = [ward2.tick() for _ in range(130)]
         self.assertEqual(snaps, snaps2)
+
+
+class TestMedicationStockoutHooks(unittest.TestCase):
+    # Medication-stockout hooks: a stockout starting or ending
+    # fires the ward's medication_stockout_hooks — the same
+    # webhook/callback machinery as the NEWS2 hooks — so
+    # something outside the ward hears the pharmacy run out of
+    # a medication and the stock return. A callback can use the
+    # start to escalate: the patients on that drug are about to
+    # miss doses and drift off it, and the doses they miss will
+    # not be given until the stock returns.
+    MEDICATION = {
+        "med": "metoprolol",
+        "drift": {"heart_rate": 0.5},
+        "recovery_rate": 1.0,
+    }
+
+    def _stockout_ward(self, hooks=None):
+        return Ward(
+            beds=2,
+            profiles=["stable", "stable"],
+            meds=[
+                [{"name": "metoprolol", "every_s": 30, "first_at": 10}],
+                [],
+            ],
+            chaos=[
+                ChaosEvent(
+                    "medication_stockout",
+                    at=5,
+                    duration=55,
+                    bed=0,
+                    medication=self.MEDICATION,
+                )
+            ],
+            seed=42,
+            medication_stockout_hooks=hooks,
+        )
+
+    def test_validate_medication_stockout_hooks(self):
+        hooks = validate_medication_stockout_hooks(None)
+        self.assertIsInstance(hooks, TrendAlertHooks)
+        self.assertFalse(hooks.configured)
+        self.assertEqual(hooks.kind, "medication-stockout")
+        custom = validate_medication_stockout_hooks(
+            {"webhook_url": "https://example.invalid/hooks", "timeout_s": 2}
+        )
+        self.assertTrue(custom.configured)
+        self.assertEqual(custom.kind, "medication-stockout")
+        self.assertEqual(custom.timeout_s, 2.0)
+        seen = []
+        append = seen.append
+        cb = validate_medication_stockout_hooks({"callback": append})
+        self.assertTrue(cb.configured)
+        self.assertIs(cb.callback, append)
+        with self.assertRaises(ValueError):
+            validate_medication_stockout_hooks(
+                {"webhook_url": "ftp://x/hooks"}
+            )
+        with self.assertRaises(ValueError):
+            validate_medication_stockout_hooks({"callback": "not callable"})
+        with self.assertRaises(ValueError):
+            validate_medication_stockout_hooks({"timeout_s": 0})
+        with self.assertRaises(ValueError):
+            validate_medication_stockout_hooks({"url": "http://x/hooks"})
+        with self.assertRaises(ValueError):
+            validate_medication_stockout_hooks("http://x/hooks")
+
+    def test_hooks_off_by_default(self):
+        # No hooks configured: the stockout still starts and
+        # ends, and each event is recorded with no hook invoked.
+        ward = self._stockout_ward()
+        self.assertFalse(ward.medication_stockout_hooks.configured)
+        for _ in range(70):
+            ward.tick()
+        summary = ward.medication_stockout_summary()
+        self.assertEqual(summary["event_count"], 2)
+        self.assertEqual(
+            [
+                (e["event"], e["t"])
+                for e in summary["events"]
+            ],
+            [
+                ("medication_stockout_started", 5.0),
+                ("medication_stockout_ended", 60.0),
+            ],
+        )
+        for event in summary["events"]:
+            self.assertFalse(event["hook_invoked"])
+            self.assertEqual(event["hook_errors"], [])
+            self.assertEqual(event["hook_retries"], 0)
+            self.assertEqual(
+                event["hook_final_status"], "not_invoked"
+            )
+        self.assertEqual(
+            summary["medication_stockout_hooks"],
+            {"configured": False, "invoked": 0, "failed": 0, "retries": 0, "delivered": 0},
+        )
+        self.assertEqual(
+            ward.snapshot()["medication_stockout"]["event_count"], 2
+        )
+
+    def test_callback_hook_fires_for_start_and_end(self):
+        seen = []
+        ward = self._stockout_ward({"callback": seen.append})
+        self.assertTrue(ward.medication_stockout_hooks.configured)
+        for _ in range(70):
+            ward.tick()
+        # Two events over the run: the pharmacy runs out at 5 s
+        # and the stock returns at 60 s. The patient drifts in
+        # between, but the stockout itself fires once on start
+        # and once on end, not once a tick.
+        self.assertEqual(
+            [(p["event"], p["t"]) for p in seen],
+            [
+                ("medication_stockout_started", 5.0),
+                ("medication_stockout_ended", 60.0),
+            ],
+        )
+        start, end = seen
+        self.assertEqual(
+            {k: v for k, v in start.items() if k != "hook_retries"
+             and k != "hook_final_status"},
+            {
+                "event": "medication_stockout_started",
+                "t": 5.0,
+                "at": 5.0,
+                "ends": 60.0,
+                "duration": 55,
+                "beds": [0],
+                "medication": self.MEDICATION,
+            },
+        )
+        self.assertEqual(end["event"], "medication_stockout_ended")
+        self.assertEqual(end["t"], 60.0)
+        self.assertEqual(end["beds"], [0])
+        # Every event records the invocation.
+        summary = ward.medication_stockout_summary()
+        self.assertEqual(summary["event_count"], 2)
+        for event in summary["events"]:
+            self.assertTrue(event["hook_invoked"])
+            self.assertEqual(event["hook_errors"], [])
+            self.assertEqual(event["hook_final_status"], "delivered")
+        self.assertEqual(
+            summary["medication_stockout_hooks"],
+            {"configured": True, "invoked": 2, "failed": 0, "retries": 0, "delivered": 2},
+        )
+
+    def test_start_and_end_fire_again_for_a_second_stockout(self):
+        # Two stockouts on the same bed: the start and the end
+        # fire once per stockout — the engine tracks each event
+        # separately, so the second stockout fires again.
+        seen = []
+        ward = Ward(
+            beds=1,
+            profiles=["stable"],
+            meds=[
+                [{"name": "metoprolol", "every_s": 30, "first_at": 10}],
+            ],
+            chaos=[
+                ChaosEvent(
+                    "medication_stockout",
+                    at=5,
+                    duration=10,
+                    bed=0,
+                    medication=self.MEDICATION,
+                ),
+                ChaosEvent(
+                    "medication_stockout",
+                    at=30,
+                    duration=10,
+                    bed=0,
+                    medication=self.MEDICATION,
+                ),
+            ],
+            seed=42,
+            medication_stockout_hooks={"callback": seen.append},
+        )
+        for _ in range(45):
+            ward.tick()
+        self.assertEqual(
+            [(p["event"], p["t"]) for p in seen],
+            [
+                ("medication_stockout_started", 5.0),
+                ("medication_stockout_ended", 15.0),
+                ("medication_stockout_started", 30.0),
+                ("medication_stockout_ended", 40.0),
+            ],
+        )
+        self.assertEqual(
+            ward.medication_stockout_summary()[
+                "medication_stockout_hooks"
+            ],
+            {"configured": True, "invoked": 4, "failed": 0, "retries": 0, "delivered": 4},
+        )
+
+    def test_callback_failure_is_not_fatal(self):
+        def boom(payload):
+            raise ValueError("pager is down")
+
+        ward = self._stockout_ward({"callback": boom})
+        for _ in range(5):
+            ward.tick()  # t=5: stockout starts, hook raises
+        snap = ward.tick()  # t=6: the tick still completes
+        self.assertTrue(snap["beds"][0]["online"])
+        event = ward.medication_stockout_summary()["events"][0]
+        self.assertEqual(event["event"], "medication_stockout_started")
+        self.assertTrue(event["hook_invoked"])
+        self.assertEqual(event["hook_errors"], ["pager is down"])
+        self.assertEqual(event["hook_final_status"], "failed")
+        summary = ward.medication_stockout_summary()[
+            "medication_stockout_hooks"
+        ]
+        self.assertEqual(summary["invoked"], 1)
+        self.assertEqual(summary["failed"], 1)
+
+    def test_webhook_posts_to_stub_server(self):
+        server, port, received = capture_server()
+        try:
+            ward = self._stockout_ward(
+                {"webhook_url": "http://127.0.0.1:%d/hooks" % port}
+            )
+            for _ in range(70):
+                ward.tick()
+            self.assertTrue(ward.medication_stockout_hooks.wait(timeout=5))
+            self.assertEqual(len(received), 2)
+            payloads = sorted(
+                (json.loads(r[2]) for r in received),
+                key=lambda p: p["t"],
+            )
+            self.assertEqual(
+                [(p["event"], p["t"]) for p in payloads],
+                [
+                    ("medication_stockout_started", 5.0),
+                    ("medication_stockout_ended", 60.0),
+                ],
+            )
+            path, content_type, body = received[0]
+            self.assertEqual(path, "/hooks")
+            self.assertEqual(content_type, "application/json")
+            start = [p for p in payloads if p["event"] == "medication_stockout_started"][0]
+            self.assertEqual(start["medication"], self.MEDICATION)
+            self.assertEqual(start["beds"], [0])
+            summary = ward.medication_stockout_summary()
+            self.assertEqual(
+                summary["medication_stockout_hooks"],
+                {"configured": True, "invoked": 2, "failed": 0, "retries": 0, "delivered": 2},
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_scenario_medication_stockout_hooks(self):
+        cfg = load_scenario(
+            os.path.join(
+                HERE, "..", "scenarios", "medication-stockout-hooks.json"
+            )
+        )
+        self.assertTrue(cfg["medication_stockout_hooks"].configured)
+        server, port, received = capture_server()
+        path = os.path.join(tempfile.mkdtemp(), "run.jsonl")
+        try:
+            # The scenario's URL is a placeholder; point it at
+            # the stub server for this run.
+            cfg["medication_stockout_hooks"] = (
+                validate_medication_stockout_hooks(
+                    {"webhook_url": "http://127.0.0.1:%d/hooks" % port}
+                )
+            )
+            ward = build_ward(cfg, seed=42)
+            with Recorder(path, ward.beds, ward.rate_hz, seed=42) as rec:
+                ward.recorder = rec
+                for _ in range(70):
+                    snap = ward.tick()
+            self.assertTrue(ward.medication_stockout_hooks.wait(timeout=5))
+            # Two events over the run: the pharmacy runs out at
+            # 5 s and the stock returns at 60 s. The deliveries
+            # run in separate daemon threads, so their arrival
+            # order at the stub is not guaranteed — sort by event
+            # time before asserting.
+            self.assertEqual(len(received), 2)
+            payloads = sorted(
+                (json.loads(r[2]) for r in received),
+                key=lambda p: p["t"],
+            )
+            self.assertEqual(
+                [
+                    (p["event"], p["t"], p.get("bed"))
+                    for p in payloads
+                ],
+                [
+                    ("medication_stockout_started", 5.0, None),
+                    ("medication_stockout_ended", 60.0, None),
+                ],
+            )
+            # Every event records that its hook was invoked.
+            for event in snap["medication_stockout"]["events"]:
+                self.assertTrue(event["hook_invoked"])
+            summary = ward.medication_stockout_summary()
+            self.assertEqual(summary["event_count"], 2)
+            self.assertEqual(
+                summary["medication_stockout_hooks"],
+                {"configured": True, "invoked": 2, "failed": 0, "retries": 0, "delivered": 2},
+            )
+            # The run summary carries the event count and the
+            # hook totals from the last tick — but only as of
+            # that tick: the snapshot in the file was recorded
+            # before the last delivery settled, so delivered is
+            # read from the live summary above, not from here.
+            run = summarize(path)
+            self.assertEqual(run["medication_stockout"]["event_count"], 2)
+            self.assertTrue(
+                run["medication_stockout"]["medication_stockout_hooks"][
+                    "configured"
+                ]
+            )
+            self.assertEqual(
+                run["medication_stockout"]["medication_stockout_hooks"][
+                    "invoked"
+                ],
+                2,
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 if __name__ == "__main__":
