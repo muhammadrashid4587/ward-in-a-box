@@ -15700,6 +15700,32 @@ class TestAlarmStormHooks(unittest.TestCase):
                     "alarms_pending": 0,
                     "alarms_pending_at_end": 0,
                     "beds": [0, 1, 2],
+                    "bed_acks": [
+                        {
+                            "bed": 0,
+                            "alarms_raised": 5,
+                            "alarms_acked": 5,
+                            "alarms_pending": 0,
+                            "last_ack_t": 43.0,
+                            "time_to_ack_s": 31.0,
+                        },
+                        {
+                            "bed": 1,
+                            "alarms_raised": 5,
+                            "alarms_acked": 5,
+                            "alarms_pending": 0,
+                            "last_ack_t": 43.0,
+                            "time_to_ack_s": 31.0,
+                        },
+                        {
+                            "bed": 2,
+                            "alarms_raised": 5,
+                            "alarms_acked": 5,
+                            "alarms_pending": 0,
+                            "last_ack_t": 42.0,
+                            "time_to_ack_s": 30.0,
+                        },
+                    ],
                     "acknowledged": True,
                     "ack_t": 43.0,
                     "time_to_ack_s": 31.0,
@@ -15751,6 +15777,23 @@ class TestAlarmStormHooks(unittest.TestCase):
         self.assertFalse(storm["acknowledged"])
         self.assertIsNone(storm["ack_t"])
         self.assertIsNone(storm["time_to_ack_s"])
+        # No bed is timed yet: every bed still has all five
+        # of its storm alarms pending, so each bed's time to
+        # ack is null until its last alarm is acked.
+        self.assertEqual(
+            storm["bed_acks"],
+            [
+                {
+                    "bed": b,
+                    "alarms_raised": 5,
+                    "alarms_acked": 0,
+                    "alarms_pending": 5,
+                    "last_ack_t": None,
+                    "time_to_ack_s": None,
+                }
+                for b in (0, 1, 2)
+            ],
+        )
 
     def test_thin_roster_storm_ends_with_every_alarm_pending(self):
         # One nurse for twelve beds takes 90 s to acknowledge,
@@ -15844,6 +15887,37 @@ class TestAlarmStormHooks(unittest.TestCase):
         self.assertEqual(ack["ack_shift"], "day")
         self.assertEqual(ack["ack_nurses"], 1)
         self.assertEqual(ack["beds"], [0, 1, 2])
+        # The acknowledged event carries the per-bed times
+        # too: bed 2's alarms were all acked a second sooner.
+        self.assertEqual(
+            ack["bed_acks"],
+            [
+                {
+                    "bed": 0,
+                    "alarms_raised": 5,
+                    "alarms_acked": 5,
+                    "alarms_pending": 0,
+                    "last_ack_t": 103.0,
+                    "time_to_ack_s": 91.0,
+                },
+                {
+                    "bed": 1,
+                    "alarms_raised": 5,
+                    "alarms_acked": 5,
+                    "alarms_pending": 0,
+                    "last_ack_t": 103.0,
+                    "time_to_ack_s": 91.0,
+                },
+                {
+                    "bed": 2,
+                    "alarms_raised": 5,
+                    "alarms_acked": 5,
+                    "alarms_pending": 0,
+                    "last_ack_t": 102.0,
+                    "time_to_ack_s": 90.0,
+                },
+            ],
+        )
 
     def test_two_storms_acknowledge_each_and_mean(self):
         # Two bursts, two storms, each acknowledged 31.0 s
@@ -15895,6 +15969,62 @@ class TestAlarmStormHooks(unittest.TestCase):
             ],
         )
 
+    def test_per_bed_ack_times_differ_when_beds_join_late(self):
+        # Bed 0's burst starts at 10 s, beds 1 and 2 join at
+        # 15 s, so the storm starts at 17 s once the window
+        # holds 10 alarms — and bed 0's alarms, raised first,
+        # are acked first: bed 0 clears in 26.0 s, beds 1 and
+        # 2 in 30.0 s, while the storm as a whole takes 30.0 s.
+        # That is the point of the per-bed record: a dashboard
+        # can see which bed the nurses cleared last.
+        ward = Ward(
+            beds=12,
+            profiles=["stable"] * 12,
+            chaos=[
+                ChaosEvent(
+                    "alarm_storm",
+                    at=10,
+                    duration=5,
+                    beds=[0],
+                ),
+                ChaosEvent(
+                    "alarm_storm",
+                    at=15,
+                    duration=5,
+                    beds=[1, 2],
+                ),
+            ],
+            seed=42,
+        )
+        for _ in range(100):
+            ward.tick()
+        summary = ward.alarm_storm_summary()
+        storm = summary["storms"][0]
+        self.assertEqual(storm["started_t"], 17.0)
+        self.assertEqual(storm["ended_t"], 77.0)
+        self.assertEqual(storm["alarms_raised"], 15)
+        self.assertTrue(storm["acknowledged"])
+        self.assertEqual(storm["time_to_ack_s"], 30.0)
+        self.assertEqual(
+            [
+                (b["bed"], b["time_to_ack_s"])
+                for b in storm["bed_acks"]
+            ],
+            [(0, 26.0), (1, 30.0), (2, 30.0)],
+        )
+        self.assertEqual(
+            [
+                (b["bed"], b["alarms_raised"], b["alarms_acked"],
+                 b["last_ack_t"])
+                for b in storm["bed_acks"]
+            ],
+            [
+                (0, 5, 5, 43.0),
+                (1, 5, 5, 47.0),
+                (2, 5, 5, 47.0),
+            ],
+        )
+
     def test_scenario_alarm_storm_ack(self):
         cfg = load_scenario(
             os.path.join(
@@ -15929,6 +16059,39 @@ class TestAlarmStormHooks(unittest.TestCase):
             run["alarm_storm"]["storms"], summary["storms"]
         )
         self.assertFalse(run["alarm_storm"]["storm_active"])
+
+    def test_scenario_alarm_storm_ack_per_bed(self):
+        # The staggered burst — bed 0 at 10 s, beds 1 and 2
+        # at 15 s — starts the storm at 17 s, and the storm
+        # record times each bed separately: bed 0 clears in
+        # 26.0 s, beds 1 and 2 in 30.0 s. The run summary
+        # carries the same per-bed record from the last tick.
+        cfg = load_scenario(
+            os.path.join(
+                HERE, "..", "scenarios", "alarm-storm-ack-per-bed.json"
+            )
+        )
+        path = os.path.join(tempfile.mkdtemp(), "run.jsonl")
+        ward = build_ward(cfg, seed=42)
+        with Recorder(path, ward.beds, ward.rate_hz, seed=42) as rec:
+            ward.recorder = rec
+            for _ in range(100):
+                ward.tick()
+        summary = ward.alarm_storm_summary()
+        storm = summary["storms"][0]
+        self.assertEqual(storm["started_t"], 17.0)
+        self.assertTrue(storm["acknowledged"])
+        self.assertEqual(
+            [
+                (b["bed"], b["time_to_ack_s"])
+                for b in storm["bed_acks"]
+            ],
+            [(0, 26.0), (1, 30.0), (2, 30.0)],
+        )
+        run = summarize(path)
+        self.assertEqual(
+            run["alarm_storm"]["storms"], summary["storms"]
+        )
 
     def test_alarm_storm_endpoint_serves_json_and_is_503_while_partitioned(self):
         ward = self._storm_ward()

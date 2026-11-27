@@ -370,6 +370,11 @@ python3 -m ward.cli scenarios/alarm-storm-hooks.json --seed 42
 # and take 91.0 s to acknowledge
 python3 -m ward.cli scenarios/alarm-storm-ack.json --seed 42
 
+# Per-bed acknowledgement times: bed 0's burst starts at
+# 10 s, beds 1 and 2 join at 15 s — the storm starts at
+# 17 s, bed 0 clears in 26.0 s, beds 1 and 2 in 30.0 s
+python3 -m ward.cli scenarios/alarm-storm-ack-per-bed.json --seed 42
+
 # Reproducible run
 python3 -m ward.cli scenarios/example.json --seed 42
 ```
@@ -499,8 +504,11 @@ python3 -m ward.cli scenarios/example.json --seed 42
   window, the acknowledgement totals (how many storms there
   have been, how many are acknowledged and how many are not,
   and the mean and longest time from a storm's start to its
-  last ack) and the per-storm records, the storm event
-  history, and the alarm-storm-hook totals, as JSON
+  last ack) and the per-storm records, each with the
+  per-bed acknowledgement times (how many of each bed's
+  storm alarms were acked and how long that bed took from
+  the storm's start), the storm event history, and the
+  alarm-storm-hook totals, as JSON
   (503 while partitioned)
 
 A reading looks like:
@@ -1251,7 +1259,16 @@ it started and ended, how many alarms it raised and how
 many of them have been acked, how many were still pending
 when it ended, and — once acknowledged — when the last ack
 landed and how long it took, with the shift on duty then
-and how many nurses it had. The summary totals it up:
+and how many nurses it had. The record also times each bed
+separately (`"bed_acks"`): how many of that bed's storm
+alarms have been raised, acked, and are still pending,
+when that bed's last ack landed, and how long that took
+from the storm's start — null while any of its alarms is
+still pending, so a dashboard can see which bed's alarms
+the nurses cleared last. A bed whose alarms were all acked
+before the storm started times at zero, like the storm
+itself. The `alarm_storm_acknowledged` hook event carries
+the same per-bed times. The summary totals it up:
 how many storms there have been, how many are
 acknowledged and how many are not, and the mean and
 longest time to ack — in `GET /alarm-storm`, every
@@ -4534,6 +4551,17 @@ the hook totals.
   the alarm-storm summary, every snapshot, WebSocket frame,
   a `GET /alarm-storm` endpoint, and the run summary) — done
   in v0.72.0
-- Next: per-bed acknowledgement times in the storm record,
-  so a dashboard can see which bed's alarms the nurses
-  cleared last
+- Per-bed acknowledgement times in the storm record (one
+  entry per bed that raised a storm alarm — how many of
+  that bed's storm alarms were raised, acked, and are still
+  pending, when that bed's last ack landed, and how long
+  that took from the storm's start, null while any of its
+  alarms is still pending — in the alarm-storm summary,
+  every snapshot, WebSocket frame, a `GET /alarm-storm`
+  endpoint, the run summary, and the
+  `alarm_storm_acknowledged` hook payload, so a dashboard
+  can see which bed's alarms the nurses cleared last) —
+  done in v0.73.0
+- Next: per-bed acknowledgement totals across storms, so
+  a dashboard can see which bed is slowest to clear over
+  a whole run, not just inside one storm

@@ -1510,6 +1510,27 @@ class Ward:
                     for t, b, a in self._alarm_storm_raised
                 }
                 outstanding = keys & pending
+                # Per-bed acknowledgement state: how many of
+                # each bed's storm alarms have been raised and
+                # acked, and when that bed's last ack landed.
+                # An alarm acked before the storm started counts
+                # as acked from here, with no ack time observed
+                # — that bed's time to ack is zero unless it
+                # raises another alarm while the storm is open.
+                bed_acks = {}
+                for _, b, _ in self._alarm_storm_raised:
+                    entry = bed_acks.setdefault(
+                        b,
+                        {
+                            "alarms_raised": 0,
+                            "alarms_acked": 0,
+                            "last_ack_t": None,
+                        },
+                    )
+                    entry["alarms_raised"] += 1
+                for t, b, a in self._alarm_storm_raised:
+                    if (round(t, 3), b, a) not in outstanding:
+                        bed_acks[b]["alarms_acked"] += 1
                 self._alarm_storm_open = {
                     "started_t": now,
                     "ended_t": None,
@@ -1520,6 +1541,7 @@ class Ward:
                     "keys": keys,
                     "outstanding": outstanding,
                     "acked": len(keys) - len(outstanding),
+                    "bed_acks": bed_acks,
                     "last_ack_t": None,
                     "acknowledged": False,
                     "ack_t": None,
@@ -1549,6 +1571,15 @@ class Ward:
                     key = (round(now, 3), m.bed_id, alarm)
                     open_storm["keys"].add(key)
                     open_storm["outstanding"].add(key)
+                    entry = open_storm["bed_acks"].setdefault(
+                        m.bed_id,
+                        {
+                            "alarms_raised": 0,
+                            "alarms_acked": 0,
+                            "last_ack_t": None,
+                        },
+                    )
+                    entry["alarms_raised"] += 1
             if count < threshold:
                 open_storm["ended_t"] = now
                 open_storm["duration_s"] = round(
@@ -1604,6 +1635,9 @@ class Ward:
                 storm["outstanding"].discard(key)
                 storm["acked"] += 1
                 storm["last_ack_t"] = pending["ack_t"]
+                entry = storm["bed_acks"][pending["bed"]]
+                entry["alarms_acked"] += 1
+                entry["last_ack_t"] = pending["ack_t"]
                 self._maybe_acknowledge_storm(storm)
 
     def _maybe_acknowledge_storm(self, storm):
@@ -1628,9 +1662,9 @@ class Ward:
         its peak and total raises, how many alarms were acked,
         when the last ack landed and how long that took from
         the storm's start, and the shift on duty then with how
-        many nurses it had — so a hook hears not just that the
-        ward has calmed down but that the nurses have actually
-        caught up.
+        many nurses it had — and the per-bed acknowledgement
+        times, so a hook hears which bed's alarms the nurses
+        cleared last.
         """
         if storm["ended_t"] is None or storm["acknowledged"]:
             return
@@ -1665,9 +1699,48 @@ class Ward:
                 "time_to_ack_s": storm["time_to_ack_s"],
                 "ack_shift": storm["ack_shift"],
                 "ack_nurses": storm["ack_nurses"],
+                "bed_acks": self._bed_acks_view(storm),
                 "beds": sorted(storm["beds"]),
             },
         )
+
+    def _bed_acks_view(self, storm):
+        """Per-bed acknowledgement times for one storm.
+
+        One entry per bed that raised a storm alarm, in bed
+        order: how many of that bed's storm alarms have been
+        raised, acked, and are still pending, when that bed's
+        last ack landed, and how long that took from the
+        storm's start. A bed is timed only once its alarms
+        are all acked — while any is still pending its time
+        is null, so a dashboard can see which bed the nurses
+        cleared last. A bed whose alarms were all acked
+        before the storm started has no observed ack time and
+        times at zero, like the storm itself.
+        """
+        view = []
+        for bed in sorted(storm["bed_acks"]):
+            entry = storm["bed_acks"][bed]
+            pending = entry["alarms_raised"] - entry["alarms_acked"]
+            if pending:
+                time_to_ack_s = None
+            elif entry["last_ack_t"] is None:
+                time_to_ack_s = 0.0
+            else:
+                time_to_ack_s = round(
+                    entry["last_ack_t"] - storm["started_t"], 3
+                )
+            view.append(
+                {
+                    "bed": bed,
+                    "alarms_raised": entry["alarms_raised"],
+                    "alarms_acked": entry["alarms_acked"],
+                    "alarms_pending": pending,
+                    "last_ack_t": entry["last_ack_t"],
+                    "time_to_ack_s": time_to_ack_s,
+                }
+            )
+        return view
 
     def _alarm_storm_view(self, storm):
         """One storm as plain JSON data, for the summary."""
@@ -1681,6 +1754,7 @@ class Ward:
             "alarms_pending": len(storm["outstanding"]),
             "alarms_pending_at_end": storm["alarms_pending_at_end"],
             "beds": sorted(storm["beds"]),
+            "bed_acks": self._bed_acks_view(storm),
             "acknowledged": storm["acknowledged"],
             "ack_t": storm["ack_t"],
             "time_to_ack_s": storm["time_to_ack_s"],
@@ -1701,7 +1775,8 @@ class Ward:
         acknowledged event carries the same shape plus when
         the last ack landed and how long that took from the
         storm's start, and the shift on duty then with how
-        many nurses it had. The event is
+        many nurses it had, and the per-bed acknowledgement
+        times. The event is
         recorded on the audit trail with whether the hook was
         invoked for it, any synchronous error, and the retries
         and final delivery outcome.
@@ -1734,8 +1809,12 @@ class Ward:
         it raised and how many of them have been acked, how
         many were still pending when it ended, and when it
         was acknowledged and how long that took, with the
-        shift on duty then and how many nurses it had; the
-        open storm, if any, is listed last with ``ended_t``
+        shift on duty then and how many nurses it had, and
+        the per-bed acknowledgement times — how many of each
+        bed's storm alarms have been acked and how long that
+        bed took from the storm's start, null while any of
+        its alarms is still pending; the open storm, if any,
+        is listed last with ``ended_t``
         null and its ack still in progress. ``event_count``
         counts every alarm-storm hook event this run — storms
         starting, ending, and being acknowledged — and
