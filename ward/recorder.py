@@ -757,7 +757,10 @@ def summarize(path):
         # the per-bed acknowledgement totals across storms,
         # the slowest-bed alert threshold and the beds whose
         # mean time to ack across the storms they fully cleared
-        # is above it, and the per-storm records.
+        # is above it, the per-bed history of those slowest-bed
+        # alert episodes — when each bed crossed, its mean and
+        # longest time then, the threshold, and when it
+        # cleared — and the per-storm records.
         "alarm_storm": (
             {
                 "storm_active": last_alarm_storm.get(
@@ -787,6 +790,16 @@ def summarize(path):
                 ),
                 "slowest_bed_alerts": last_alarm_storm.get(
                     "slowest_bed_alerts", []
+                ),
+                "slowest_bed_alert_episode_count": (
+                    last_alarm_storm.get(
+                        "slowest_bed_alert_episode_count", 0
+                    )
+                ),
+                "slowest_bed_alert_history": (
+                    last_alarm_storm.get(
+                        "slowest_bed_alert_history", {}
+                    )
                 ),
                 "event_count": last_alarm_storm.get(
                     "event_count", 0

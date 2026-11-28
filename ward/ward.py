@@ -441,6 +441,17 @@ class Ward:
         # back below it, so a bed that falls behind again
         # pages again.
         self._slowest_bed_alerted = set()
+        # Every slowest-bed alert episode this run, oldest
+        # first — one entry per crossing of the threshold,
+        # with when the bed crossed, its mean and longest
+        # time to ack then, the threshold, and how many
+        # storms it raised in and cleared, plus when it
+        # cleared (null while the episode is still open)
+        # and the same figures at the clearing tick — so a
+        # dashboard can see each bed's crossings and
+        # clearings this run without scanning the event
+        # list.
+        self._slowest_bed_alert_episodes = []
         # Every storm that has ended this run, in order — the
         # acknowledgement record for each: when it started and
         # ended, how many alarms it raised, how many of them
@@ -1887,6 +1898,55 @@ class Ward:
                     )
         return cleared
 
+    def _slowest_bed_alert_history(self):
+        """Slowest-bed alert episodes grouped per bed.
+
+        One list per bed that has crossed the threshold this
+        run, in bed order, oldest episode first: when it
+        crossed, its mean and longest time to ack then, the
+        threshold, and how many storms it raised in and
+        cleared — plus when it cleared (null while the
+        episode is still open) and the same figures at the
+        clearing tick — so a dashboard can see each bed's
+        crossings and clearings this run without scanning
+        the event list. A bed that never crossed has no
+        entry.
+        """
+        history = {}
+        for episode in self._slowest_bed_alert_episodes:
+            history.setdefault(
+                str(episode["bed"]), []
+            ).append(
+                {
+                    "raised_t": episode["raised_t"],
+                    "threshold_s": episode["threshold_s"],
+                    "mean_time_to_ack_s": episode[
+                        "mean_time_to_ack_s"
+                    ],
+                    "max_time_to_ack_s": episode[
+                        "max_time_to_ack_s"
+                    ],
+                    "storms": episode["storms"],
+                    "cleared_storms": episode[
+                        "cleared_storms"
+                    ],
+                    "cleared_t": episode["cleared_t"],
+                    "mean_time_to_ack_at_clear_s": episode[
+                        "mean_time_to_ack_at_clear_s"
+                    ],
+                    "max_time_to_ack_at_clear_s": episode[
+                        "max_time_to_ack_at_clear_s"
+                    ],
+                    "storms_at_clear": episode[
+                        "storms_at_clear"
+                    ],
+                    "cleared_storms_at_clear": episode[
+                        "cleared_storms_at_clear"
+                    ],
+                }
+            )
+        return history
+
     def _alarm_storm_view(self, storm):
         """One storm as plain JSON data, for the summary."""
         return {
@@ -1977,6 +2037,31 @@ class Ward:
                         ),
                     },
                 )
+                # Open one history episode per crossing, so
+                # the bed's crossings and clearings survive
+                # as a record even after it recovers.
+                self._slowest_bed_alert_episodes.append(
+                    {
+                        "bed": alert["bed"],
+                        "raised_t": self.elapsed,
+                        "threshold_s": alert["threshold_s"],
+                        "mean_time_to_ack_s": (
+                            alert["mean_time_to_ack_s"]
+                        ),
+                        "max_time_to_ack_s": (
+                            alert["max_time_to_ack_s"]
+                        ),
+                        "storms": alert["storms"],
+                        "cleared_storms": (
+                            alert["cleared_storms"]
+                        ),
+                        "cleared_t": None,
+                        "mean_time_to_ack_at_clear_s": None,
+                        "max_time_to_ack_at_clear_s": None,
+                        "storms_at_clear": None,
+                        "cleared_storms_at_clear": None,
+                    }
+                )
         if threshold is not None:
             by_bed = {total["bed"]: total for total in totals}
             cleared = self._cleared_storm_counts(storms)
@@ -2005,6 +2090,30 @@ class Ward:
                         "cleared_storms": cleared.get(bed, 0),
                     },
                 )
+                # Close the bed's open episode with the same
+                # figures the cleared event carries, so the
+                # history shows both ends of the episode.
+                for episode in reversed(
+                    self._slowest_bed_alert_episodes
+                ):
+                    if (
+                        episode["bed"] == bed
+                        and episode["cleared_t"] is None
+                    ):
+                        episode["cleared_t"] = self.elapsed
+                        episode[
+                            "mean_time_to_ack_at_clear_s"
+                        ] = total["mean_time_to_ack_s"]
+                        episode[
+                            "max_time_to_ack_at_clear_s"
+                        ] = total["max_time_to_ack_s"]
+                        episode["storms_at_clear"] = total[
+                            "storms"
+                        ]
+                        episode["cleared_storms_at_clear"] = (
+                            cleared.get(bed, 0)
+                        )
+                        break
         self._slowest_bed_alerted = alerted
 
     def _fire_alarm_storm_event(self, kind, now, extra):
@@ -2087,7 +2196,16 @@ class Ward:
         below the threshold fires an
         ``alarm_storm_slowest_bed_cleared`` event in the tick
         it recovers, with the same payload shape, and is
-        re-armed. ``event_count``
+        re-armed. ``slowest_bed_alert_episode_count`` counts
+        every slowest-bed alert episode this run and
+        ``slowest_bed_alert_history`` is those episodes
+        grouped per bed — each with when the bed crossed,
+        its mean and longest time then, the threshold, and
+        how many storms it raised in and cleared, plus when
+        it cleared (null while still open) and the same
+        figures at the clearing tick — so a dashboard can
+        see each bed's crossings and clearings without
+        scanning the event list. ``event_count``
         counts every alarm-storm hook event this run — storms
         starting, ending, being acknowledged, and beds
         crossing the slowest-bed threshold or recovering
@@ -2137,6 +2255,12 @@ class Ward:
             ],
             "slowest_bed_alerts": self._slowest_bed_alerts(
                 bed_ack_totals, storms
+            ),
+            "slowest_bed_alert_episode_count": len(
+                self._slowest_bed_alert_episodes
+            ),
+            "slowest_bed_alert_history": (
+                self._slowest_bed_alert_history()
             ),
             "event_count": len(self.alarm_storm_events),
             "events": [dict(e) for e in self.alarm_storm_events],

@@ -16968,6 +16968,160 @@ class TestAlarmStormHooks(unittest.TestCase):
             server.shutdown()
             server.server_close()
 
+    def test_scenario_alarm_storm_slowest_bed_history(self):
+        # The same four storms as the cleared-hooks scenario,
+        # with a 20.0 s mean-ack threshold and no hooks: six
+        # slowest-bed episodes this run. Bed 0 crosses once
+        # at 43 s, at a 26.0 s mean, and never recovers; beds
+        # 1 and 2 cross at 47 s at 30.0 s, recover at 167 s
+        # when the second storm times them at 0.0 s and their
+        # mean falls to 15.0 s, then cross again at 377 s at
+        # a 22.5 s mean; bed 3 crosses once at 198 s at
+        # 31.0 s. The history is grouped per bed, in the
+        # alarm-storm summary, in every tick snapshot, and
+        # in the run summary — a bed that never crossed has
+        # no entry.
+        cfg = load_scenario(
+            os.path.join(
+                HERE,
+                "..",
+                "scenarios",
+                "alarm-storm-ack-slowest-bed-history.json",
+            )
+        )
+        path = os.path.join(tempfile.mkdtemp(), "run.jsonl")
+        ward = build_ward(cfg, seed=42)
+        with Recorder(path, ward.beds, ward.rate_hz, seed=42) as rec:
+            ward.recorder = rec
+            for _ in range(500):
+                snap = ward.tick()
+        expected = {
+            "0": [
+                {
+                    "raised_t": 43.0,
+                    "threshold_s": 20.0,
+                    "mean_time_to_ack_s": 26.0,
+                    "max_time_to_ack_s": 26.0,
+                    "storms": 1,
+                    "cleared_storms": 1,
+                    "cleared_t": None,
+                    "mean_time_to_ack_at_clear_s": None,
+                    "max_time_to_ack_at_clear_s": None,
+                    "storms_at_clear": None,
+                    "cleared_storms_at_clear": None,
+                }
+            ],
+            "1": [
+                {
+                    "raised_t": 47.0,
+                    "threshold_s": 20.0,
+                    "mean_time_to_ack_s": 30.0,
+                    "max_time_to_ack_s": 30.0,
+                    "storms": 1,
+                    "cleared_storms": 1,
+                    "cleared_t": 167.0,
+                    "mean_time_to_ack_at_clear_s": 15.0,
+                    "max_time_to_ack_at_clear_s": 30.0,
+                    "storms_at_clear": 2,
+                    "cleared_storms_at_clear": 2,
+                },
+                {
+                    "raised_t": 377.0,
+                    "threshold_s": 20.0,
+                    "mean_time_to_ack_s": 22.5,
+                    "max_time_to_ack_s": 30.0,
+                    "storms": 4,
+                    "cleared_storms": 4,
+                    "cleared_t": None,
+                    "mean_time_to_ack_at_clear_s": None,
+                    "max_time_to_ack_at_clear_s": None,
+                    "storms_at_clear": None,
+                    "cleared_storms_at_clear": None,
+                },
+            ],
+            "2": [
+                {
+                    "raised_t": 47.0,
+                    "threshold_s": 20.0,
+                    "mean_time_to_ack_s": 30.0,
+                    "max_time_to_ack_s": 30.0,
+                    "storms": 1,
+                    "cleared_storms": 1,
+                    "cleared_t": 167.0,
+                    "mean_time_to_ack_at_clear_s": 15.0,
+                    "max_time_to_ack_at_clear_s": 30.0,
+                    "storms_at_clear": 2,
+                    "cleared_storms_at_clear": 2,
+                },
+                {
+                    "raised_t": 377.0,
+                    "threshold_s": 20.0,
+                    "mean_time_to_ack_s": 22.5,
+                    "max_time_to_ack_s": 30.0,
+                    "storms": 4,
+                    "cleared_storms": 4,
+                    "cleared_t": None,
+                    "mean_time_to_ack_at_clear_s": None,
+                    "max_time_to_ack_at_clear_s": None,
+                    "storms_at_clear": None,
+                    "cleared_storms_at_clear": None,
+                },
+            ],
+            "3": [
+                {
+                    "raised_t": 198.0,
+                    "threshold_s": 20.0,
+                    "mean_time_to_ack_s": 31.0,
+                    "max_time_to_ack_s": 31.0,
+                    "storms": 1,
+                    "cleared_storms": 1,
+                    "cleared_t": None,
+                    "mean_time_to_ack_at_clear_s": None,
+                    "max_time_to_ack_at_clear_s": None,
+                    "storms_at_clear": None,
+                    "cleared_storms_at_clear": None,
+                }
+            ],
+        }
+        summary = ward.alarm_storm_summary()
+        self.assertEqual(
+            summary["slowest_bed_alert_episode_count"], 6
+        )
+        self.assertEqual(
+            summary["slowest_bed_alert_history"], expected
+        )
+        self.assertEqual(
+            snap["alarm_storm"]["slowest_bed_alert_history"],
+            expected,
+        )
+        run = summarize(path)
+        self.assertEqual(
+            run["alarm_storm"]["slowest_bed_alert_episode_count"],
+            6,
+        )
+        self.assertEqual(
+            run["alarm_storm"]["slowest_bed_alert_history"],
+            expected,
+        )
+
+    def test_slowest_bed_alert_history_empty_without_threshold(self):
+        # No threshold configured: the same storms clear at
+        # the same means, but nothing alerts and no episode
+        # is ever recorded.
+        cfg = load_scenario(
+            os.path.join(
+                HERE, "..", "scenarios", "alarm-storm-ack-totals.json"
+            )
+        )
+        ward = build_ward(cfg, seed=42)
+        for _ in range(220):
+            ward.tick()
+        summary = ward.alarm_storm_summary()
+        self.assertEqual(
+            summary["slowest_bed_alert_episode_count"], 0
+        )
+        self.assertEqual(summary["slowest_bed_alert_history"], {})
+
 
 class TestLabDelay(unittest.TestCase):
     # A lab-result delay: bed 0's bloods are due at t=30, but the

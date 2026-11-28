@@ -403,6 +403,16 @@ python3 -m ward.cli scenarios/alarm-storm-ack-slowest-bed-hooks.json --seed 42
 # at your own endpoint; a dead endpoint is logged, never fatal)
 python3 -m ward.cli scenarios/alarm-storm-ack-slowest-bed-cleared-hooks.json --seed 42
 
+# Slowest-bed alert history: the same burst four times, with a
+# 20.0 s mean-ack threshold — bed 0 crosses once at 43 s at a
+# 26.0 s mean and never recovers, beds 1 and 2 cross at 47 s at
+# 30.0 s, recover at 167 s at a 15.0 s mean, then cross again at
+# 377 s at a 22.5 s mean, and bed 3 crosses once at 198 s at
+# 31.0 s — six episodes in total, each recorded per bed with
+# when it crossed, its mean and longest time then, and when it
+# cleared
+python3 -m ward.cli scenarios/alarm-storm-ack-slowest-bed-history.json --seed 42
+
 # Reproducible run
 python3 -m ward.cli scenarios/example.json --seed 42
 ```
@@ -546,7 +556,10 @@ python3 -m ward.cli scenarios/example.json --seed 42
   the tick it crosses, and each bed whose mean drops back
   below it fires an `alarm_storm_slowest_bed_cleared` hook
   event in the tick it recovers, with the same payload
-  shape — the storm event history,
+  shape — and the per-bed history of those slowest-bed
+  alert episodes, grouped per bed, each with when the bed
+  crossed, its mean and longest time then, the threshold,
+  and when it cleared (null while still open) — the storm event history,
   and the alarm-storm-hook totals, as JSON
   (503 while partitioned)
 
@@ -1308,7 +1321,20 @@ for four bursts with a 20.0 s threshold: beds 1 and 2 alert
 at 47 s, recover to a 15.0 s mean and each fire their
 cleared event at 167 s, then fall behind again and fire
 again at 377 s — 20 hook deliveries invoked and 0 failed
-against a stub server over a seeded 500-tick run.
+against a stub server over a seeded 500-tick run. Every
+crossing and clearing is also recorded per bed as an alert
+episode — when the bed crossed, its mean and longest time
+then, the threshold, and when it cleared (null while still
+open) — in `slowest_bed_alert_history`, grouped per bed, in
+the alarm-storm summary, every snapshot and WebSocket
+frame, a `GET /alarm-storm` endpoint, and the run summary.
+See `scenarios/alarm-storm-ack-slowest-bed-history.json`
+for the same four bursts with a 20.0 s threshold and no
+hooks: six episodes over a seeded 500-tick run — bed 0
+crosses once at 43 s at a 26.0 s mean and never recovers,
+beds 1 and 2 cross at 47 s at 30.0 s, recover at 167 s at
+a 15.0 s mean, then cross again at 377 s at a 22.5 s mean,
+and bed 3 crosses once at 198 s at 31.0 s.
 
 ## Alarm-storm acknowledgement
 
@@ -4699,6 +4725,17 @@ the hook totals.
   alert, in the alarm-storm summary, every snapshot,
   WebSocket frame, a `GET /alarm-storm` endpoint, and the run
   summary) — done in v0.77.0
-- Next: slowest-bed alert history per bed, so a dashboard can
-  see each bed's crossings and clearings this run — the tick
-  and the mean at each — without scanning the event list
+- Slowest-bed alert history per bed (one episode per
+  crossing of the threshold, grouped per bed — when the bed
+  crossed, its mean and longest time to ack then, the
+  threshold, and how many storms it raised in and cleared,
+  plus when it cleared and the same figures at the clearing
+  tick, null while the episode is still open — in the
+  alarm-storm summary, every snapshot, WebSocket frame, a
+  `GET /alarm-storm` endpoint, and the run summary, so a
+  dashboard can see each bed's crossings and clearings this
+  run without scanning the event list) — done in v0.78.0
+- Next: alarm-storm acknowledgement by shift, so a dashboard
+  can see whether nights are slower than days — the per-storm
+  and per-bed acknowledgement times broken down by the shift
+  on duty when each storm was acknowledged
