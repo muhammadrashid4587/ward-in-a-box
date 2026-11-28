@@ -753,7 +753,9 @@ def summarize(path):
         # retried, and delivered — plus the acknowledgement
         # totals (how many storms there have been, how many are
         # acknowledged and how many are not, and the mean and
-        # longest time from a storm's start to its last ack),
+        # longest time from a storm's start to its last ack,
+        # broken down by the shift that acknowledged each
+        # storm),
         # the per-bed acknowledgement totals across storms,
         # the slowest-bed alert threshold and the beds whose
         # mean time to ack across the storms they fully cleared
@@ -777,6 +779,18 @@ def summarize(path):
                         "unacknowledged": 0,
                         "mean_time_to_ack_s": None,
                         "max_time_to_ack_s": None,
+                        "by_shift": {
+                            "day": {
+                                "storms": 0,
+                                "mean_time_to_ack_s": None,
+                                "max_time_to_ack_s": None,
+                            },
+                            "night": {
+                                "storms": 0,
+                                "mean_time_to_ack_s": None,
+                                "max_time_to_ack_s": None,
+                            },
+                        },
                     },
                 ),
                 "storms": last_alarm_storm.get("storms", []),

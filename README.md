@@ -413,6 +413,16 @@ python3 -m ward.cli scenarios/alarm-storm-ack-slowest-bed-cleared-hooks.json --s
 # cleared
 python3 -m ward.cli scenarios/alarm-storm-ack-slowest-bed-history.json --seed 42
 
+# Acknowledgement by shift: the same burst twice, on a ward
+# whose clock starts at 18:00 — the first storm is raised and
+# acknowledged on the day shift (3 nurses, bed 0 clears in
+# 26.0 s, beds 1 and 2 in 30.0 s), the second straddles the
+# 19:00 change (bed 0's alarms are acked at 3595 s, still on
+# days, beds 1 and 2's at 3605 s, on nights with 2 nurses),
+# so the run totals break the storms down by shift: one storm
+# a side, 30.0 s on days against 31.0 s on nights
+python3 -m ward.cli scenarios/alarm-storm-ack-by-shift.json --seed 42
+
 # Reproducible run
 python3 -m ward.cli scenarios/example.json --seed 42
 ```
@@ -542,10 +552,15 @@ python3 -m ward.cli scenarios/example.json --seed 42
   window, the acknowledgement totals (how many storms there
   have been, how many are acknowledged and how many are not,
   and the mean and longest time from a storm's start to its
-  last ack) and the per-storm records, each with the
+  last ack, broken down by shift — how many storms the day
+  shift acknowledged and how many the night shift did, with
+  the mean and longest time to ack for each) and the per-storm records, each with the
   per-bed acknowledgement times (how many of each bed's
   storm alarms were acked and how long that bed took from
-  the storm's start), the per-bed acknowledgement totals
+  the storm's start, with the shift on duty when that bed's
+  last ack landed and how many nurses it had, so a storm
+  that straddles a shift change shows which shift cleared
+  which bed), the per-bed acknowledgement totals
   across storms (how many storms each bed raised in, how
   many of its storm alarms were raised, acked, and are
   still pending, and the mean and longest time it took to
@@ -4735,7 +4750,19 @@ the hook totals.
   `GET /alarm-storm` endpoint, and the run summary, so a
   dashboard can see each bed's crossings and clearings this
   run without scanning the event list) — done in v0.78.0
-- Next: alarm-storm acknowledgement by shift, so a dashboard
-  can see whether nights are slower than days — the per-storm
-  and per-bed acknowledgement times broken down by the shift
-  on duty when each storm was acknowledged
+- Alarm-storm acknowledgement by shift (the per-storm and
+  per-bed acknowledgement times broken down by the shift on
+  duty when each storm was acknowledged — each bed's entry
+  names the shift on duty when its last ack landed and how
+  many nurses it had, so a storm that straddles a shift
+  change shows which shift cleared which bed, and the run
+  totals break the acknowledged storms down by shift, with
+  the mean and longest time to ack for days and for nights
+  — in the alarm-storm summary, every snapshot, WebSocket
+  frame, a `GET /alarm-storm` endpoint, and the run summary,
+  and in the `alarm_storm_acknowledged` hook payload, so a
+  dashboard can see whether nights are slower than days) —
+  done in v0.79.0
+- Next: slowest-bed alerts per shift, so a bed that is slow
+  on nights but fine on days alerts only for the shift it
+  falls behind on

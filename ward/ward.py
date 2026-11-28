@@ -1756,12 +1756,16 @@ class Ward:
         order: how many of that bed's storm alarms have been
         raised, acked, and are still pending, when that bed's
         last ack landed, and how long that took from the
-        storm's start. A bed is timed only once its alarms
-        are all acked — while any is still pending its time
-        is null, so a dashboard can see which bed the nurses
-        cleared last. A bed whose alarms were all acked
-        before the storm started has no observed ack time and
-        times at zero, like the storm itself.
+        storm's start — plus which shift was on duty when
+        that last ack landed and how many nurses it had, so
+        a storm that straddles a shift change shows which
+        shift cleared which bed. A bed is timed only once
+        its alarms are all acked — while any is still pending
+        its time is null and its shift is null too, so a
+        dashboard can see which bed the nurses cleared last.
+        A bed whose alarms were all acked before the storm
+        started has no observed ack time and times at zero,
+        with no shift to name, like the storm itself.
         """
         view = []
         for bed in sorted(storm["bed_acks"]):
@@ -1775,6 +1779,16 @@ class Ward:
                 time_to_ack_s = round(
                     entry["last_ack_t"] - storm["started_t"], 3
                 )
+            if entry["last_ack_t"] is None:
+                ack_shift = None
+                ack_nurses = None
+            else:
+                ack_shift = self.staffing.shift_at(
+                    entry["last_ack_t"]
+                )
+                ack_nurses = self.staffing.on_shift(
+                    entry["last_ack_t"]
+                )["nurse"]
             view.append(
                 {
                     "bed": bed,
@@ -1783,6 +1797,8 @@ class Ward:
                     "alarms_pending": pending,
                     "last_ack_t": entry["last_ack_t"],
                     "time_to_ack_s": time_to_ack_s,
+                    "ack_shift": ack_shift,
+                    "ack_nurses": ack_nurses,
                 }
             )
         return view
@@ -1841,6 +1857,43 @@ class Ward:
                     ),
                 }
             )
+        return view
+
+    def _ack_totals_by_shift(self, storms):
+        """Acknowledgement totals per shift, over acknowledged storms.
+
+        One entry per shift — day, then night — keyed by the
+        shift on duty when each storm's last alarm was acked:
+        how many storms that shift acknowledged, and the mean
+        and longest time from those storms' starts to their
+        last acks, null while the shift has acknowledged no
+        storm yet — so a dashboard can see whether nights are
+        slower than days without scanning the storm list.
+        Storms that are not acknowledged yet name no shift
+        and count for neither.
+        """
+        by_shift = {}
+        for storm in storms:
+            if not storm["acknowledged"]:
+                continue
+            shift = storm["ack_shift"]
+            total = by_shift.setdefault(
+                shift, {"storms": 0, "times": []}
+            )
+            total["storms"] += 1
+            total["times"].append(storm["time_to_ack_s"])
+        view = {}
+        for shift in ("day", "night"):
+            total = by_shift.get(shift, {"storms": 0, "times": []})
+            times = total["times"]
+            view[shift] = {
+                "storms": total["storms"],
+                "mean_time_to_ack_s": (
+                    round(sum(times) / len(times), 3)
+                    if times else None
+                ),
+                "max_time_to_ack_s": max(times) if times else None,
+            }
         return view
 
     def _slowest_bed_alerts(self, totals, storms):
@@ -2130,7 +2183,8 @@ class Ward:
         the last ack landed and how long that took from the
         storm's start, and the shift on duty then with how
         many nurses it had, and the per-bed acknowledgement
-        times. A slowest-bed event carries the bed whose mean
+        times — each with the shift on duty when that bed's
+        last ack landed and how many nurses it had. A slowest-bed event carries the bed whose mean
         time to ack has just crossed the threshold, its mean
         and longest time, the threshold, and how many storms
         it raised in and cleared; a slowest-bed cleared event
@@ -2163,7 +2217,10 @@ class Ward:
         are acknowledged (every alarm they raised has been
         acked by the nurse on duty) and how many are not, and
         the mean and longest time from a storm's start to its
-        last ack — and ``storms`` lists every storm this run,
+        last ack, broken down by shift in ``by_shift`` — how
+        many storms the day shift acknowledged and how many
+        the night shift did, with the mean and longest time
+        to ack for each — and ``storms`` lists every storm this run,
         each with when it started and ended, how many alarms
         it raised and how many of them have been acked, how
         many were still pending when it ended, and when it
@@ -2172,7 +2229,10 @@ class Ward:
         the per-bed acknowledgement times — how many of each
         bed's storm alarms have been acked and how long that
         bed took from the storm's start, null while any of
-        its alarms is still pending; the open storm, if any,
+        its alarms is still pending, with the shift on duty
+        when that bed's last ack landed and how many nurses
+        it had, so a storm that straddles a shift change
+        shows which shift cleared which bed; the open storm, if any,
         is listed last with ``ended_t``
         null and its ack still in progress. ``bed_ack_totals``
         aggregates the per-bed times across every storm this
@@ -2247,6 +2307,7 @@ class Ward:
                     if times else None
                 ),
                 "max_time_to_ack_s": max(times) if times else None,
+                "by_shift": self._ack_totals_by_shift(storms),
             },
             "storms": storms,
             "bed_ack_totals": bed_ack_totals,

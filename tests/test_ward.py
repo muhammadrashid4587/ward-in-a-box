@@ -15697,6 +15697,18 @@ class TestAlarmStormHooks(unittest.TestCase):
                 "unacknowledged": 0,
                 "mean_time_to_ack_s": 31.0,
                 "max_time_to_ack_s": 31.0,
+                "by_shift": {
+                    "day": {
+                        "storms": 1,
+                        "mean_time_to_ack_s": 31.0,
+                        "max_time_to_ack_s": 31.0,
+                    },
+                    "night": {
+                        "storms": 0,
+                        "mean_time_to_ack_s": None,
+                        "max_time_to_ack_s": None,
+                    },
+                },
             },
         )
         self.assertEqual(
@@ -15720,6 +15732,8 @@ class TestAlarmStormHooks(unittest.TestCase):
                             "alarms_pending": 0,
                             "last_ack_t": 43.0,
                             "time_to_ack_s": 31.0,
+                            "ack_shift": "day",
+                            "ack_nurses": 3,
                         },
                         {
                             "bed": 1,
@@ -15728,6 +15742,8 @@ class TestAlarmStormHooks(unittest.TestCase):
                             "alarms_pending": 0,
                             "last_ack_t": 43.0,
                             "time_to_ack_s": 31.0,
+                            "ack_shift": "day",
+                            "ack_nurses": 3,
                         },
                         {
                             "bed": 2,
@@ -15736,6 +15752,8 @@ class TestAlarmStormHooks(unittest.TestCase):
                             "alarms_pending": 0,
                             "last_ack_t": 42.0,
                             "time_to_ack_s": 30.0,
+                            "ack_shift": "day",
+                            "ack_nurses": 3,
                         },
                     ],
                     "acknowledged": True,
@@ -15777,6 +15795,18 @@ class TestAlarmStormHooks(unittest.TestCase):
                 "unacknowledged": 1,
                 "mean_time_to_ack_s": None,
                 "max_time_to_ack_s": None,
+                "by_shift": {
+                    "day": {
+                        "storms": 0,
+                        "mean_time_to_ack_s": None,
+                        "max_time_to_ack_s": None,
+                    },
+                    "night": {
+                        "storms": 0,
+                        "mean_time_to_ack_s": None,
+                        "max_time_to_ack_s": None,
+                    },
+                },
             },
         )
         storm = summary["storms"][0]
@@ -15802,6 +15832,8 @@ class TestAlarmStormHooks(unittest.TestCase):
                     "alarms_pending": 5,
                     "last_ack_t": None,
                     "time_to_ack_s": None,
+                    "ack_shift": None,
+                    "ack_nurses": None,
                 }
                 for b in (0, 1, 2)
             ],
@@ -15842,6 +15874,18 @@ class TestAlarmStormHooks(unittest.TestCase):
                 "unacknowledged": 0,
                 "mean_time_to_ack_s": 91.0,
                 "max_time_to_ack_s": 91.0,
+                "by_shift": {
+                    "day": {
+                        "storms": 1,
+                        "mean_time_to_ack_s": 91.0,
+                        "max_time_to_ack_s": 91.0,
+                    },
+                    "night": {
+                        "storms": 0,
+                        "mean_time_to_ack_s": None,
+                        "max_time_to_ack_s": None,
+                    },
+                },
             },
         )
         storm = summary["storms"][0]
@@ -15911,6 +15955,8 @@ class TestAlarmStormHooks(unittest.TestCase):
                     "alarms_pending": 0,
                     "last_ack_t": 103.0,
                     "time_to_ack_s": 91.0,
+                    "ack_shift": "day",
+                    "ack_nurses": 1,
                 },
                 {
                     "bed": 1,
@@ -15919,6 +15965,8 @@ class TestAlarmStormHooks(unittest.TestCase):
                     "alarms_pending": 0,
                     "last_ack_t": 103.0,
                     "time_to_ack_s": 91.0,
+                    "ack_shift": "day",
+                    "ack_nurses": 1,
                 },
                 {
                     "bed": 2,
@@ -15927,6 +15975,8 @@ class TestAlarmStormHooks(unittest.TestCase):
                     "alarms_pending": 0,
                     "last_ack_t": 102.0,
                     "time_to_ack_s": 90.0,
+                    "ack_shift": "day",
+                    "ack_nurses": 1,
                 },
             ],
         )
@@ -15967,6 +16017,18 @@ class TestAlarmStormHooks(unittest.TestCase):
                 "unacknowledged": 0,
                 "mean_time_to_ack_s": 31.0,
                 "max_time_to_ack_s": 31.0,
+                "by_shift": {
+                    "day": {
+                        "storms": 2,
+                        "mean_time_to_ack_s": 31.0,
+                        "max_time_to_ack_s": 31.0,
+                    },
+                    "night": {
+                        "storms": 0,
+                        "mean_time_to_ack_s": None,
+                        "max_time_to_ack_s": None,
+                    },
+                },
             },
         )
         self.assertEqual(
@@ -16058,6 +16120,18 @@ class TestAlarmStormHooks(unittest.TestCase):
                 "unacknowledged": 0,
                 "mean_time_to_ack_s": 31.0,
                 "max_time_to_ack_s": 31.0,
+                "by_shift": {
+                    "day": {
+                        "storms": 1,
+                        "mean_time_to_ack_s": 31.0,
+                        "max_time_to_ack_s": 31.0,
+                    },
+                    "night": {
+                        "storms": 0,
+                        "mean_time_to_ack_s": None,
+                        "max_time_to_ack_s": None,
+                    },
+                },
             },
         )
         # The run summary carries the same acknowledgement
@@ -17102,6 +17176,146 @@ class TestAlarmStormHooks(unittest.TestCase):
         self.assertEqual(
             run["alarm_storm"]["slowest_bed_alert_history"],
             expected,
+        )
+
+    def test_scenario_alarm_storm_ack_by_shift(self):
+        # Two storms across a shift change, on a ward whose
+        # clock starts at 18:00: the first storm is raised
+        # and acknowledged on the day shift (3 nurses), the
+        # second straddles the 19:00 change — bed 0's alarms
+        # are acked at 3595, still on days, beds 1 and 2's
+        # at 3605, on nights (2 nurses) — so the per-bed
+        # acknowledgement times name the shift that cleared
+        # each bed, and the run totals break the storms down
+        # by shift: one storm a side, 30.0 s on days against
+        # 31.0 s on nights. The same fields are in every tick
+        # snapshot and in the run summary.
+        cfg = load_scenario(
+            os.path.join(
+                HERE,
+                "..",
+                "scenarios",
+                "alarm-storm-ack-by-shift.json",
+            )
+        )
+        path = os.path.join(tempfile.mkdtemp(), "run.jsonl")
+        ward = build_ward(cfg, seed=42)
+        with Recorder(path, ward.beds, ward.rate_hz, seed=42) as rec:
+            ward.recorder = rec
+            for _ in range(3800):
+                snap = ward.tick()
+        summary = ward.alarm_storm_summary()
+        self.assertEqual(
+            summary["acknowledgement"],
+            {
+                "storms": 2,
+                "acknowledged": 2,
+                "unacknowledged": 0,
+                "mean_time_to_ack_s": 30.5,
+                "max_time_to_ack_s": 31.0,
+                "by_shift": {
+                    "day": {
+                        "storms": 1,
+                        "mean_time_to_ack_s": 30.0,
+                        "max_time_to_ack_s": 30.0,
+                    },
+                    "night": {
+                        "storms": 1,
+                        "mean_time_to_ack_s": 31.0,
+                        "max_time_to_ack_s": 31.0,
+                    },
+                },
+            },
+        )
+        day_storm, night_storm = summary["storms"]
+        self.assertEqual(day_storm["ack_shift"], "day")
+        self.assertEqual(day_storm["ack_nurses"], 3)
+        self.assertEqual(
+            [
+                (
+                    b["bed"],
+                    b["time_to_ack_s"],
+                    b["ack_shift"],
+                    b["ack_nurses"],
+                )
+                for b in day_storm["bed_acks"]
+            ],
+            [
+                (0, 26.0, "day", 3),
+                (1, 30.0, "day", 3),
+                (2, 30.0, "day", 3),
+            ],
+        )
+        self.assertEqual(night_storm["ack_shift"], "night")
+        self.assertEqual(night_storm["ack_nurses"], 2)
+        self.assertEqual(
+            [
+                (
+                    b["bed"],
+                    b["time_to_ack_s"],
+                    b["ack_shift"],
+                    b["ack_nurses"],
+                )
+                for b in night_storm["bed_acks"]
+            ],
+            [
+                (0, 21.0, "day", 3),
+                (1, 31.0, "night", 2),
+                (2, 31.0, "night", 2),
+            ],
+        )
+        # The acknowledged hook events carry the same
+        # per-bed shifts, so a hook hears which shift
+        # cleared which bed.
+        acked = [
+            e
+            for e in summary["events"]
+            if e["event"] == "alarm_storm_acknowledged"
+        ]
+        self.assertEqual(len(acked), 2)
+        self.assertEqual(
+            [
+                (b["bed"], b["ack_shift"])
+                for b in acked[1]["bed_acks"]
+            ],
+            [(0, "day"), (1, "night"), (2, "night")],
+        )
+        self.assertEqual(
+            snap["alarm_storm"]["acknowledgement"],
+            summary["acknowledgement"],
+        )
+        self.assertEqual(
+            snap["alarm_storm"]["storms"], summary["storms"]
+        )
+        run = summarize(path)
+        self.assertEqual(
+            run["alarm_storm"]["acknowledgement"],
+            summary["acknowledgement"],
+        )
+        self.assertEqual(
+            run["alarm_storm"]["storms"], summary["storms"]
+        )
+
+    def test_ack_by_shift_empty_before_any_storm(self):
+        # No storm yet: both shifts count zero storms with
+        # null mean and longest times.
+        ward = self._storm_ward()
+        self.assertEqual(
+            ward.alarm_storm_summary()["acknowledgement"][
+                "by_shift"
+            ],
+            {
+                "day": {
+                    "storms": 0,
+                    "mean_time_to_ack_s": None,
+                    "max_time_to_ack_s": None,
+                },
+                "night": {
+                    "storms": 0,
+                    "mean_time_to_ack_s": None,
+                    "max_time_to_ack_s": None,
+                },
+            },
         )
 
     def test_slowest_bed_alert_history_empty_without_threshold(self):
