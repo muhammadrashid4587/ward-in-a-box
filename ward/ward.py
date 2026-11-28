@@ -1850,13 +1850,7 @@ class Ward:
         threshold = self.alarm_storm["slowest_bed_alert_threshold_s"]
         if threshold is None:
             return []
-        cleared = {}
-        for storm in storms:
-            for entry in storm["bed_acks"]:
-                if entry["time_to_ack_s"] is not None:
-                    cleared[entry["bed"]] = (
-                        cleared.get(entry["bed"], 0) + 1
-                    )
+        cleared = self._cleared_storm_counts(storms)
         alerts = []
         for total in totals:
             mean = total["mean_time_to_ack_s"]
@@ -1876,6 +1870,22 @@ class Ward:
                     }
                 )
         return alerts
+
+    def _cleared_storm_counts(self, storms):
+        """How many storms each bed fully cleared, by bed.
+
+        A storm counts for a bed once its per-bed time to ack
+        is a number — its last storm alarm has been acked —
+        so the count only grows as storms settle.
+        """
+        cleared = {}
+        for storm in storms:
+            for entry in storm["bed_acks"]:
+                if entry["time_to_ack_s"] is not None:
+                    cleared[entry["bed"]] = (
+                        cleared.get(entry["bed"], 0) + 1
+                    )
+        return cleared
 
     def _alarm_storm_view(self, storm):
         """One storm as plain JSON data, for the summary."""
@@ -1915,7 +1925,7 @@ class Ward:
         return storms
 
     def _check_slowest_bed_alerts(self):
-        """Fire a hook event for each bed newly crossing the slowest-bed threshold.
+        """Fire a hook event for each bed newly crossing — or leaving — the slowest-bed threshold.
 
         A bed's mean time to ack moves whenever one of its
         storms is fully cleared — its per-bed time goes from
@@ -1930,16 +1940,23 @@ class Ward:
         bed, its mean and longest time, the threshold, and how
         many storms it raised in and cleared — the same entry
         the summary lists under ``slowest_bed_alerts``. A bed
-        whose mean drops back below the threshold is re-armed:
-        it fires again if it crosses later, so a bed that
-        recovers and falls behind again pages again. With no
-        threshold configured the alert list is empty and
-        nothing fires, so a ward with the alert off behaves
-        exactly as before.
+        whose mean drops back below the threshold fires one
+        ``alarm_storm_slowest_bed_cleared`` event instead, in
+        the tick it recovers, with the same payload shape —
+        the bed, its mean and longest time now below the
+        threshold, the threshold, and how many storms it
+        raised in and cleared — and is re-armed: it fires
+        again if it crosses later, so a bed that recovers and
+        falls behind again pages again. With no threshold
+        configured the alert list is empty and nothing fires,
+        so a ward with the alert off behaves exactly as
+        before.
         """
+        threshold = self.alarm_storm["slowest_bed_alert_threshold_s"]
         storms = self._alarm_storm_views()
         totals = self._bed_ack_totals(storms)
         alerts = self._slowest_bed_alerts(totals, storms)
+        alerted = {alert["bed"] for alert in alerts}
         for alert in alerts:
             if alert["bed"] not in self._slowest_bed_alerted:
                 self._fire_alarm_storm_event(
@@ -1960,9 +1977,35 @@ class Ward:
                         ),
                     },
                 )
-        self._slowest_bed_alerted = {
-            alert["bed"] for alert in alerts
-        }
+        if threshold is not None:
+            by_bed = {total["bed"]: total for total in totals}
+            cleared = self._cleared_storm_counts(storms)
+            for bed in sorted(
+                self._slowest_bed_alerted - alerted
+            ):
+                total = by_bed.get(bed)
+                if (
+                    total is None
+                    or total["mean_time_to_ack_s"] is None
+                ):
+                    continue
+                self._fire_alarm_storm_event(
+                    "alarm_storm_slowest_bed_cleared",
+                    self.elapsed,
+                    {
+                        "bed": bed,
+                        "mean_time_to_ack_s": total[
+                            "mean_time_to_ack_s"
+                        ],
+                        "max_time_to_ack_s": total[
+                            "max_time_to_ack_s"
+                        ],
+                        "threshold_s": threshold,
+                        "storms": total["storms"],
+                        "cleared_storms": cleared.get(bed, 0),
+                    },
+                )
+        self._slowest_bed_alerted = alerted
 
     def _fire_alarm_storm_event(self, kind, now, extra):
         """Fire one alarm-storm hook event.
@@ -1981,7 +2024,9 @@ class Ward:
         times. A slowest-bed event carries the bed whose mean
         time to ack has just crossed the threshold, its mean
         and longest time, the threshold, and how many storms
-        it raised in and cleared. The event is
+        it raised in and cleared; a slowest-bed cleared event
+        carries the same shape for a bed whose mean has just
+        dropped back below the threshold. The event is
         recorded on the audit trail with whether the hook was
         invoked for it, any synchronous error, and the retries
         and final delivery outcome.
@@ -2038,10 +2083,15 @@ class Ward:
         of having to poll the totals, and each bed newly
         crossing it also fires an ``alarm_storm_slowest_bed``
         hook event in the tick it crosses, through the same
-        ``alarm_storm_hooks``. ``event_count``
+        ``alarm_storm_hooks``, and a bed whose mean drops back
+        below the threshold fires an
+        ``alarm_storm_slowest_bed_cleared`` event in the tick
+        it recovers, with the same payload shape, and is
+        re-armed. ``event_count``
         counts every alarm-storm hook event this run — storms
         starting, ending, being acknowledged, and beds
-        crossing the slowest-bed threshold — and
+        crossing the slowest-bed threshold or recovering
+        below it — and
         ``events`` lists them, each with the tick, the storm's
         shape, and whether the
         ward's hooks were invoked for it (``hook_invoked``)

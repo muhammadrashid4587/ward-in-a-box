@@ -395,6 +395,14 @@ python3 -m ward.cli scenarios/alarm-storm-ack-slowest-bed.json --seed 42
 # acks push their mean to 30.5 s, past the 30.0 s threshold
 python3 -m ward.cli scenarios/alarm-storm-ack-slowest-bed-hooks.json --seed 42
 
+# Slowest-bed alert cleared hooks: the same burst four times, with a
+# 20.0 s mean-ack threshold — beds 1 and 2 alert at 47 s, recover to a
+# 15.0 s mean and each fire their cleared event at 167 s, when the
+# second storm's acks land, then fall behind again and fire again at
+# 377 s, all POSTed to a webhook (here a placeholder URL — point it
+# at your own endpoint; a dead endpoint is logged, never fatal)
+python3 -m ward.cli scenarios/alarm-storm-ack-slowest-bed-cleared-hooks.json --seed 42
+
 # Reproducible run
 python3 -m ward.cli scenarios/example.json --seed 42
 ```
@@ -535,7 +543,10 @@ python3 -m ward.cli scenarios/example.json --seed 42
   and the beds whose mean time to ack across the storms
   they fully cleared is above it — each bed newly crossing
   it also fires an `alarm_storm_slowest_bed` hook event in
-  the tick it crosses — the storm event history,
+  the tick it crosses, and each bed whose mean drops back
+  below it fires an `alarm_storm_slowest_bed_cleared` hook
+  event in the tick it recovers, with the same payload
+  shape — the storm event history,
   and the alarm-storm-hook totals, as JSON
   (503 while partitioned)
 
@@ -1237,8 +1248,12 @@ alert threshold — with the bed, its mean and longest time,
 the threshold, and how many storms it raised in and cleared
 — so a hook hears the moment a bed falls behind instead of
 having to poll the summary; a bed whose mean drops back
-below the threshold is re-armed and fires again if it
-crosses later. A storm
+below the threshold fires one `alarm_storm_slowest_bed_cleared`
+event in the tick it recovers — with the same payload shape,
+the bed, its mean and longest time now below the threshold,
+the threshold, and how many storms it raised in and cleared —
+so a hook hears the recovery too, and the bed is re-armed and
+fires again if it crosses later. A storm
 that stays open for sixty ticks fires once, not sixty
 times, and a second burst fires again — the detector
 re-arms when the trailing count falls back below the
@@ -1287,7 +1302,13 @@ burst twice with a 30.0 s mean-ack threshold: beds 1 and 2
 average 30.5 s and each fire their slowest-bed event at
 158 s, when the second storm's acks push their mean over the
 threshold — 8 hook deliveries invoked and 0 failed against
-a stub server over a seeded 220-tick run.
+a stub server over a seeded 220-tick run. See
+`scenarios/alarm-storm-ack-slowest-bed-cleared-hooks.json`
+for four bursts with a 20.0 s threshold: beds 1 and 2 alert
+at 47 s, recover to a 15.0 s mean and each fire their
+cleared event at 167 s, then fall behind again and fire
+again at 377 s — 20 hook deliveries invoked and 0 failed
+against a stub server over a seeded 500-tick run.
 
 ## Alarm-storm acknowledgement
 
@@ -4667,7 +4688,17 @@ the hook totals.
   alarm-storm summary, every snapshot, WebSocket frame, a
   `GET /alarm-storm` endpoint, and the run summary) — done
   in v0.76.0
-- Next: a slowest-bed alert cleared hook event, so a ward
-  hears the moment a bed's mean time to ack drops back
-  below the threshold — when it recovers — instead of only
-  hearing when it falls behind
+- Slowest-bed alert cleared hook event (an
+  `alarm_storm_slowest_bed_cleared` event fires in the tick a
+  bed's mean time to ack across the storms it fully cleared
+  drops back below the threshold — with the same payload
+  shape as the alert, the bed, its mean and longest time now
+  below the threshold, the threshold, and how many storms it
+  raised in and cleared — through the same
+  `alarm_storm_hooks`, once per recovery and re-arming the
+  alert, in the alarm-storm summary, every snapshot,
+  WebSocket frame, a `GET /alarm-storm` endpoint, and the run
+  summary) — done in v0.77.0
+- Next: slowest-bed alert history per bed, so a dashboard can
+  see each bed's crossings and clearings this run — the tick
+  and the mean at each — without scanning the event list

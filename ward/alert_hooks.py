@@ -58,10 +58,11 @@ the ward's ``partition_hooks``; a monitor dropping out or
 coming back — a bed's monitor going offline and returning —
 fires the ward's ``dropout_hooks``; an alarm storm starting, ending, becoming fully acknowledged,
 or a bed's mean time to ack crossing the slowest-bed alert
-threshold — the ward raising at least
+threshold — or dropping back below it — the ward raising at least
 ``threshold`` alarms within ``window_s`` seconds, the rate
 falling back below it, the storm's last alarm being
-acked, and a bed falling behind the threshold — fires the ward's ``alarm_storm_hooks``.
+acked, and a bed falling behind the threshold or recovering
+below it — fires the ward's ``alarm_storm_hooks``.
 All twenty-two share
 the same ``AlertHooks`` machinery — the same webhook and
 callback channels, the same best-effort delivery — just a

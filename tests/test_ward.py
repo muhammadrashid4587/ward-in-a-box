@@ -16683,13 +16683,44 @@ class TestAlarmStormHooks(unittest.TestCase):
                 (2, 377.0, 22.5, 30.0, 4, 4),
             ],
         )
+        # Beds 1 and 2 recover between the two crossings: the
+        # second storm times them at 0.0 s, so their mean falls
+        # to 15.0 s and each fires one cleared event, in the
+        # tick the second storm is detected — 167 s — with the
+        # same payload shape as the alert, the mean now below
+        # the threshold. Bed 0 never recovers: its mean stays
+        # above 20.0 s for the whole run, so it fires no
+        # cleared event.
+        cleared = [
+            p
+            for p in seen
+            if p["event"] == "alarm_storm_slowest_bed_cleared"
+        ]
+        self.assertEqual(
+            [
+                (
+                    p["bed"],
+                    p["t"],
+                    p["mean_time_to_ack_s"],
+                    p["max_time_to_ack_s"],
+                    p["threshold_s"],
+                    p["storms"],
+                    p["cleared_storms"],
+                )
+                for p in cleared
+            ],
+            [
+                (1, 167.0, 15.0, 30.0, 20.0, 2, 2),
+                (2, 167.0, 15.0, 30.0, 20.0, 2, 2),
+            ],
+        )
         # Four storms, three events each, plus the six
-        # slowest-bed events.
+        # slowest-bed events and the two cleared events.
         summary = ward.alarm_storm_summary()
-        self.assertEqual(summary["event_count"], 18)
+        self.assertEqual(summary["event_count"], 20)
         self.assertEqual(
             summary["alarm_storm_hooks"],
-            {"configured": True, "invoked": 18, "failed": 0, "retries": 0, "delivered": 18},
+            {"configured": True, "invoked": 20, "failed": 0, "retries": 0, "delivered": 20},
         )
 
     def test_scenario_alarm_storm_slowest_bed_hooks(self):
@@ -16791,6 +16822,142 @@ class TestAlarmStormHooks(unittest.TestCase):
                     "invoked"
                 ],
                 8,
+            )
+            self.assertEqual(
+                run["alarm_storm"]["slowest_bed_alerts"],
+                summary["slowest_bed_alerts"],
+            )
+            self.assertFalse(run["alarm_storm"]["storm_active"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_scenario_alarm_storm_slowest_bed_cleared_hooks(self):
+        cfg = load_scenario(
+            os.path.join(
+                HERE,
+                "..",
+                "scenarios",
+                "alarm-storm-ack-slowest-bed-cleared-hooks.json",
+            )
+        )
+        self.assertTrue(cfg["alarm_storm_hooks"].configured)
+        server, port, received = capture_server()
+        path = os.path.join(tempfile.mkdtemp(), "run.jsonl")
+        try:
+            # The scenario's URL is a placeholder; point it at
+            # the stub server for this run.
+            cfg["alarm_storm_hooks"] = (
+                validate_alarm_storm_hooks(
+                    {"webhook_url": "http://127.0.0.1:%d/hooks" % port}
+                )
+            )
+            ward = build_ward(cfg, seed=42)
+            with Recorder(path, ward.beds, ward.rate_hz, seed=42) as rec:
+                ward.recorder = rec
+                for _ in range(500):
+                    snap = ward.tick()
+            self.assertTrue(ward.alarm_storm_hooks.wait(timeout=5))
+            # Twenty events over the run: four storms, each
+            # starting, ending, and being acknowledged — beds
+            # 0, 1, and 2 each firing a slowest-bed event when
+            # the first storm's acks push their mean over the
+            # 20.0 s threshold, beds 1 and 2 each firing a
+            # cleared event at 167 s, when the second storm's
+            # 0.0 s times pull their mean back to 15.0 s, bed
+            # 3 firing its slowest-bed event at 198 s, and
+            # beds 1 and 2 firing again at 377 s, when the
+            # third and fourth storms pull their mean back
+            # over the threshold. The deliveries run in
+            # separate daemon threads, so their arrival order
+            # at the stub is not guaranteed — sort by event
+            # time, then by the order the ward fires them in,
+            # then by bed, before asserting.
+            self.assertEqual(len(received), 20)
+            order = {
+                "alarm_storm_started": 0,
+                "alarm_storm_slowest_bed": 1,
+                "alarm_storm_slowest_bed_cleared": 2,
+                "alarm_storm_ended": 3,
+                "alarm_storm_acknowledged": 4,
+            }
+            payloads = sorted(
+                (json.loads(r[2]) for r in received),
+                key=lambda p: (
+                    p["t"],
+                    order[p["event"]],
+                    p.get("bed", -1),
+                ),
+            )
+            self.assertEqual(
+                [
+                    (p["event"], p["t"], p.get("bed"))
+                    for p in payloads
+                ],
+                [
+                    ("alarm_storm_started", 17.0, None),
+                    ("alarm_storm_slowest_bed", 43.0, 0),
+                    ("alarm_storm_slowest_bed", 47.0, 1),
+                    ("alarm_storm_slowest_bed", 47.0, 2),
+                    ("alarm_storm_ended", 77.0, None),
+                    ("alarm_storm_acknowledged", 77.0, None),
+                    ("alarm_storm_started", 167.0, None),
+                    (
+                        "alarm_storm_slowest_bed_cleared",
+                        167.0,
+                        1,
+                    ),
+                    (
+                        "alarm_storm_slowest_bed_cleared",
+                        167.0,
+                        2,
+                    ),
+                    ("alarm_storm_slowest_bed", 198.0, 3),
+                    ("alarm_storm_ended", 227.0, None),
+                    ("alarm_storm_acknowledged", 227.0, None),
+                    ("alarm_storm_started", 237.0, None),
+                    ("alarm_storm_ended", 297.0, None),
+                    ("alarm_storm_acknowledged", 297.0, None),
+                    ("alarm_storm_started", 347.0, None),
+                    ("alarm_storm_slowest_bed", 377.0, 1),
+                    ("alarm_storm_slowest_bed", 377.0, 2),
+                    ("alarm_storm_ended", 407.0, None),
+                    ("alarm_storm_acknowledged", 407.0, None),
+                ],
+            )
+            cleared = [
+                p
+                for p in payloads
+                if p["event"] == "alarm_storm_slowest_bed_cleared"
+            ]
+            for p in cleared:
+                self.assertEqual(p["mean_time_to_ack_s"], 15.0)
+                self.assertEqual(p["max_time_to_ack_s"], 30.0)
+                self.assertEqual(p["threshold_s"], 20.0)
+                self.assertEqual(p["storms"], 2)
+                self.assertEqual(p["cleared_storms"], 2)
+            # Every event records that its hook was invoked.
+            for event in snap["alarm_storm"]["events"]:
+                self.assertTrue(event["hook_invoked"])
+            summary = ward.alarm_storm_summary()
+            self.assertEqual(summary["event_count"], 20)
+            self.assertEqual(
+                summary["alarm_storm_hooks"],
+                {"configured": True, "invoked": 20, "failed": 0, "retries": 0, "delivered": 20},
+            )
+            # The run summary carries the event count, the
+            # hook totals, and the slowest-bed alerts from
+            # the last tick — but only as of that tick: the
+            # snapshot in the file was recorded before the
+            # last delivery settled, so delivered is read
+            # from the live summary above, not from here.
+            run = summarize(path)
+            self.assertEqual(run["alarm_storm"]["event_count"], 20)
+            self.assertEqual(
+                run["alarm_storm"]["alarm_storm_hooks"][
+                    "invoked"
+                ],
+                20,
             )
             self.assertEqual(
                 run["alarm_storm"]["slowest_bed_alerts"],
